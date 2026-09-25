@@ -5,7 +5,7 @@
 <br>
 
 <p align="center">
-    <a href="https://github.com/surrealdb/artmap"><img src="https://img.shields.io/badge/status-alpha-ff00bb.svg?style=flat-square"></a>
+    <a href="https://github.com/surrealdb/artmap"><img src="https://img.shields.io/badge/status-pre--alpha-ff00bb.svg?style=flat-square"></a>
     &nbsp;
     <a href="https://docs.rs/artmap/"><img src="https://img.shields.io/docsrs/artmap?style=flat-square"></a>
     &nbsp;
@@ -22,18 +22,19 @@ It combines the $O(k)$ key-length lookup time and prefix compression of adaptive
 
 Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM**, Linux 6.8):
 
-| Data Structure | Point Read (Random Hit) | Point Insert (Concurrent) | Range Scan (1K items) | Allocations / Insert |
+| Data Structure | Point Read (Random Hit) | Point Insert | Range Scan (100 items) | Allocations / Insert |
 | :--- | ---: | ---: | ---: | ---: |
-| **`artmap::ArtMap` (Slice Lookup)** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**TBD** | — | — | **0 allocs** |
-| **`artmap::ArtMap` (Standard Key)** | **TBD** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**TBD** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**TBD** | **TBD** |
-| `crossbeam_skiplist::SkipMap` | TBD | TBD | TBD | ~1.0 allocs |
-| `imbl::OrdMap` | 46.5 ns | 71.6 ns | 12.4 µs | ~0.14 allocs |
-| `std::collections::BTreeMap` | 72.7 ns | 37.7 ns (single-thread) | 14.8 µs | ~0.16 allocs |
-| `std::collections::HashMap`* | 14.4 ns | 28.8 ns (single-thread) | N/A | ~0 allocs |
+| **`artmap::ArtMap` (Slice Lookup)** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**20.8 ns**<br><sup>(48.0M/s)</sup> | — | — | **0 allocs** |
+| **`artmap::ArtMap` (Standard Key)** | **20.8 ns**<br><sup>(48.0M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**36.1 ns**<br><sup>(27.7M/s)</sup> | **2.25 µs**<br><sup>(44.3M/s)</sup> | **1.0 allocs** |
+| `crossbeam_skiplist::SkipMap` | 147.2 ns<br><sup>(6.8M/s)</sup> | 96.9 ns<br><sup>(10.3M/s)</sup> | 2.15 µs<br><sup>(46.5M/s)</sup> | ~1.0 allocs |
+| `imbl::OrdMap` (Persistent B-Tree v7) | 40.4 ns<br><sup>(24.7M/s)</sup> | 72.1 ns<br><sup>(13.9M/s)</sup> | 320 ns<br><sup>(312M/s)</sup> | ~0.14 allocs |
+| `std::collections::BTreeMap` | 60.1 ns<br><sup>(16.6M/s)</sup> | 38.1 ns<br><sup>(26.2M/s)</sup> | 183 ns<br><sup>(544M/s)</sup> | ~0.16 allocs |
+| `std::collections::HashMap`* | 13.4 ns<br><sup>(74.7M/s)</sup> | 29.0 ns<br><sup>(34.4M/s)</sup> | N/A | ~0 allocs |
 
 <sup>* Rocket badge denotes the fastest implementation among ordered, concurrent range-scannable maps. `std::collections::HashMap` is included as an unordered $O(1)$ reference baseline and does not support range queries, sorted scans, or concurrent multi-writer scaling.</sup>
 
-- **$O(k)$ Lookup Complexity**: Search time is strictly bounded by key length in bytes $k$, avoiding the 15–20 pointer hops and full `memcmp` comparisons per lookup inherent to skip lists.
+- **7.1× Faster Point Lookups**: `artmap` resolves random point lookups in **20.8 ns** (48.0M ops/sec), compared to **147.2 ns** for `crossbeam-skiplist::SkipMap` and **60.1 ns** for standard `BTreeMap`.
+- **2.7× Faster Ingestion**: Point inserts complete in **36.1 ns** (27.7M ops/sec) vs. **96.9 ns** for `crossbeam-skiplist::SkipMap`.
 - **Zero-Atomic-Write Reads**: Optimistic readers traverse nodes without issuing atomic write instructions or updating reference counters, eliminating CPU cache-line bouncing.
 - **True Multi-Writer Scaling**: Writers acquire fine-grained node locks only at the local leaf or node being resized, allowing concurrent inserts across disjoint key prefixes to scale linearly with core count.
 - **Epoch-Based Memory Safety**: Replaced or shrunk nodes are retired safely via `crossbeam-epoch` without the runtime overhead of atomic reference counts.
@@ -41,7 +42,7 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 ## Features
 
 - **Adaptive Radix Tree Architecture**: Dynamically resizes inner nodes across 4 compact layouts (`Node4` $\leftrightarrow$ `Node16` $\leftrightarrow$ `Node48` $\leftrightarrow$ `Node256`) to maximize CPU L1/L2 cache locality.
-- **SIMD-Accelerated Lookups**: Vectorized child key comparisons on `Node16` using SSE2/AVX2 on x86_64 and NEON on ARM64.
+- **SIMD-Accelerated Lookups**: Vectorized child key comparisons on `Node16` using SSE2 on x86_64 and NEON on ARM64.
 - **Prefix Compression**: Collapses single-child paths into shared byte prefixes, dramatically reducing memory usage for structured database keys.
 - **Optimistic Lock Coupling (OLC / ROWEX)**: Readers validate version counters optimistically, operating with zero locks and zero atomic writes.
 - **Zero-Allocation Slice Queries**: Query entries directly with raw byte slices (`&[u8]`) or string slices (`&str`) without allocating wrapper objects.
@@ -192,8 +193,8 @@ cargo bench --bench comparison_bench
 # Run allocation and memory benchmarks locally
 cargo bench --bench alloc_comparison
 
-# Run ART-specific micro-benchmarks
-cargo bench --bench artmap_bench
+# Run on remote dedicated hardware (AMD Threadripper)
+./scripts/bench-remote.sh --all
 ```
 
 ## License
