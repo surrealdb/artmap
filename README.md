@@ -22,14 +22,14 @@ It combines the $O(k)$ key-length lookup time and prefix compression of adaptive
 
 Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM**, Linux 6.8):
 
-| Data Structure | Point Read (Random Hit) | Point Insert | Range Scan (100 items) | Allocations / Insert |
+| Data&nbsp;Structure | Point&nbsp;Read&nbsp;(Random&nbsp;Hit) | Point&nbsp;Insert&nbsp;(Concurrent) | Range&nbsp;Scan&nbsp;(100&nbsp;items) | Allocations&nbsp;/&nbsp;Insert |
 | :--- | ---: | ---: | ---: | ---: |
-| **`artmap::ArtMap` (Slice Lookup)** | <nobr><img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**20.8&nbsp;ns**</nobr><br><sup>(48.0M/s)</sup> | — | — | <nobr>**0&nbsp;allocs**</nobr> |
-| **`artmap::ArtMap` (Standard Key)** | <nobr>**20.8&nbsp;ns**</nobr><br><sup>(48.0M/s)</sup> | <nobr><img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**36.1&nbsp;ns**</nobr><br><sup>(27.7M/s)</sup> | <nobr>**2.25&nbsp;µs**</nobr><br><sup>(44.3M/s)</sup> | <nobr>**1.0&nbsp;allocs**</nobr> |
-| `crossbeam_skiplist::SkipMap` | <nobr>147.2&nbsp;ns</nobr><br><sup>(6.8M/s)</sup> | <nobr>96.9&nbsp;ns</nobr><br><sup>(10.3M/s)</sup> | <nobr>2.15&nbsp;µs</nobr><br><sup>(46.5M/s)</sup> | <nobr>~1.0&nbsp;allocs</nobr> |
-| `imbl::OrdMap` (Persistent B-Tree v7) | <nobr>40.4&nbsp;ns</nobr><br><sup>(24.7M/s)</sup> | <nobr>72.1&nbsp;ns</nobr><br><sup>(13.9M/s)</sup> | <nobr>320&nbsp;ns</nobr><br><sup>(312M/s)</sup> | <nobr>~0.14&nbsp;allocs</nobr> |
-| `std::collections::BTreeMap` | <nobr>60.1&nbsp;ns</nobr><br><sup>(16.6M/s)</sup> | <nobr>38.1&nbsp;ns</nobr><br><sup>(26.2M/s)</sup> | <nobr>183&nbsp;ns</nobr><br><sup>(544M/s)</sup> | <nobr>~0.16&nbsp;allocs</nobr> |
-| `std::collections::HashMap`* | <nobr>13.4&nbsp;ns</nobr><br><sup>(74.7M/s)</sup> | <nobr>29.0&nbsp;ns</nobr><br><sup>(34.4M/s)</sup> | N/A | <nobr>~0&nbsp;allocs</nobr> |
+| **`artmap::ArtMap` (Slice Lookup)** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**20.8&nbsp;ns**<br><sup>(48.0M/s)</sup> | — | — | **0&nbsp;allocs** |
+| **`artmap::ArtMap` (Standard Key)** | **20.8&nbsp;ns**<br><sup>(48.0M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**36.1&nbsp;ns**<br><sup>(27.7M/s)</sup> | **2.25&nbsp;µs**<br><sup>(44.3M/s)</sup> | **1.0&nbsp;allocs** |
+| `crossbeam_skiplist::SkipMap` | 147.2&nbsp;ns<br><sup>(6.8M/s)</sup> | 96.9&nbsp;ns<br><sup>(10.3M/s)</sup> | 2.15&nbsp;µs<br><sup>(46.5M/s)</sup> | ~1.0&nbsp;allocs |
+| `imbl::OrdMap` (Persistent B-Tree v7) | 40.4&nbsp;ns<br><sup>(24.7M/s)</sup> | 72.1&nbsp;ns<br><sup>(13.9M/s)</sup> | 320&nbsp;ns<br><sup>(312M/s)</sup> | ~0.14&nbsp;allocs |
+| `std::collections::BTreeMap` | 60.1&nbsp;ns<br><sup>(16.6M/s)</sup> | 38.1&nbsp;ns<br><sup>(26.2M/s)</sup> | 183&nbsp;ns<br><sup>(544M/s)</sup> | ~0.16&nbsp;allocs |
+| `std::collections::HashMap`* | 13.4&nbsp;ns<br><sup>(74.7M/s)</sup> | 29.0&nbsp;ns<br><sup>(34.4M/s)</sup> | N/A | ~0&nbsp;allocs |
 
 <sup>* Rocket badge denotes the fastest implementation among ordered, concurrent range-scannable maps. `std::collections::HashMap` is included as an unordered $O(1)$ reference baseline and does not support range queries, sorted scans, or concurrent multi-writer scaling.</sup>
 
