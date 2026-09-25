@@ -1,0 +1,42 @@
+name: CI
+
+run-name: "CI run '${{ github.head_ref || github.ref_name }}'"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compile
+        run: cargo build --all-targets --all-features
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+      - name: Run deterministic simulation
+        run: cargo test --test sim -- --nocapture
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format
+        run: cargo fmt --all -- --check
