@@ -22,7 +22,7 @@ It combines the $O(k)$ key-length lookup time and prefix compression of adaptive
 
 Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM**, Linux 6.8):
 
-| Data&nbsp;Structure | Point&nbsp;Read&nbsp;(Random&nbsp;Hit) | Point&nbsp;Insert&nbsp;(Concurrent) | Range&nbsp;Scan&nbsp;(100&nbsp;items) | Allocations&nbsp;/&nbsp;Insert |
+| Data Structure | Point&nbsp;Read (Random&nbsp;Hit) | Point&nbsp;Insert (Concurrent) | Range&nbsp;Scan (100&nbsp;items) | Allocations /&nbsp;Insert |
 | :--- | ---: | ---: | ---: | ---: |
 | **`artmap::ArtMap` (Slice Lookup)** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**20.8&nbsp;ns**<br><sup>(48.0M/s)</sup> | — | — | **0&nbsp;allocs** |
 | **`artmap::ArtMap` (Standard Key)** | **20.8&nbsp;ns**<br><sup>(48.0M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**36.1&nbsp;ns**<br><sup>(27.7M/s)</sup> | **2.25&nbsp;µs**<br><sup>(44.3M/s)</sup> | **1.0&nbsp;allocs** |
