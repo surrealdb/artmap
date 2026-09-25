@@ -16,9 +16,9 @@
 //!
 //! Provides bidirectional range scanning for [`ArtMap`](crate::ArtMap).
 
-use crossbeam_epoch::Guard;
 use std::ops::Bound;
 
+use crate::entry::EntryRef;
 use crate::key::AsBytes;
 use crate::node::{Leaf, TaggedPtr};
 use crate::tree::Tree;
@@ -26,7 +26,6 @@ use crate::tree::Tree;
 /// An iterator over a range of entries in an [`ArtMap`](crate::ArtMap).
 pub struct Range<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
     tree: &'a Tree<K, V>,
-    _guard: Guard,
     start_bound: Bound<Vec<u8>>,
     end_bound: Bound<Vec<u8>>,
     cursor_front: Vec<u8>,
@@ -39,13 +38,11 @@ pub struct Range<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
     pub(crate) fn new(
         tree: &'a Tree<K, V>,
-        guard: Guard,
         start_bound: Bound<Vec<u8>>,
         end_bound: Bound<Vec<u8>>,
     ) -> Self {
         Self {
             tree,
-            _guard: guard,
             start_bound,
             end_bound,
             cursor_front: Vec::with_capacity(32),
@@ -58,7 +55,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
 }
 
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, K, V> {
-    type Item = (&'a K, &'a V);
+    type Item = EntryRef<'a, K, V>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.exhausted {
@@ -101,7 +98,12 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, 
         self.cursor_front.clear();
         self.cursor_front.extend_from_slice(k_bytes);
         self.has_front = true;
-        Some((&leaf.key, &leaf.value))
+        Some(EntryRef {
+            key_ptr: &leaf.key,
+            val_ptr: &leaf.value,
+            tree: self.tree,
+            is_removed: false,
+        })
     }
 }
 
@@ -147,7 +149,12 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for
         self.cursor_back.clear();
         self.cursor_back.extend_from_slice(k_bytes);
         self.has_back = true;
-        Some((&leaf.key, &leaf.value))
+        Some(EntryRef {
+            key_ptr: &leaf.key,
+            val_ptr: &leaf.value,
+            tree: self.tree,
+            is_removed: false,
+        })
     }
 }
 
@@ -157,15 +164,15 @@ pub struct Iter<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
 }
 
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iter<'a, K, V> {
-    pub(crate) fn new(tree: &'a Tree<K, V>, guard: Guard) -> Self {
+    pub(crate) fn new(tree: &'a Tree<K, V>) -> Self {
         Self {
-            inner: Range::new(tree, guard, Bound::Unbounded, Bound::Unbounded),
+            inner: Range::new(tree, Bound::Unbounded, Bound::Unbounded),
         }
     }
 }
 
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Iter<'a, K, V> {
-    type Item = (&'a K, &'a V);
+    type Item = EntryRef<'a, K, V>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -196,7 +203,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Keys<'a, K
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, _)| k)
+        self.inner.next().map(|e| e.key())
     }
 }
 
@@ -216,7 +223,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Values<'a,
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_, v)| v)
+        self.inner.next().map(|e| e.value())
     }
 }
 

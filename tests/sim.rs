@@ -167,7 +167,7 @@ fn test_deterministic_simulation() {
         .collect();
     let map_range: Vec<_> = map
         .range(start_key..end_key)
-        .map(|(k, v)| (k.clone(), *v))
+        .map(|e| (e.key().clone(), *e.value()))
         .collect();
     assert_eq!(
         map_range, oracle_range,
@@ -182,7 +182,7 @@ fn test_deterministic_simulation() {
     let map_rev_range: Vec<_> = map
         .range(start_key..end_key)
         .rev()
-        .map(|(k, v)| (k.clone(), *v))
+        .map(|e| (e.key().clone(), *e.value()))
         .collect();
     assert_eq!(
         map_rev_range, oracle_rev_range,

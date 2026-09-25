@@ -17,7 +17,6 @@
 //! Provides [`EntryRef`], an ergonomic reference to an entry in the map
 //! matching `crossbeam-skiplist::map::Entry` conventions.
 
-use crossbeam_epoch::Guard;
 use std::ops::Deref;
 
 use crate::key::AsBytes;
@@ -28,20 +27,19 @@ pub struct EntryRef<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
     pub(crate) key_ptr: *const K,
     pub(crate) val_ptr: *const V,
     pub(crate) tree: &'a Tree<K, V>,
-    pub(crate) guard: Guard,
     pub(crate) is_removed: bool,
 }
 
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> EntryRef<'a, K, V> {
     /// Returns a reference to the entry's key.
     #[inline]
-    pub fn key(&self) -> &K {
+    pub fn key(&self) -> &'a K {
         unsafe { &*self.key_ptr }
     }
 
     /// Returns a reference to the entry's value.
     #[inline]
-    pub fn value(&self) -> &V {
+    pub fn value(&self) -> &'a V {
         unsafe { &*self.val_ptr }
     }
 
@@ -57,7 +55,8 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> EntryRef<'a, K, V> {
             return false;
         }
         let key = self.key();
-        let removed = self.tree.remove(key, &self.guard).is_some();
+        let guard = &crossbeam_epoch::pin();
+        let removed = self.tree.remove(key, guard).is_some();
         if removed {
             self.is_removed = true;
         }

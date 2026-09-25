@@ -77,6 +77,11 @@ impl<K, V> ArtMap<K, V> {
 }
 
 impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
+    /// Removes all key-value pairs from the map.
+    #[inline]
+    pub fn clear(&self) {
+        self.tree.clear();
+    }
     /// Returns a copy of the value corresponding to the key, if present.
     #[inline]
     pub fn get<Q>(&self, key: &Q) -> Option<V>
@@ -149,7 +154,6 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
             key_ptr,
             val_ptr,
             tree: &self.tree,
-            guard,
             is_removed: false,
         }
     }
@@ -173,7 +177,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
     }
 
     /// Returns an iterator over a sub-range of entries.
-    pub fn range<'a, R, Q>(&'a self, range: R) -> Range<'a, K, V>
+    pub fn range<R, Q>(&self, range: R) -> Range<'_, K, V>
     where
         R: RangeBounds<Q>,
         Q: AsBytes + ?Sized,
@@ -189,14 +193,12 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
             Bound::Unbounded => Bound::Unbounded,
         };
 
-        let guard = crossbeam_epoch::pin();
-        Range::new(&self.tree, guard, start, end)
+        Range::new(&self.tree, start, end)
     }
 
     /// Returns an iterator visiting all key-value pairs in lexicographical key order.
     pub fn iter(&self) -> Iter<'_, K, V> {
-        let guard = crossbeam_epoch::pin();
-        Iter::new(&self.tree, guard)
+        Iter::new(&self.tree)
     }
 
     /// Returns an iterator visiting all keys in lexicographical order.
@@ -209,12 +211,6 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
         Values::new(self.iter())
     }
 
-    /// Removes all key-value pairs from the map.
-    #[inline]
-    pub fn clear(&self) {
-        self.tree.clear();
-    }
-
     /// Validates all structural invariants of the tree.
     #[inline]
     pub fn validate_invariants(&self) {
@@ -223,7 +219,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
 }
 
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> IntoIterator for &'a ArtMap<K, V> {
-    type Item = (&'a K, &'a V);
+    type Item = EntryRef<'a, K, V>;
     type IntoIter = Iter<'a, K, V>;
 
     #[inline]
@@ -279,14 +275,14 @@ mod tests {
 
         let items: Vec<_> = map
             .range("k:2".."k:5")
-            .map(|(k, v)| (k.as_str(), *v))
+            .map(|e| (e.key().as_str(), *e.value()))
             .collect();
         assert_eq!(items, vec![("k:2", 2), ("k:3", 3), ("k:4", 4)]);
 
         let rev_items: Vec<_> = map
             .range("k:2".."k:5")
             .rev()
-            .map(|(k, v)| (k.as_str(), *v))
+            .map(|e| (e.key().as_str(), *e.value()))
             .collect();
         assert_eq!(rev_items, vec![("k:4", 4), ("k:3", 3), ("k:2", 2)]);
     }
