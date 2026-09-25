@@ -45,6 +45,23 @@ impl Default for HybridLatch {
 }
 
 impl HybridLatch {
+    /// Attempts to acquire the exclusive write lock if the version matches `expected_version`.
+    #[inline]
+    pub fn lock_version(&self, expected_version: u64) -> Result<u64, LockError> {
+        if self.version.load(Ordering::Relaxed) != expected_version {
+            return Err(LockError::Obsolete);
+        }
+        match self.version.compare_exchange(
+            expected_version,
+            expected_version | LOCK_BIT,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Ok(expected_version),
+            Err(_) => Err(LockError::Obsolete),
+        }
+    }
+
     /// Creates a new unlocked, non-obsolete latch with initial version 0.
     #[inline]
     pub const fn new() -> Self {

@@ -360,6 +360,14 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
 
             'traverse: loop {
                 let header = unsafe { &mut *current.as_inner_ptr() };
+                let v_header = match header.latch.read_version() {
+                    Some(v) => v,
+                    None => {
+                        std::hint::spin_loop();
+                        continue 'retry;
+                    }
+                };
+
                 let (matched, is_full) = header.match_prefix(key_bytes, depth);
 
                 // Prefix mismatch -> prefix split
@@ -372,7 +380,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                         continue 'retry;
                     }
 
-                    if header.latch.lock().is_err() {
+                    if header.latch.lock_version(v_header).is_err() {
                         match parent {
                             Some(p) => unsafe { (*p).latch.unlock() },
                             None => self.root_latch.unlock(),
@@ -443,7 +451,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
 
                 // Exact key match at this inner node
                 if depth == key_bytes.len() {
-                    if header.latch.lock().is_err() {
+                    if header.latch.lock_version(v_header).is_err() {
                         continue 'retry;
                     }
 
@@ -486,9 +494,15 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 )
                                 .is_ok()
                             {
-                                n256.header.num_children += 1;
-                                self.len.fetch_add(1, Ordering::Relaxed);
-                                return Ok((None, new_leaf_ptr));
+                                if header.latch.validate(v_header) {
+                                    n256.header.num_children += 1;
+                                    self.len.fetch_add(1, Ordering::Relaxed);
+                                    return Ok((None, new_leaf_ptr));
+                                } else {
+                                    n256.children[next_byte as usize]
+                                        .store(ptr::null_mut(), Ordering::Release);
+                                    continue 'retry;
+                                }
                             }
                             continue 'retry;
                         }
@@ -503,7 +517,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 continue 'retry;
                             }
 
-                            if header.latch.lock().is_err() {
+                            if header.latch.lock_version(v_header).is_err() {
                                 match parent {
                                     Some(p) => unsafe { (*p).latch.unlock() },
                                     None => self.root_latch.unlock(),
@@ -555,7 +569,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             }
                         } else {
                             // Fast path: node has room. Lock header only (no parent or root latch)
-                            if header.latch.lock().is_err() {
+                            if header.latch.lock_version(v_header).is_err() {
                                 continue 'retry;
                             }
 
@@ -577,7 +591,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                     }
                     Some(child) => {
                         if child.is_leaf() {
-                            if header.latch.lock().is_err() {
+                            if header.latch.lock_version(v_header).is_err() {
                                 continue 'retry;
                             }
                             if unsafe { find_child(header, next_byte) } != Some(child) {
