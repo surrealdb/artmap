@@ -24,8 +24,8 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 | Data Structure | Point&nbsp;Read (Random&nbsp;Hit) | Point&nbsp;Insert (Concurrent) | Range&nbsp;Scan (100&nbsp;items) | Allocations /&nbsp;Insert |
 | :--- | ---: | ---: | ---: | ---: |
-| **`artmap::ArtMap` (Slice Lookup)** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**20.8&nbsp;ns**<br><sup>(48.0M/s)</sup> | — | — | **0&nbsp;allocs** |
-| **`artmap::ArtMap` (Standard Key)** | **20.8&nbsp;ns**<br><sup>(48.0M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**36.1&nbsp;ns**<br><sup>(27.7M/s)</sup> | **2.25&nbsp;µs**<br><sup>(44.3M/s)</sup> | **1.0&nbsp;allocs** |
+| **`artmap::ArtMap`**<br><sup>&nbsp;(Slice Lookup)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**20.8&nbsp;ns**<br><sup>(48.0M/s)</sup> | — | — | **0&nbsp;allocs** |
+| **`artmap::ArtMap`**<br><sup>&nbsp;(Standard Key)</sup> | **20.8&nbsp;ns**<br><sup>(48.0M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**36.1&nbsp;ns**<br><sup>(27.7M/s)</sup> | **2.25&nbsp;µs**<br><sup>(44.3M/s)</sup> | **1.0&nbsp;allocs** |
 | `crossbeam_skiplist::SkipMap` | 147.2&nbsp;ns<br><sup>(6.8M/s)</sup> | 96.9&nbsp;ns<br><sup>(10.3M/s)</sup> | 2.15&nbsp;µs<br><sup>(46.5M/s)</sup> | ~1.0&nbsp;allocs |
 | `imbl::OrdMap` | 40.4&nbsp;ns<br><sup>(24.7M/s)</sup> | 72.1&nbsp;ns<br><sup>(13.9M/s)</sup> | 320&nbsp;ns<br><sup>(312M/s)</sup> | ~0.14&nbsp;allocs |
 | `std::collections::BTreeMap` | 60.1&nbsp;ns<br><sup>(16.6M/s)</sup> | 38.1&nbsp;ns<br><sup>(26.2M/s)</sup> | 183&nbsp;ns<br><sup>(544M/s)</sup> | ~0.16&nbsp;allocs |
