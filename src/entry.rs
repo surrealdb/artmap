@@ -28,7 +28,7 @@ pub struct EntryRef<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
     pub(crate) key_ptr: *const K,
     pub(crate) val_ptr: *const V,
     pub(crate) tree: &'a Tree<K, V>,
-    pub(crate) guard: &'a Guard,
+    pub(crate) guard: Guard,
     pub(crate) is_removed: bool,
 }
 
@@ -57,7 +57,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> EntryRef<'a, K, V> {
             return false;
         }
         let key = self.key();
-        let removed = self.tree.remove(key, self.guard).is_some();
+        let removed = self.tree.remove(key, &self.guard).is_some();
         if removed {
             self.is_removed = true;
         }

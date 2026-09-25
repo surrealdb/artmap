@@ -26,7 +26,7 @@ use crate::tree::Tree;
 /// An iterator over a range of entries in an [`ArtMap`](crate::ArtMap).
 pub struct Range<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
     tree: &'a Tree<K, V>,
-    _guard: &'a Guard,
+    _guard: Guard,
     start_bound: Bound<Vec<u8>>,
     end_bound: Bound<Vec<u8>>,
     cursor_front: Vec<u8>,
@@ -39,7 +39,7 @@ pub struct Range<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
     pub(crate) fn new(
         tree: &'a Tree<K, V>,
-        guard: &'a Guard,
+        guard: Guard,
         start_bound: Bound<Vec<u8>>,
         end_bound: Bound<Vec<u8>>,
     ) -> Self {
@@ -157,7 +157,7 @@ pub struct Iter<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
 }
 
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iter<'a, K, V> {
-    pub(crate) fn new(tree: &'a Tree<K, V>, guard: &'a Guard) -> Self {
+    pub(crate) fn new(tree: &'a Tree<K, V>, guard: Guard) -> Self {
         Self {
             inner: Range::new(tree, guard, Bound::Unbounded, Bound::Unbounded),
         }
@@ -225,9 +225,8 @@ pub(crate) unsafe fn first_leaf_in_subtree<K, V>(ptr: TaggedPtr) -> Option<*mut 
         return Some(ptr.as_leaf_ptr());
     }
     let header = &*ptr.as_inner_ptr();
-    let exact = header.exact_leaf.load(std::sync::atomic::Ordering::Acquire);
-    if !exact.is_null() {
-        return Some(exact as *mut Leaf<K, V>);
+    if let Some(leaf) = header.load_exact_leaf::<K, V>(std::sync::atomic::Ordering::Acquire) {
+        return Some(leaf);
     }
 
     match header.node_type {
@@ -295,12 +294,7 @@ pub(crate) unsafe fn last_leaf_in_subtree<K, V>(ptr: TaggedPtr) -> Option<*mut L
                 );
                 last_leaf_in_subtree(child)
             } else {
-                let exact = header.exact_leaf.load(std::sync::atomic::Ordering::Acquire);
-                if !exact.is_null() {
-                    Some(exact as *mut Leaf<K, V>)
-                } else {
-                    None
-                }
+                header.load_exact_leaf::<K, V>(std::sync::atomic::Ordering::Acquire)
             }
         }
         crate::node::NodeType::Node16 => {
@@ -312,12 +306,7 @@ pub(crate) unsafe fn last_leaf_in_subtree<K, V>(ptr: TaggedPtr) -> Option<*mut L
                 );
                 last_leaf_in_subtree(child)
             } else {
-                let exact = header.exact_leaf.load(std::sync::atomic::Ordering::Acquire);
-                if !exact.is_null() {
-                    Some(exact as *mut Leaf<K, V>)
-                } else {
-                    None
-                }
+                header.load_exact_leaf::<K, V>(std::sync::atomic::Ordering::Acquire)
             }
         }
         crate::node::NodeType::Node48 => {
@@ -331,12 +320,7 @@ pub(crate) unsafe fn last_leaf_in_subtree<K, V>(ptr: TaggedPtr) -> Option<*mut L
                     return last_leaf_in_subtree(child);
                 }
             }
-            let exact = header.exact_leaf.load(std::sync::atomic::Ordering::Acquire);
-            if !exact.is_null() {
-                Some(exact as *mut Leaf<K, V>)
-            } else {
-                None
-            }
+            header.load_exact_leaf::<K, V>(std::sync::atomic::Ordering::Acquire)
         }
         crate::node::NodeType::Node256 => {
             let n = &*(ptr.as_inner_ptr() as *const crate::node::Node256);
@@ -348,12 +332,7 @@ pub(crate) unsafe fn last_leaf_in_subtree<K, V>(ptr: TaggedPtr) -> Option<*mut L
                     return last_leaf_in_subtree(child);
                 }
             }
-            let exact = header.exact_leaf.load(std::sync::atomic::Ordering::Acquire);
-            if !exact.is_null() {
-                Some(exact as *mut Leaf<K, V>)
-            } else {
-                None
-            }
+            header.load_exact_leaf::<K, V>(std::sync::atomic::Ordering::Acquire)
         }
     }
 }

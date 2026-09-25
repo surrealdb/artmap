@@ -36,7 +36,6 @@ pub mod node;
 pub mod simd;
 pub mod tree;
 
-use crossbeam_epoch::Guard;
 use std::borrow::Borrow;
 use std::ops::{Bound, RangeBounds};
 
@@ -144,14 +143,13 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
         F: FnOnce() -> V,
     {
         let guard = crossbeam_epoch::pin();
-        let guard_ref: &'static Guard = unsafe { std::mem::transmute(&guard) };
-        let (key_ptr, val_ptr) = self.tree.get_or_insert_with(key, f, guard_ref);
+        let (key_ptr, val_ptr) = self.tree.get_or_insert_with(key, f, &guard);
 
         EntryRef {
             key_ptr,
             val_ptr,
             tree: &self.tree,
-            guard: guard_ref,
+            guard,
             is_removed: false,
         }
     }
@@ -192,17 +190,13 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
         };
 
         let guard = crossbeam_epoch::pin();
-        let guard_ref: &'a Guard = unsafe { std::mem::transmute(&guard) };
-        Range::new(&self.tree, guard_ref, start, end)
+        Range::new(&self.tree, guard, start, end)
     }
 
     /// Returns an iterator visiting all key-value pairs in lexicographical key order.
     pub fn iter(&self) -> Iter<'_, K, V> {
         let guard = crossbeam_epoch::pin();
-        let guard_ref = unsafe {
-            std::mem::transmute::<&crossbeam_epoch::Guard, &crossbeam_epoch::Guard>(&guard)
-        };
-        Iter::new(&self.tree, guard_ref)
+        Iter::new(&self.tree, guard)
     }
 
     /// Returns an iterator visiting all keys in lexicographical order.
