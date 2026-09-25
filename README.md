@@ -39,7 +39,7 @@ When running multi-threaded workloads with concurrent writers, non-concurrent da
 
 Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM**, Linux 6.8):
 
-| Data Structure | Concurrent&nbsp;Writes <br><sup>(8 Threads)</sup> | Mixed&nbsp;Workload <br><sup>(4 Readers + 4 Writers)</sup> | Concurrency Model |
+| Data Structure | Concurrent&nbsp;Writes<br><sup>(8&nbsp;Threads)</sup> | Mixed&nbsp;Workload<br><sup>(4&nbsp;Readers&nbsp;+&nbsp;4&nbsp;Writers)</sup> | Concurrency&nbsp;Model |
 | :--- | ---: | ---: | :--- |
 | **`artmap::ArtMap`** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**548&nbsp;µs**<br><sup>(14.6M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**857&nbsp;µs**<br><sup>(18.7M/s)</sup> | Non-Blocking Reads + OLC Writes |
 | `crossbeam_skiplist::SkipMap` | 885&nbsp;µs<br><sup>(9.04M/s)</sup> | 1.52&nbsp;ms<br><sup>(10.5M/s)</sup> | Lock-Free Atomic CAS |
