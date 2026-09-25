@@ -5,7 +5,7 @@
 <br>
 
 <p align="center">
-    <a href="https://github.com/surrealdb/artmap"><img src="https://img.shields.io/badge/status-pre--alpha-ff00bb.svg?style=flat-square"></a>
+    <a href="https://github.com/surrealdb/artmap"><img src="https://img.shields.io/badge/status-alpha-ff00bb.svg?style=flat-square"></a>
     &nbsp;
     <a href="https://docs.rs/artmap/"><img src="https://img.shields.io/docsrs/artmap?style=flat-square"></a>
     &nbsp;
@@ -27,7 +27,7 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 | **`artmap::ArtMap` (Slice Lookup)** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**TBD** | — | — | **0 allocs** |
 | **`artmap::ArtMap` (Standard Key)** | **TBD** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**TBD** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**TBD** | **TBD** |
 | `crossbeam_skiplist::SkipMap` | TBD | TBD | TBD | ~1.0 allocs |
-| `imbl::OrdMap` (Persistent B-Tree v7) | 46.5 ns | 71.6 ns | 12.4 µs | ~0.14 allocs |
+| `imbl::OrdMap` | 46.5 ns | 71.6 ns | 12.4 µs | ~0.14 allocs |
 | `std::collections::BTreeMap` | 72.7 ns | 37.7 ns (single-thread) | 14.8 µs | ~0.16 allocs |
 | `std::collections::HashMap`* | 14.4 ns | 28.8 ns (single-thread) | N/A | ~0 allocs |
 
