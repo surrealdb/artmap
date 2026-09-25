@@ -451,7 +451,8 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                         let existing_leaf = unsafe { &mut *leaf_ptr };
                         let new_leaf = unsafe { Box::from_raw(new_leaf_ptr) };
                         if replace_if_present {
-                            let old_val = std::mem::replace(&mut existing_leaf.value, new_leaf.value);
+                            let old_val =
+                                std::mem::replace(&mut existing_leaf.value, new_leaf.value);
                             header.latch.unlock();
                             return Ok((Some(old_val), leaf_ptr));
                         } else {
@@ -459,7 +460,9 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             return Ok((None, leaf_ptr));
                         }
                     } else {
-                        header.exact_leaf.store(tagged_new_leaf.as_raw(), Ordering::Release);
+                        header
+                            .exact_leaf
+                            .store(tagged_new_leaf.as_raw(), Ordering::Release);
                         self.len.fetch_add(1, Ordering::Relaxed);
                         header.latch.unlock();
                         return Ok((None, new_leaf_ptr));
@@ -556,7 +559,9 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 continue 'retry;
                             }
 
-                            if is_node_full(header) || unsafe { find_child(header, next_byte) }.is_some() {
+                            if is_node_full(header)
+                                || unsafe { find_child(header, next_byte) }.is_some()
+                            {
                                 header.latch.unlock();
                                 continue 'retry;
                             }
@@ -696,7 +701,9 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             header.latch.unlock();
                             let val = unsafe { ptr::read(&leaf.value) };
                             let raw_leaf = leaf_ptr as usize;
-                            guard.defer(move || unsafe { drop(Box::from_raw(raw_leaf as *mut Leaf<K, V>)) });
+                            guard.defer(move || unsafe {
+                                drop(Box::from_raw(raw_leaf as *mut Leaf<K, V>))
+                            });
                             return Some(val);
                         }
                     }

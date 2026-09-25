@@ -120,15 +120,15 @@ pub struct NodeHeader {
 }
 
 impl NodeHeader {
-	#[inline]
-	pub fn load_exact_leaf<K, V>(&self, order: Ordering) -> Option<*mut Leaf<K, V>> {
-		let raw = self.exact_leaf.load(order);
-		if raw.is_null() {
-			None
-		} else {
-			Some(TaggedPtr::from_raw(raw).as_leaf_ptr::<K, V>())
-		}
-	}
+    #[inline]
+    pub fn load_exact_leaf<K, V>(&self, order: Ordering) -> Option<*mut Leaf<K, V>> {
+        let raw = self.exact_leaf.load(order);
+        if raw.is_null() {
+            None
+        } else {
+            Some(TaggedPtr::from_raw(raw).as_leaf_ptr::<K, V>())
+        }
+    }
 
     #[inline]
     pub fn new(node_type: NodeType, prefix: &[u8]) -> Self {
@@ -156,6 +156,9 @@ impl NodeHeader {
     /// Returns `(matched_bytes, is_complete_prefix_match)`.
     #[inline]
     pub fn match_prefix(&self, key: &[u8], depth: usize) -> (usize, bool) {
+        if self.prefix_len == 0 {
+            return (0, true);
+        }
         let remaining_key = if depth < key.len() {
             &key[depth..]
         } else {
@@ -192,11 +195,25 @@ impl Node4 {
     #[inline]
     pub fn find_child(&self, needle: u8) -> Option<TaggedPtr> {
         let count = self.header.num_children as usize;
-        for i in 0..count {
-            if self.keys[i] == needle {
-                let child = self.children[i].load(Ordering::Acquire);
-                return Some(TaggedPtr::from_raw(child));
-            }
+        if count > 0 && self.keys[0] == needle {
+            return Some(TaggedPtr::from_raw(
+                self.children[0].load(Ordering::Acquire),
+            ));
+        }
+        if count > 1 && self.keys[1] == needle {
+            return Some(TaggedPtr::from_raw(
+                self.children[1].load(Ordering::Acquire),
+            ));
+        }
+        if count > 2 && self.keys[2] == needle {
+            return Some(TaggedPtr::from_raw(
+                self.children[2].load(Ordering::Acquire),
+            ));
+        }
+        if count > 3 && self.keys[3] == needle {
+            return Some(TaggedPtr::from_raw(
+                self.children[3].load(Ordering::Acquire),
+            ));
         }
         None
     }

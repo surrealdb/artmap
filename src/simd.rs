@@ -63,11 +63,7 @@ fn find_child_x86_sse2(keys: &[u8; 16], num_children: usize, needle: u8) -> Opti
         let keys_vec = _mm_loadu_si128(keys.as_ptr() as *const __m128i);
         let cmp = _mm_cmpeq_epi8(keys_vec, needle_vec);
         let mask = _mm_movemask_epi8(cmp) as u32;
-        let valid_mask = if num_children >= 16 {
-            0xFFFF
-        } else {
-            (1u32 << num_children) - 1
-        };
+        let valid_mask = (1u32 << num_children).wrapping_sub(1);
         let matches = mask & valid_mask;
         if matches != 0 {
             Some(matches.trailing_zeros() as usize)

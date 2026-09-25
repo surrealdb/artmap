@@ -29,8 +29,10 @@ pub struct Range<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
     _guard: &'a Guard,
     start_bound: Bound<Vec<u8>>,
     end_bound: Bound<Vec<u8>>,
-    cursor_front: Option<Vec<u8>>,
-    cursor_back: Option<Vec<u8>>,
+    cursor_front: Vec<u8>,
+    cursor_back: Vec<u8>,
+    has_front: bool,
+    has_back: bool,
     exhausted: bool,
 }
 
@@ -46,8 +48,10 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
             _guard: guard,
             start_bound,
             end_bound,
-            cursor_front: None,
-            cursor_back: None,
+            cursor_front: Vec::with_capacity(32),
+            cursor_back: Vec::with_capacity(32),
+            has_front: false,
+            has_back: false,
             exhausted: false,
         }
     }
@@ -61,13 +65,14 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, 
             return None;
         }
 
-        let (search_key, include_equal) = match &self.cursor_front {
-            Some(k) => (k.as_slice(), false),
-            None => match &self.start_bound {
+        let (search_key, include_equal) = if self.has_front {
+            (self.cursor_front.as_slice(), false)
+        } else {
+            match &self.start_bound {
                 Bound::Included(k) => (k.as_slice(), true),
                 Bound::Excluded(k) => (k.as_slice(), false),
                 Bound::Unbounded => (&[][..], true),
-            },
+            }
         };
 
         let leaf_ptr = self.tree.find_successor(search_key, include_equal)?;
@@ -88,14 +93,14 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, 
         }
 
         // Check overlap with backward cursor
-        if let Some(ref back) = self.cursor_back {
-            if k_bytes > back.as_slice() {
-                self.exhausted = true;
-                return None;
-            }
+        if self.has_back && k_bytes > self.cursor_back.as_slice() {
+            self.exhausted = true;
+            return None;
         }
 
-        self.cursor_front = Some(k_bytes.to_vec());
+        self.cursor_front.clear();
+        self.cursor_front.extend_from_slice(k_bytes);
+        self.has_front = true;
         Some((&leaf.key, &leaf.value))
     }
 }
@@ -106,13 +111,14 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for
             return None;
         }
 
-        let (search_key, include_equal) = match &self.cursor_back {
-            Some(k) => (k.as_slice(), false),
-            None => match &self.end_bound {
+        let (search_key, include_equal) = if self.has_back {
+            (self.cursor_back.as_slice(), false)
+        } else {
+            match &self.end_bound {
                 Bound::Included(k) => (k.as_slice(), true),
                 Bound::Excluded(k) => (k.as_slice(), false),
                 Bound::Unbounded => (&[0xFF; 64][..], true),
-            },
+            }
         };
 
         let leaf_ptr = self.tree.find_predecessor(search_key, include_equal)?;
@@ -133,14 +139,14 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for
         }
 
         // Check overlap with forward cursor
-        if let Some(ref front) = self.cursor_front {
-            if k_bytes < front.as_slice() {
-                self.exhausted = true;
-                return None;
-            }
+        if self.has_front && k_bytes < self.cursor_front.as_slice() {
+            self.exhausted = true;
+            return None;
         }
 
-        self.cursor_back = Some(k_bytes.to_vec());
+        self.cursor_back.clear();
+        self.cursor_back.extend_from_slice(k_bytes);
+        self.has_back = true;
         Some((&leaf.key, &leaf.value))
     }
 }
