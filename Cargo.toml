@@ -1,0 +1,22 @@
+[package]
+name = "artmap"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "A concurrent in-memory Adaptive Radix Tree (ART) featuring optimistic lock coupling."
+repository = "https://github.com/surrealdb/artmap"
+homepage = "https://github.com/surrealdb/artmap"
+documentation = "https://docs.rs/artmap"
+readme = "README.md"
+keywords = ["art", "radix-tree", "trie", "concurrent", "lock-free"]
+categories = ["data-structures", "concurrency", "database-implementations"]
+
+[features]
+default = []
+
+[dependencies]
+crossbeam-epoch = "0.9"
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.8"
