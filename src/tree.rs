@@ -1320,7 +1320,9 @@ unsafe fn find_first_child_leaf<K, V>(
             for i in 0..n.header.num_children as usize {
                 if n.keys[i] >= min_byte {
                     let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
-                    return crate::iter::first_leaf_in_subtree(child);
+                    if let Some(leaf) = crate::iter::first_leaf_in_subtree(child) {
+                        return Some(leaf);
+                    }
                 }
             }
             None
@@ -1330,7 +1332,9 @@ unsafe fn find_first_child_leaf<K, V>(
             for i in 0..n.header.num_children as usize {
                 if n.keys[i] >= min_byte {
                     let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
-                    return crate::iter::first_leaf_in_subtree(child);
+                    if let Some(leaf) = crate::iter::first_leaf_in_subtree(child) {
+                        return Some(leaf);
+                    }
                 }
             }
             None
@@ -1342,7 +1346,9 @@ unsafe fn find_first_child_leaf<K, V>(
                 if slot != NODE48_EMPTY {
                     let child =
                         TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
-                    return crate::iter::first_leaf_in_subtree(child);
+                    if let Some(leaf) = crate::iter::first_leaf_in_subtree(child) {
+                        return Some(leaf);
+                    }
                 }
             }
             None
@@ -1352,7 +1358,9 @@ unsafe fn find_first_child_leaf<K, V>(
             for byte in min_byte..=255u8 {
                 let child = TaggedPtr::from_raw(n.children[byte as usize].load(Ordering::Acquire));
                 if !child.is_null() {
-                    return crate::iter::first_leaf_in_subtree(child);
+                    if let Some(leaf) = crate::iter::first_leaf_in_subtree(child) {
+                        return Some(leaf);
+                    }
                 }
             }
             None
@@ -1367,7 +1375,9 @@ unsafe fn find_last_child_leaf<K, V>(header: &NodeHeader, max_byte: u8) -> Optio
             for i in (0..n.header.num_children as usize).rev() {
                 if n.keys[i] <= max_byte {
                     let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
-                    return crate::iter::last_leaf_in_subtree(child);
+                    if let Some(leaf) = crate::iter::last_leaf_in_subtree(child) {
+                        return Some(leaf);
+                    }
                 }
             }
             None
@@ -1377,7 +1387,9 @@ unsafe fn find_last_child_leaf<K, V>(header: &NodeHeader, max_byte: u8) -> Optio
             for i in (0..n.header.num_children as usize).rev() {
                 if n.keys[i] <= max_byte {
                     let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
-                    return crate::iter::last_leaf_in_subtree(child);
+                    if let Some(leaf) = crate::iter::last_leaf_in_subtree(child) {
+                        return Some(leaf);
+                    }
                 }
             }
             None
@@ -1389,7 +1401,9 @@ unsafe fn find_last_child_leaf<K, V>(header: &NodeHeader, max_byte: u8) -> Optio
                 if slot != NODE48_EMPTY {
                     let child =
                         TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
-                    return crate::iter::last_leaf_in_subtree(child);
+                    if let Some(leaf) = crate::iter::last_leaf_in_subtree(child) {
+                        return Some(leaf);
+                    }
                 }
             }
             None
@@ -1399,7 +1413,9 @@ unsafe fn find_last_child_leaf<K, V>(header: &NodeHeader, max_byte: u8) -> Optio
             for byte in (0..=max_byte).rev() {
                 let child = TaggedPtr::from_raw(n.children[byte as usize].load(Ordering::Acquire));
                 if !child.is_null() {
-                    return crate::iter::last_leaf_in_subtree(child);
+                    if let Some(leaf) = crate::iter::last_leaf_in_subtree(child) {
+                        return Some(leaf);
+                    }
                 }
             }
             None
