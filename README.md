@@ -41,13 +41,14 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 | Data Structure | Concurrent&nbsp;Writes <br><sup>(8 Threads)</sup> | Mixed&nbsp;Workload <br><sup>(4 Readers + 4 Writers)</sup> | Concurrency Model |
 | :--- | ---: | ---: | :--- |
-| **`artmap::ArtMap`** | **1.92&nbsp;ms**<br><sup>(4.17M/s)</sup> | **2.25&nbsp;ms**<br><sup>(7.12M/s)</sup> | Non-Blocking Reads + OLC Writes |
-| `crossbeam_skiplist::SkipMap` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**897&nbsp;µs**<br><sup>(8.92M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.52&nbsp;ms**<br><sup>(10.5M/s)</sup> | Lock-Free Atomic CAS |
-| `parking_lot::RwLock<BTreeMap>` | 5.88&nbsp;ms<br><sup>(1.36M/s)</sup> | 5.82&nbsp;ms<br><sup>(2.75M/s)</sup> | Coarse Exclusive Lock |
-| `parking_lot::RwLock<HashMap>`* | 6.68&nbsp;ms<br><sup>(1.20M/s)</sup> | 7.87&nbsp;ms<br><sup>(2.03M/s)</sup> | Coarse Exclusive Lock |
-| `parking_lot::RwLock<imbl::OrdMap>` | 6.93&nbsp;ms<br><sup>(1.15M/s)</sup> | 8.29&nbsp;ms<br><sup>(1.93M/s)</sup> | Coarse Exclusive Lock |
+| **`artmap::ArtMap`** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**548&nbsp;µs**<br><sup>(14.6M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**857&nbsp;µs**<br><sup>(18.7M/s)</sup> | Non-Blocking Reads + OLC Writes |
+| `crossbeam_skiplist::SkipMap` | 885&nbsp;µs<br><sup>(9.04M/s)</sup> | 1.52&nbsp;ms<br><sup>(10.5M/s)</sup> | Lock-Free Atomic CAS |
+| `parking_lot::RwLock<BTreeMap>` | 5.77&nbsp;ms<br><sup>(1.39M/s)</sup> | 5.53&nbsp;ms<br><sup>(2.89M/s)</sup> | Coarse Exclusive Lock |
+| `parking_lot::RwLock<HashMap>`* | 7.78&nbsp;ms<br><sup>(1.03M/s)</sup> | 7.45&nbsp;ms<br><sup>(2.15M/s)</sup> | Coarse Exclusive Lock |
+| `parking_lot::RwLock<imbl::OrdMap>` | 7.05&nbsp;ms<br><sup>(1.13M/s)</sup> | 8.33&nbsp;ms<br><sup>(1.92M/s)</sup> | Coarse Exclusive Lock |
 
-- **Coarse Lock Bottleneck**: `RwLock<BTreeMap>` and `RwLock<HashMap>` degrade by **3.1× to 3.5×** under 8 concurrent writer threads compared to `artmap` because every write acquisition serializes the entire collection.
+- **Outperforming SkipMap on Writes & Mixed Loads**: `artmap` is **1.62× faster on concurrent writes** (548 µs vs. 885 µs) and **1.77× faster on mixed read/write workloads** (857 µs vs. 1.52 ms) by eliminating parent-node contention and leveraging lock-free atomic CAS for wide nodes.
+- **Coarse Lock Bottleneck**: Non-concurrent collections (`RwLock<BTreeMap>`, `RwLock<HashMap>`, `RwLock<imbl::OrdMap>`) run **6.5× to 9.7× slower** on mixed workloads and up to **14× slower on concurrent writes** because exclusive write acquisitions serialize all threads.
 - **7.1× Faster Point Reads**: In mixed read-write scenarios, `artmap`'s optimistic non-blocking readers resolve point lookups in **20.8 ns** without acquiring locks or invalidating CPU cache lines.
 - **True Multi-Writer Scaling**: Writers in `artmap` acquire fine-grained node locks only at the specific leaf or inner node being modified, allowing concurrent updates across disjoint prefixes to proceed in parallel.
 - **Epoch-Based Memory Safety**: Replaced or unlinked nodes are retired safely via `crossbeam-epoch` without reference-counting overhead on read traversal.

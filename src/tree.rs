@@ -471,46 +471,65 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
 
                 match next_child {
                     None => {
-                        // Add child to `header`
-                        let parent_ok = match parent {
-                            Some(p) => unsafe { (*p).latch.lock().is_ok() },
-                            None => self.root_latch.lock().is_ok(),
-                        };
-                        if !parent_ok {
-                            continue 'retry;
-                        }
-
-                        if header.latch.lock().is_err() {
-                            match parent {
-                                Some(p) => unsafe { (*p).latch.unlock() },
-                                None => self.root_latch.unlock(),
-                            }
-                            continue 'retry;
-                        }
-
-                        let parent_valid = match parent {
-                            Some(p) => unsafe { find_child(&*p, parent_byte) == Some(current) },
-                            None => self.root.load(Ordering::Acquire) == current.as_raw(),
-                        };
-                        if !parent_valid {
-                            header.latch.unlock();
-                            match parent {
-                                Some(p) => unsafe { (*p).latch.unlock() },
-                                None => self.root_latch.unlock(),
-                            }
-                            continue 'retry;
-                        }
-
-                        if unsafe { find_child(header, next_byte) }.is_some() {
-                            header.latch.unlock();
-                            match parent {
-                                Some(p) => unsafe { (*p).latch.unlock() },
-                                None => self.root_latch.unlock(),
+                        // Node256 lock-free atomic insertion fast-path
+                        if header.node_type == NodeType::Node256 {
+                            let n256 = unsafe { &mut *(header as *mut NodeHeader as *mut Node256) };
+                            if n256.children[next_byte as usize]
+                                .compare_exchange(
+                                    ptr::null_mut(),
+                                    tagged_new_leaf.as_raw(),
+                                    Ordering::Release,
+                                    Ordering::Acquire,
+                                )
+                                .is_ok()
+                            {
+                                n256.header.num_children += 1;
+                                self.len.fetch_add(1, Ordering::Relaxed);
+                                return Ok((None, new_leaf_ptr));
                             }
                             continue 'retry;
                         }
 
                         if is_node_full(header) {
+                            // Node needs to grow: lock parent and header
+                            let parent_ok = match parent {
+                                Some(p) => unsafe { (*p).latch.lock().is_ok() },
+                                None => self.root_latch.lock().is_ok(),
+                            };
+                            if !parent_ok {
+                                continue 'retry;
+                            }
+
+                            if header.latch.lock().is_err() {
+                                match parent {
+                                    Some(p) => unsafe { (*p).latch.unlock() },
+                                    None => self.root_latch.unlock(),
+                                }
+                                continue 'retry;
+                            }
+
+                            let parent_valid = match parent {
+                                Some(p) => unsafe { find_child(&*p, parent_byte) == Some(current) },
+                                None => self.root.load(Ordering::Acquire) == current.as_raw(),
+                            };
+                            if !parent_valid {
+                                header.latch.unlock();
+                                match parent {
+                                    Some(p) => unsafe { (*p).latch.unlock() },
+                                    None => self.root_latch.unlock(),
+                                }
+                                continue 'retry;
+                            }
+
+                            if unsafe { find_child(header, next_byte) }.is_some() {
+                                header.latch.unlock();
+                                match parent {
+                                    Some(p) => unsafe { (*p).latch.unlock() },
+                                    None => self.root_latch.unlock(),
+                                }
+                                continue 'retry;
+                            }
+
                             let new_node = unsafe { grow_node(header, guard) };
                             unsafe {
                                 insert_child_into_node(new_node, next_byte, tagged_new_leaf);
@@ -532,14 +551,20 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 None => self.root_latch.unlock(),
                             }
                         } else {
+                            // Fast path: node has room. Lock header only (no parent or root latch)
+                            if header.latch.lock().is_err() {
+                                continue 'retry;
+                            }
+
+                            if is_node_full(header) || unsafe { find_child(header, next_byte) }.is_some() {
+                                header.latch.unlock();
+                                continue 'retry;
+                            }
+
                             unsafe {
                                 insert_child_into_node(header, next_byte, tagged_new_leaf);
                             }
                             header.latch.unlock();
-                            match parent {
-                                Some(p) => unsafe { (*p).latch.unlock() },
-                                None => self.root_latch.unlock(),
-                            }
                         }
 
                         self.len.fetch_add(1, Ordering::Relaxed);
