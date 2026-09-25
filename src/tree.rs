@@ -61,9 +61,8 @@ unsafe fn drop_subtree<K, V>(ptr: TaggedPtr) {
         drop(Box::from_raw(ptr.as_leaf_ptr::<K, V>()));
     } else {
         let header = &*ptr.as_inner_ptr();
-        let exact = header.exact_leaf.load(Ordering::Relaxed);
-        if !exact.is_null() {
-            drop(Box::from_raw(exact as *mut Leaf<K, V>));
+        if let Some(leaf_ptr) = header.load_exact_leaf::<K, V>(Ordering::Relaxed) {
+            drop(Box::from_raw(leaf_ptr));
         }
         match header.node_type {
             NodeType::Node4 => {
@@ -183,14 +182,12 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                 depth += header.prefix_len as usize;
 
                 if depth == key_bytes.len() {
-                    let exact = header.exact_leaf.load(Ordering::Acquire);
+                    let exact = header.load_exact_leaf::<K, V>(Ordering::Acquire);
                     if !header.latch.validate(v) {
                         continue 'retry;
                     }
-                    if exact.is_null() {
-                        return None;
-                    }
-                    let leaf = unsafe { &*(exact as *mut Leaf<K, V>) };
+                    let leaf_ptr = exact?;
+                    let leaf = unsafe { &*leaf_ptr };
                     if leaf.key.as_bytes() == key_bytes {
                         return Some(&leaf.value);
                     } else {
@@ -261,11 +258,10 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
             }
             depth += header.prefix_len as usize;
             if depth == key_bytes.len() {
-                let exact = header.exact_leaf.load(Ordering::Acquire);
-                if !exact.is_null() {
-                    let leaf = unsafe { &*(exact as *mut Leaf<K, V>) };
+                if let Some(leaf_ptr) = header.load_exact_leaf::<K, V>(Ordering::Acquire) {
+                    let leaf = unsafe { &*leaf_ptr };
                     if leaf.key.as_bytes() == key_bytes {
-                        return exact as *mut Leaf<K, V>;
+                        return leaf_ptr;
                     }
                 }
                 return ptr::null_mut();
@@ -451,26 +447,22 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                         continue 'retry;
                     }
 
-                    let exact = header.exact_leaf.load(Ordering::Acquire);
-                    if exact.is_null() {
-                        header
-                            .exact_leaf
-                            .store(tagged_new_leaf.as_raw(), Ordering::Release);
+                    if let Some(leaf_ptr) = header.load_exact_leaf::<K, V>(Ordering::Acquire) {
+                        let existing_leaf = unsafe { &mut *leaf_ptr };
+                        let new_leaf = unsafe { Box::from_raw(new_leaf_ptr) };
+                        if replace_if_present {
+                            let old_val = std::mem::replace(&mut existing_leaf.value, new_leaf.value);
+                            header.latch.unlock();
+                            return Ok((Some(old_val), leaf_ptr));
+                        } else {
+                            header.latch.unlock();
+                            return Ok((None, leaf_ptr));
+                        }
+                    } else {
+                        header.exact_leaf.store(tagged_new_leaf.as_raw(), Ordering::Release);
                         self.len.fetch_add(1, Ordering::Relaxed);
                         header.latch.unlock();
                         return Ok((None, new_leaf_ptr));
-                    } else {
-                        let existing_leaf = unsafe { &mut *(exact as *mut Leaf<K, V>) };
-                        let new_leaf = unsafe { Box::from_raw(new_leaf_ptr) };
-                        if replace_if_present {
-                            let old_val =
-                                std::mem::replace(&mut existing_leaf.value, new_leaf.value);
-                            header.latch.unlock();
-                            return Ok((Some(old_val), exact as *mut Leaf<K, V>));
-                        } else {
-                            header.latch.unlock();
-                            return Ok((None, exact as *mut Leaf<K, V>));
-                        }
                     }
                 }
 
@@ -671,23 +663,17 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                         continue 'retry;
                     }
 
-                    let exact = header.exact_leaf.load(Ordering::Acquire);
-                    if exact.is_null() {
-                        header.latch.unlock();
-                        return None;
-                    }
-
-                    let leaf = unsafe { &*(exact as *mut Leaf<K, V>) };
-                    if leaf.key.as_bytes() == key_bytes {
-                        header.exact_leaf.store(ptr::null_mut(), Ordering::Release);
-                        self.len.fetch_sub(1, Ordering::Relaxed);
-                        header.latch.unlock();
-                        let val = unsafe { ptr::read(&leaf.value) };
-                        let raw_leaf = exact as usize;
-                        guard.defer(move || unsafe {
-                            drop(Box::from_raw(raw_leaf as *mut Leaf<K, V>))
-                        });
-                        return Some(val);
+                    if let Some(leaf_ptr) = header.load_exact_leaf::<K, V>(Ordering::Acquire) {
+                        let leaf = unsafe { &*leaf_ptr };
+                        if leaf.key.as_bytes() == key_bytes {
+                            header.exact_leaf.store(ptr::null_mut(), Ordering::Release);
+                            self.len.fetch_sub(1, Ordering::Relaxed);
+                            header.latch.unlock();
+                            let val = unsafe { ptr::read(&leaf.value) };
+                            let raw_leaf = leaf_ptr as usize;
+                            guard.defer(move || unsafe { drop(Box::from_raw(raw_leaf as *mut Leaf<K, V>)) });
+                            return Some(val);
+                        }
                     }
                     header.latch.unlock();
                     return None;
@@ -850,12 +836,13 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
         let new_depth = depth + header.prefix_len as usize;
 
         if new_depth == search_key.len() {
-            let exact = header.exact_leaf.load(Ordering::Acquire);
-            if include_equal && !exact.is_null() {
-                if !header.latch.validate(v) {
-                    return Err(());
+            if include_equal {
+                if let Some(leaf_ptr) = header.load_exact_leaf::<K, V>(Ordering::Acquire) {
+                    if !header.latch.validate(v) {
+                        return Err(());
+                    }
+                    return Ok(Some(leaf_ptr));
                 }
-                return Ok(Some(exact as *mut Leaf<K, V>));
             }
 
             if let Some(leaf) = find_first_child_leaf(header, 0) {
@@ -947,12 +934,13 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
         let new_depth = depth + header.prefix_len as usize;
 
         if new_depth >= search_key.len() {
-            let exact = header.exact_leaf.load(Ordering::Acquire);
-            if include_equal && !exact.is_null() {
-                if !header.latch.validate(v) {
-                    return Err(());
+            if include_equal {
+                if let Some(leaf_ptr) = header.load_exact_leaf::<K, V>(Ordering::Acquire) {
+                    if !header.latch.validate(v) {
+                        return Err(());
+                    }
+                    return Ok(Some(leaf_ptr));
                 }
-                return Ok(Some(exact as *mut Leaf<K, V>));
             }
             if !header.latch.validate(v) {
                 return Err(());
@@ -982,12 +970,11 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
             }
         }
 
-        let exact = header.exact_leaf.load(Ordering::Acquire);
-        if !exact.is_null() {
+        if let Some(leaf_ptr) = header.load_exact_leaf::<K, V>(Ordering::Acquire) {
             if !header.latch.validate(v) {
                 return Err(());
             }
-            return Ok(Some(exact as *mut Leaf<K, V>));
+            return Ok(Some(leaf_ptr));
         }
 
         if !header.latch.validate(v) {
@@ -1062,9 +1049,8 @@ unsafe fn validate_node_invariants<K: AsBytes, V>(ptr: TaggedPtr, current_prefix
     prefix_buf.extend_from_slice(header.prefix_slice());
 
     let mut count = 0;
-    let exact = header.exact_leaf.load(Ordering::SeqCst);
-    if !exact.is_null() {
-        let leaf = &*(exact as *mut Leaf<K, V>);
+    if let Some(leaf_ptr) = header.load_exact_leaf::<K, V>(Ordering::SeqCst) {
+        let leaf = &*leaf_ptr;
         assert_eq!(leaf.key.as_bytes(), prefix_buf.as_slice());
         count += 1;
     }

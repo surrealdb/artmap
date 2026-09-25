@@ -120,6 +120,16 @@ pub struct NodeHeader {
 }
 
 impl NodeHeader {
+	#[inline]
+	pub fn load_exact_leaf<K, V>(&self, order: Ordering) -> Option<*mut Leaf<K, V>> {
+		let raw = self.exact_leaf.load(order);
+		if raw.is_null() {
+			None
+		} else {
+			Some(TaggedPtr::from_raw(raw).as_leaf_ptr::<K, V>())
+		}
+	}
+
     #[inline]
     pub fn new(node_type: NodeType, prefix: &[u8]) -> Self {
         let mut p = [0u8; MAX_PREFIX_LEN];

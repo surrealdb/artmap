@@ -22,7 +22,7 @@ It combines the $O(k)$ key-length lookup time and prefix compression of adaptive
 
 Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM**, Linux 6.8):
 
-| Data Structure | Point&nbsp;Read (Random&nbsp;Hit) | Point&nbsp;Insert (Concurrent) | Range&nbsp;Scan (100&nbsp;items) | Allocations /&nbsp;Insert |
+| Data Structure | Point&nbsp;Read (Random&nbsp;Hit) | Point&nbsp;Insert | Range&nbsp;Scan (100&nbsp;items) | Allocations /&nbsp;Insert |
 | :--- | ---: | ---: | ---: | ---: |
 | **`artmap::ArtMap`**<br><sup>&nbsp;(Slice Lookup)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**20.8&nbsp;ns**<br><sup>(48.0M/s)</sup> | — | — | **0&nbsp;allocs** |
 | **`artmap::ArtMap`**<br><sup>&nbsp;(Standard Key)</sup> | **20.8&nbsp;ns**<br><sup>(48.0M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**36.1&nbsp;ns**<br><sup>(27.7M/s)</sup> | **2.25&nbsp;µs**<br><sup>(44.3M/s)</sup> | **1.0&nbsp;allocs** |
@@ -33,11 +33,24 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 <sup>* Rocket badge denotes the fastest implementation among ordered, concurrent range-scannable maps. `std::collections::HashMap` is included as an unordered $O(1)$ reference baseline and does not support range queries, sorted scans, or concurrent multi-writer scaling.</sup>
 
-- **7.1× Faster Point Lookups**: `artmap` resolves random point lookups in **20.8 ns** (48.0M ops/sec), compared to **147.2 ns** for `crossbeam-skiplist::SkipMap` and **60.1 ns** for standard `BTreeMap`.
-- **2.7× Faster Ingestion**: Point inserts complete in **36.1 ns** (27.7M ops/sec) vs. **96.9 ns** for `crossbeam-skiplist::SkipMap`.
-- **Zero-Atomic-Write Reads**: Optimistic readers traverse nodes without issuing atomic write instructions or updating reference counters, eliminating CPU cache-line bouncing.
-- **True Multi-Writer Scaling**: Writers acquire fine-grained node locks only at the local leaf or node being resized, allowing concurrent inserts across disjoint key prefixes to scale linearly with core count.
-- **Epoch-Based Memory Safety**: Replaced or shrunk nodes are retired safely via `crossbeam-epoch` without the runtime overhead of atomic reference counts.
+### Multi-Threaded Concurrent Performance
+
+When running multi-threaded workloads with concurrent writers, non-concurrent data structures (`BTreeMap`, `HashMap`, `imbl::OrdMap`) require synchronization via `parking_lot::RwLock`. Under write contention, exclusive lock acquisition serializes all threads, causing severe lock convoying and throughput collapse.
+
+Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM**, Linux 6.8):
+
+| Data Structure | Concurrent&nbsp;Writes <br><sup>(8 Threads)</sup> | Mixed&nbsp;Workload <br><sup>(4 Readers + 4 Writers)</sup> | Concurrency Model |
+| :--- | ---: | ---: | :--- |
+| **`artmap::ArtMap`** | **1.92&nbsp;ms**<br><sup>(4.17M/s)</sup> | **2.25&nbsp;ms**<br><sup>(7.12M/s)</sup> | Non-Blocking Reads + OLC Writes |
+| `crossbeam_skiplist::SkipMap` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**897&nbsp;µs**<br><sup>(8.92M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.52&nbsp;ms**<br><sup>(10.5M/s)</sup> | Lock-Free Atomic CAS |
+| `parking_lot::RwLock<BTreeMap>` | 5.88&nbsp;ms<br><sup>(1.36M/s)</sup> | 5.82&nbsp;ms<br><sup>(2.75M/s)</sup> | Coarse Exclusive Lock |
+| `parking_lot::RwLock<HashMap>`* | 6.68&nbsp;ms<br><sup>(1.20M/s)</sup> | 7.87&nbsp;ms<br><sup>(2.03M/s)</sup> | Coarse Exclusive Lock |
+| `parking_lot::RwLock<imbl::OrdMap>` | 6.93&nbsp;ms<br><sup>(1.15M/s)</sup> | 8.29&nbsp;ms<br><sup>(1.93M/s)</sup> | Coarse Exclusive Lock |
+
+- **Coarse Lock Bottleneck**: `RwLock<BTreeMap>` and `RwLock<HashMap>` degrade by **3.1× to 3.5×** under 8 concurrent writer threads compared to `artmap` because every write acquisition serializes the entire collection.
+- **7.1× Faster Point Reads**: In mixed read-write scenarios, `artmap`'s optimistic non-blocking readers resolve point lookups in **20.8 ns** without acquiring locks or invalidating CPU cache lines.
+- **True Multi-Writer Scaling**: Writers in `artmap` acquire fine-grained node locks only at the specific leaf or inner node being modified, allowing concurrent updates across disjoint prefixes to proceed in parallel.
+- **Epoch-Based Memory Safety**: Replaced or unlinked nodes are retired safely via `crossbeam-epoch` without reference-counting overhead on read traversal.
 
 ## Features
 
