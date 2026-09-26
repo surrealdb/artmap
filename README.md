@@ -100,7 +100,7 @@ Benchmarked with 100,000 keys (64-bit integer keys and 64-bit values), measuring
 - **Optimistic Lock Coupling (OLC / ROWEX)**: Readers validate version counters optimistically, operating with zero locks and zero atomic writes.
 - **Zero-Allocation Slice Queries**: Query entries directly with raw byte slices (`&[u8]`) or string slices (`&str`) without allocating wrapper objects.
 - **Bidirectional Range Iterators**: Full `DoubleEndedIterator` support for ordered forward and reverse scans (`map.range(A..B)` and `map.range(A..B).rev()`).
-- **Thread Safety Guaranteed**: Compile-time static assertions ensure both `ArtMap<K, V>` and `ArenaArtMap<K, V>` implement `Send + Sync`.
+- **Thread Safety Guaranteed**: Compile-time static assertions ensure `ArtMap`, `VersionedArtMap`, `ArenaArtMap`, and `ArenaVersionedArtMap` implement `Send + Sync`.
 - **Deterministic Simulation Tested (DST)**: Validated continuously by a seeded PRNG fuzzer against an in-memory `BTreeMap` reference oracle with comprehensive structural invariant checking.
 
 ## Quick Start
@@ -217,31 +217,31 @@ for (k, v) in map.range(&start..&end).rev() {
 }
 ```
 
-### Arena-Backed ART (`ArenaArtMap`)
+### Arena-Backed ART (`ArenaArtMap` & `ArenaVersionedArtMap`)
 
 For transactional storage engines, database memtables, or workloads requiring instant $O(1)$ teardown without per-node garbage collection:
 
 ```rust
-use artmap::arena::ArenaArtMap;
+use artmap::arena::{ArenaArtMap, ArenaVersionedArtMap};
 
-// Allocate with a 16 MB pre-allocated arena buffer
+// Compact unversioned map: 0 heap allocations, 24-byte leaves
 let map = ArenaArtMap::<String, i32>::with_capacity(16 * 1024 * 1024);
-
-// Inserts allocate zero heap memory outside the arena buffer
 map.insert("account:1001".to_string(), 500);
+assert_eq!(map.get("account:1001"), Some(500));
 
-// Multi-version concurrency control (MVCC) support
-map.insert_versioned("account:1001".to_string(), 1, 500);
-map.insert_versioned("account:1001".to_string(), 2, 750);
+// Multi-version (MVCC) map: built-in 64-bit sequence numbers & snapshot reads
+let vmap = ArenaVersionedArtMap::<String, i32>::with_capacity(16 * 1024 * 1024);
+vmap.insert_versioned("account:1001".to_string(), 1, 500);
+vmap.insert_versioned("account:1001".to_string(), 2, 750);
 
 // Point read with version <= 1 returns 500
-assert_eq!(map.get_version_le("account:1001", 1), Some((1, 500)));
+assert_eq!(vmap.get_version_le("account:1001", 1), Some((1, 500)));
 
 // Point read with version <= 2 returns 750
-assert_eq!(map.get_version_le("account:1001", 2), Some((2, 750)));
+assert_eq!(vmap.get_version_le("account:1001", 2), Some((2, 750)));
 
 // Bidirectional range scan with entry metadata
-for entry in map.range("account:1000".."account:2000") {
+for entry in vmap.range("account:1000".."account:2000") {
     println!("{}: {} (v{})", entry.key(), entry.value(), entry.version());
 }
 ```
@@ -266,7 +266,7 @@ ARTMAP_SIM_SEED=20202 cargo test --test sim -- --nocapture
 
 ## Benchmarks
 
-Benchmarks compare `artmap` and `artmap::ArenaArtMap` against `arenaskiplist::SkipList`, `crossbeam-skiplist::SkipMap`, `std::collections::BTreeMap`, `imbl::OrdMap`, and `std::collections::HashMap`:
+Benchmarks compare the four `artmap` data structures (`ArtMap`, `VersionedArtMap`, `ArenaArtMap`, and `ArenaVersionedArtMap`) against `arenaskiplist::SkipList`, `crossbeam-skiplist::SkipMap`, `std::collections::BTreeMap`, `imbl::OrdMap`, and `std::collections::HashMap`:
 
 ```bash
 # Run comparison benchmarks locally
