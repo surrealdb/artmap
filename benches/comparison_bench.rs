@@ -69,6 +69,24 @@ fn bench_insert(c: &mut Criterion) {
         })
     });
 
+    // ArenaArtMap with Inserter
+    group.bench_function("arena_artmap_with_inserter", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
+                let mut ins = artmap::arena::ArenaInserter::new();
+                let start = Instant::now();
+                for key in 0..BATCH {
+                    let k = key.to_be_bytes();
+                    let _ = map.insert_with_inserter(k, key, &mut ins);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
     // arenaskiplist
     group.bench_function("arenaskiplist", |b| {
         b.iter_custom(|iters| {
@@ -81,6 +99,26 @@ fn bench_insert(c: &mut Criterion) {
                     let k = key.to_be_bytes();
                     let val = key.to_be_bytes();
                     let _ = list.insert(&k, &val);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    // arenaskiplist with Inserter
+    group.bench_function("arenaskiplist_with_inserter", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let arena = SkiplistArena::with_capacity(32 * 1024 * 1024);
+                let list = SkipList::new(arena);
+                let mut ins = arenaskiplist::Inserter::new();
+                let start = Instant::now();
+                for key in 0..BATCH {
+                    let k = key.to_be_bytes();
+                    let val = key.to_be_bytes();
+                    let _ = list.insert_with_inserter(&k, &val, &mut ins);
                 }
                 total += start.elapsed();
             }
@@ -146,6 +184,131 @@ fn bench_insert(c: &mut Criterion) {
                 let start = Instant::now();
                 for key in 0..BATCH {
                     imbl_map.insert(key, key);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_random_insert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("random_insert");
+    const BATCH: u64 = 50_000;
+    group.throughput(Throughput::Elements(BATCH));
+
+    let mut rng = seeded_rng(0x12345678);
+    let random_keys: Vec<[u8; 8]> = (0..BATCH).map(|_| rng.gen::<u64>().to_be_bytes()).collect();
+
+    // ArtMap
+    group.bench_function("artmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let map = ArtMap::<[u8; 8], u64>::new();
+                let start = Instant::now();
+                for (i, &k) in random_keys.iter().enumerate() {
+                    let _ = map.insert(k, i as u64);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    // ArenaArtMap
+    group.bench_function("arena_artmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
+                let start = Instant::now();
+                for (i, &k) in random_keys.iter().enumerate() {
+                    let _ = map.insert(k, i as u64);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    // arenaskiplist
+    group.bench_function("arenaskiplist", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let arena = SkiplistArena::with_capacity(32 * 1024 * 1024);
+                let list = SkipList::new(arena);
+                let start = Instant::now();
+                for (i, &k) in random_keys.iter().enumerate() {
+                    let val = (i as u64).to_be_bytes();
+                    let _ = list.insert(&k, &val);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    // crossbeam-skiplist SkipMap
+    group.bench_function("crossbeam_skipmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let map = SkipMap::<[u8; 8], u64>::new();
+                let start = Instant::now();
+                for (i, &k) in random_keys.iter().enumerate() {
+                    let _ = map.insert(k, i as u64);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    // BTreeMap
+    group.bench_function("btreemap", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let mut btree = BTreeMap::new();
+                let start = Instant::now();
+                for (i, &k) in random_keys.iter().enumerate() {
+                    btree.insert(k, i as u64);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    // HashMap
+    group.bench_function("hashmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let mut hmap = HashMap::new();
+                let start = Instant::now();
+                for (i, &k) in random_keys.iter().enumerate() {
+                    hmap.insert(k, i as u64);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    // imbl::OrdMap
+    group.bench_function("imbl_ordmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let mut imbl_map = imbl::OrdMap::new();
+                let start = Instant::now();
+                for (i, &k) in random_keys.iter().enumerate() {
+                    imbl_map.insert(k, i as u64);
                 }
                 total += start.elapsed();
             }
@@ -976,6 +1139,7 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_insert,
+    bench_random_insert,
     bench_get,
     bench_scan,
     bench_concurrent_writes,

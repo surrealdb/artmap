@@ -1,4 +1,4 @@
-use artmap::arena::{Arena, ArenaArtMap};
+use artmap::arena::{Arena, ArenaArtMap, ArenaInserter, ArenaVersionedArtMap};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -55,8 +55,8 @@ fn test_arena_artmap_node_growth() {
 }
 
 #[test]
-fn test_arena_artmap_versioned_snapshot_reads() {
-    let map = ArenaArtMap::<String, String>::with_capacity(16 * 1024 * 1024);
+fn test_arena_versioned_artmap_snapshot_reads() {
+    let map = ArenaVersionedArtMap::<String, String>::with_capacity(16 * 1024 * 1024);
 
     // Insert multiple versions of the same key
     map.insert_versioned("account:1".to_string(), 100, "balance: 50".to_string());
@@ -193,4 +193,109 @@ fn test_arena_artmap_reset() {
     }
     assert_eq!(map2.len(), 1000);
     assert_eq!(map2.get("new_key:0500"), Some(5000));
+}
+
+#[test]
+fn test_arena_artmap_inserter() {
+    let map = ArenaArtMap::<String, usize>::with_capacity(16 * 1024 * 1024);
+    let mut inserter = ArenaInserter::new();
+
+    // Insert 5000 sequential items with inserter
+    for i in 0..5000 {
+        map.insert_with_inserter(format!("seq:{i:05}"), i, &mut inserter);
+    }
+    assert_eq!(map.len(), 5000);
+
+    for i in 0..5000 {
+        assert_eq!(map.get(&format!("seq:{i:05}")), Some(i));
+    }
+
+    // Interleaved inserts with inserter
+    inserter.reset();
+    for i in 5000..6000 {
+        map.insert_with_inserter(format!("interleaved:{i:05}"), i * 2, &mut inserter);
+    }
+    assert_eq!(map.len(), 6000);
+}
+
+#[test]
+fn test_arena_artmap_scan_api() {
+    let map = ArenaArtMap::<String, usize>::with_capacity(16 * 1024 * 1024);
+
+    for i in 0..500 {
+        map.insert(format!("user:{i:04}"), i);
+    }
+
+    let mut scanned = Vec::new();
+    map.scan("user:0100".."user:0200", |k, v| {
+        scanned.push((k.clone(), *v));
+        true
+    });
+    assert_eq!(scanned.len(), 100);
+    assert_eq!(scanned[0], ("user:0100".to_string(), 100));
+    assert_eq!(scanned[99], ("user:0199".to_string(), 199));
+
+    // Early termination
+    let mut count = 0;
+    map.scan("user:0000".., |_k, _v| {
+        count += 1;
+        count < 25
+    });
+    assert_eq!(count, 25);
+}
+
+#[test]
+fn test_arena_versioned_artmap_scan_api() {
+    let map = ArenaVersionedArtMap::<String, usize>::with_capacity(16 * 1024 * 1024);
+
+    for i in 0..500 {
+        map.insert_versioned(format!("user:{i:04}"), i as u64, i);
+    }
+
+    let mut scanned = Vec::new();
+    map.scan("user:0100".."user:0200", |k, v, ver| {
+        scanned.push((k.clone(), *v, ver));
+        true
+    });
+    assert_eq!(scanned.len(), 100);
+    assert_eq!(scanned[0], ("user:0100".to_string(), 100, 100));
+    assert_eq!(scanned[99], ("user:0199".to_string(), 199, 199));
+}
+
+#[test]
+fn test_arena_versioned_artmap_range_and_crud() {
+    let map = ArenaVersionedArtMap::<String, u64>::with_capacity(16 * 1024 * 1024);
+
+    assert!(map.is_empty());
+    assert_eq!(map.len(), 0);
+
+    map.insert_versioned("k1".to_string(), 1, 10);
+    map.insert_versioned("k2".to_string(), 1, 20);
+    map.insert_versioned("k3".to_string(), 1, 30);
+    assert_eq!(map.len(), 3);
+
+    // Overwrite k2 with version 2
+    map.insert_versioned("k2".to_string(), 2, 25);
+
+    assert_eq!(map.get("k2"), Some(25));
+    assert_eq!(map.get_latest("k2"), Some((2, 25)));
+    assert_eq!(map.get_version_le("k2", 1), Some((1, 20)));
+    assert_eq!(map.get_version_le("k2", 2), Some((2, 25)));
+    assert_eq!(map.get_version_le("k2", 3), Some((2, 25)));
+
+    // Iterate
+    let items: Vec<(String, u64, u64)> = map
+        .iter()
+        .map(|e| (e.key().clone(), *e.value(), e.version()))
+        .collect();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0], ("k1".to_string(), 10, 1));
+    assert_eq!(items[1], ("k2".to_string(), 25, 2));
+    assert_eq!(items[2], ("k3".to_string(), 30, 1));
+
+    // Remove
+    assert_eq!(map.remove("k2"), Some(25));
+    assert_eq!(map.get("k2"), None);
+    assert_eq!(map.get_latest("k2"), None);
+    assert_eq!(map.len(), 2);
 }
