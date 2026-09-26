@@ -30,9 +30,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33ca55ee147b1926dbea904f50fe4902494e97bc742205abbbf10c709e43815f"
 
 [[package]]
+name = "arenaskiplist"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f145446d02c5d1573972c2d562d2f397f37c79b3d1426f3cad8f18cac8bc4bf8"
+dependencies = [
+ "fastrand",
+]
+
+[[package]]
 name = "artmap"
 version = "0.5.0"
 dependencies = [
+ "arenaskiplist",
  "byteslice",
  "criterion",
  "crossbeam-epoch",
@@ -277,6 +287,12 @@ dependencies = [
  "libc",
  "windows-sys",
 ]
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "futures-core"

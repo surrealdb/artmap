@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use artmap::arena::ArenaArtMap;
 use artmap::ArtMap;
 use crossbeam_skiplist::SkipMap;
 use std::collections::{BTreeMap, HashMap};
@@ -24,6 +25,32 @@ fn main() {
 }
 
 const COUNTS: &[usize] = &[50_000];
+
+#[divan::bench(args = COUNTS)]
+fn alloc_arena_artmap_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
+    let map = ArenaArtMap::<[u8; 8], usize>::with_capacity(32 * 1024 * 1024);
+    let mut key = 0usize;
+
+    bencher.counter(count).bench_local(|| {
+        let k = (key as u64).to_be_bytes();
+        let _ = map.insert(k, key);
+        key += 1;
+    });
+}
+
+#[divan::bench(args = COUNTS)]
+fn alloc_arenaskiplist_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
+    let arena = arenaskiplist::Arena::with_capacity(32 * 1024 * 1024);
+    let list = arenaskiplist::SkipList::new(arena);
+    let mut key = 0usize;
+
+    bencher.counter(count).bench_local(|| {
+        let k = (key as u64).to_be_bytes();
+        let val = key.to_be_bytes();
+        let _ = list.insert(&k, &val);
+        key += 1;
+    });
+}
 
 #[divan::bench(args = COUNTS)]
 fn alloc_artmap_insert(bencher: divan::Bencher<'_, '_>, count: usize) {

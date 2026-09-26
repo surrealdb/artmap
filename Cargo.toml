@@ -28,6 +28,7 @@ criterion = "0.5.1"
 divan = "0.1.14"
 imbl = "7.0"
 crossbeam-skiplist = "0.1.3"
+arenaskiplist = "0.2.0"
 parking_lot = "0.12"
 
 [[bench]]
