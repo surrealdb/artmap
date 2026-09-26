@@ -71,7 +71,7 @@ Add `artmap` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-artmap = "0.1"
+artmap = "0.2"
 ```
 
 ```rust
