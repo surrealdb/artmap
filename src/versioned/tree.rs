@@ -211,14 +211,14 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                     }
                 }
 
-                let (matched, complete) = header.match_prefix(key_bytes, depth);
+                let (_matched, complete) = header.match_prefix(key_bytes, depth);
                 if !complete {
                     if !header.latch.validate(v) {
                         continue 'retry;
                     }
                     return None;
                 }
-                depth += matched;
+                depth += header.prefix_len as usize;
 
                 if depth == key_bytes.len() {
                     let exact = header.load_exact_versioned_leaf::<K, V>(Ordering::Acquire);
@@ -366,7 +366,7 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
             let mut depth = 0;
 
             'traverse: loop {
-                let header = unsafe { &*current.as_inner_ptr() };
+                let header = unsafe { &mut *current.as_inner_ptr() };
                 let v_header = match header.latch.read_version() {
                     Some(v) => v,
                     None => continue 'retry,
@@ -382,7 +382,7 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                         continue 'retry;
                     }
 
-                    if !header.latch.lock().is_ok() {
+                    if header.latch.lock_version(v_header).is_err() {
                         match parent {
                             Some(p) => unsafe { (*p).latch.unlock() },
                             None => self.root_latch.unlock(),
@@ -390,42 +390,54 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                         continue 'retry;
                     }
 
-                    let prefix = header.prefix_slice();
-                    let byte_existing = prefix[matched];
-
-                    let exact_new = depth + matched == key_bytes.len();
-                    let byte_new = if !exact_new {
-                        key_bytes[depth + matched]
-                    } else {
-                        0
+                    let parent_valid = match parent {
+                        Some(p) => unsafe { find_child(&*p, parent_byte) == Some(current) },
+                        None => self.root.load(Ordering::Acquire) == current.as_raw(),
                     };
-
-                    let new_n4 = Node4::new(&prefix[..matched]);
-                    let n4_ptr = Box::into_raw(new_n4);
-
-                    let remaining_existing = &prefix[(matched + 1)..];
-                    let old_inner = current.as_inner_ptr();
-                    unsafe {
-                        (*old_inner).set_prefix(remaining_existing);
-                    }
-
-                    unsafe {
-                        (*n4_ptr).insert_child(byte_existing, current);
-                        if exact_new {
-                            (*n4_ptr)
-                                .header
-                                .exact_leaf
-                                .store(tagged_new_leaf.as_raw(), Ordering::Relaxed);
-                        } else {
-                            (*n4_ptr).insert_child(byte_new, tagged_new_leaf);
+                    if !parent_valid {
+                        header.latch.unlock();
+                        match parent {
+                            Some(p) => unsafe { (*p).latch.unlock() },
+                            None => self.root_latch.unlock(),
                         }
+                        continue 'retry;
                     }
 
-                    let new_inner = TaggedPtr::from_inner(n4_ptr as *mut NodeHeader);
+                    let cur_prefix_len = (header.prefix_len as usize).min(MAX_PREFIX_LEN);
+                    let mut cur_prefix_buf = [0u8; MAX_PREFIX_LEN];
+                    cur_prefix_buf[..cur_prefix_len].copy_from_slice(header.prefix_slice());
+                    let cur_prefix = &cur_prefix_buf[..cur_prefix_len];
+
+                    let mismatch_char_existing = cur_prefix[matched];
+
+                    let mut split_node = Node4::new(&cur_prefix[..matched]);
+
+                    let remaining_prefix = &cur_prefix[(matched + 1)..];
+                    let mut new_p = [0u8; MAX_PREFIX_LEN];
+                    let new_p_len = remaining_prefix.len().min(MAX_PREFIX_LEN);
+                    new_p[..new_p_len].copy_from_slice(&remaining_prefix[..new_p_len]);
+                    header.prefix = new_p;
+                    header.prefix_len = remaining_prefix.len() as u16;
+
+                    split_node.insert_child(mismatch_char_existing, TaggedPtr::from_inner(header));
+
+                    if depth + matched == key_bytes.len() {
+                        split_node
+                            .header
+                            .exact_leaf
+                            .store(tagged_new_leaf.as_raw(), Ordering::Relaxed);
+                    } else {
+                        let new_char = key_bytes[depth + matched];
+                        split_node.insert_child(new_char, tagged_new_leaf);
+                    }
+
+                    let split_ptr = Box::into_raw(split_node);
+                    let tagged_split =
+                        TaggedPtr::from_inner(&mut unsafe { &mut *split_ptr }.header);
 
                     match parent {
-                        Some(p) => unsafe { self.replace_child(p, parent_byte, new_inner) },
-                        None => self.root.store(new_inner.as_raw(), Ordering::Release),
+                        Some(p) => unsafe { self.replace_child(p, parent_byte, tagged_split) },
+                        None => self.root.store(tagged_split.as_raw(), Ordering::Release),
                     }
 
                     self.len.fetch_add(1, Ordering::Relaxed);
@@ -437,26 +449,25 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                     return true;
                 }
 
-                depth += matched;
+                depth += header.prefix_len as usize;
 
                 if depth == key_bytes.len() {
-                    if !header.latch.lock().is_ok() {
+                    if header.latch.lock_version(v_header).is_err() {
                         continue 'retry;
                     }
 
-                    let exact_raw = header.exact_leaf.load(Ordering::Acquire);
-                    if !exact_raw.is_null() {
-                        let existing_leaf_ptr =
-                            TaggedPtr::from_raw(exact_raw).as_versioned_leaf_ptr::<K, V>();
+                    if let Some(leaf_ptr) =
+                        header.load_exact_versioned_leaf::<K, V>(Ordering::Acquire)
+                    {
                         unsafe {
                             (*new_leaf_ptr)
                                 .next_version
-                                .store(existing_leaf_ptr, Ordering::Relaxed);
+                                .store(leaf_ptr, Ordering::Relaxed);
+                            header
+                                .exact_leaf
+                                .store(tagged_new_leaf.as_raw(), Ordering::Release);
+                            header.latch.unlock();
                         }
-                        header
-                            .exact_leaf
-                            .store(tagged_new_leaf.as_raw(), Ordering::Release);
-                        header.latch.unlock();
                         return true;
                     } else {
                         header
@@ -1035,14 +1046,6 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
             }
             NodeType::Node256 => unreachable!("Node256 is maximum node type"),
         }
-    }
-}
-
-impl NodeHeader {
-    fn set_prefix(&mut self, new_prefix: &[u8]) {
-        let p_len = new_prefix.len().min(MAX_PREFIX_LEN);
-        self.prefix[..p_len].copy_from_slice(&new_prefix[..p_len]);
-        self.prefix_len = new_prefix.len() as u16;
     }
 }
 
