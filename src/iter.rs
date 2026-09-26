@@ -27,10 +27,20 @@ use crate::node::{
 };
 use crate::tree::Tree;
 
+const MAX_STACK_DEPTH: usize = 16;
+const INLINE_KEY_BUF: usize = 64;
+
 #[derive(Clone, Copy)]
 struct CursorFrame {
     node: *mut NodeHeader,
     current_pos: usize,
+}
+
+impl CursorFrame {
+    const NULL: Self = Self {
+        node: std::ptr::null_mut(),
+        current_pos: 0,
+    };
 }
 
 /// An iterator over a range of entries in an [`ArtMap`](crate::ArtMap).
@@ -39,9 +49,15 @@ pub struct Range<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
     _guard: Guard,
     start_bound: Bound<Vec<u8>>,
     end_bound: Bound<Vec<u8>>,
-    stack: Vec<CursorFrame>,
-    cursor_front: Vec<u8>,
-    cursor_back: Vec<u8>,
+    stack: [CursorFrame; MAX_STACK_DEPTH],
+    stack_len: usize,
+    stack_overflow: Vec<CursorFrame>,
+    cursor_front_buf: [u8; INLINE_KEY_BUF],
+    cursor_front_len: usize,
+    cursor_front_overflow: Vec<u8>,
+    cursor_back_buf: [u8; INLINE_KEY_BUF],
+    cursor_back_len: usize,
+    cursor_back_overflow: Vec<u8>,
     has_front: bool,
     has_back: bool,
     exhausted: bool,
@@ -59,12 +75,103 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
             _guard: guard,
             start_bound,
             end_bound,
-            stack: Vec::with_capacity(16),
-            cursor_front: Vec::with_capacity(32),
-            cursor_back: Vec::with_capacity(32),
+            stack: [CursorFrame::NULL; MAX_STACK_DEPTH],
+            stack_len: 0,
+            stack_overflow: Vec::new(),
+            cursor_front_buf: [0u8; INLINE_KEY_BUF],
+            cursor_front_len: 0,
+            cursor_front_overflow: Vec::new(),
+            cursor_back_buf: [0u8; INLINE_KEY_BUF],
+            cursor_back_len: 0,
+            cursor_back_overflow: Vec::new(),
             has_front: false,
             has_back: false,
             exhausted: false,
+        }
+    }
+
+    #[inline]
+    fn stack_push(&mut self, frame: CursorFrame) {
+        if self.stack_len < MAX_STACK_DEPTH && self.stack_overflow.is_empty() {
+            self.stack[self.stack_len] = frame;
+            self.stack_len += 1;
+        } else {
+            self.stack_overflow.push(frame);
+        }
+    }
+
+    #[inline]
+    fn stack_last_mut(&mut self) -> Option<&mut CursorFrame> {
+        if let Some(f) = self.stack_overflow.last_mut() {
+            Some(f)
+        } else if self.stack_len > 0 {
+            Some(&mut self.stack[self.stack_len - 1])
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn stack_pop(&mut self) -> Option<CursorFrame> {
+        if let Some(f) = self.stack_overflow.pop() {
+            Some(f)
+        } else if self.stack_len > 0 {
+            self.stack_len -= 1;
+            Some(self.stack[self.stack_len])
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn stack_clear(&mut self) {
+        self.stack_len = 0;
+        self.stack_overflow.clear();
+    }
+
+    #[inline]
+    fn set_cursor_front(&mut self, bytes: &[u8]) {
+        self.has_front = true;
+        if bytes.len() <= INLINE_KEY_BUF {
+            self.cursor_front_buf[..bytes.len()].copy_from_slice(bytes);
+            self.cursor_front_len = bytes.len();
+            self.cursor_front_overflow.clear();
+        } else {
+            self.cursor_front_len = 0;
+            self.cursor_front_overflow.clear();
+            self.cursor_front_overflow.extend_from_slice(bytes);
+        }
+    }
+
+    #[inline]
+    fn cursor_front(&self) -> &[u8] {
+        if self.cursor_front_len > 0 {
+            &self.cursor_front_buf[..self.cursor_front_len]
+        } else {
+            &self.cursor_front_overflow
+        }
+    }
+
+    #[inline]
+    fn set_cursor_back(&mut self, bytes: &[u8]) {
+        self.has_back = true;
+        if bytes.len() <= INLINE_KEY_BUF {
+            self.cursor_back_buf[..bytes.len()].copy_from_slice(bytes);
+            self.cursor_back_len = bytes.len();
+            self.cursor_back_overflow.clear();
+        } else {
+            self.cursor_back_len = 0;
+            self.cursor_back_overflow.clear();
+            self.cursor_back_overflow.extend_from_slice(bytes);
+        }
+    }
+
+    #[inline]
+    fn cursor_back(&self) -> &[u8] {
+        if self.cursor_back_len > 0 {
+            &self.cursor_back_buf[..self.cursor_back_len]
+        } else {
+            &self.cursor_back_overflow
         }
     }
 
@@ -76,7 +183,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
             let header = ptr.as_inner_ptr();
             let exact = unsafe { (*header).load_exact_leaf::<K, V>(Ordering::Acquire) };
             if let Some(leaf_ptr) = exact {
-                self.stack.push(CursorFrame {
+                self.stack_push(CursorFrame {
                     node: header,
                     current_pos: usize::MAX,
                 });
@@ -85,7 +192,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
 
             match unsafe { next_child_in_node(header, usize::MAX) } {
                 Some((pos, child)) => {
-                    self.stack.push(CursorFrame {
+                    self.stack_push(CursorFrame {
                         node: header,
                         current_pos: pos,
                     });
@@ -98,7 +205,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
     }
 
     fn seek_to_key(&mut self, target_key: &[u8]) {
-        self.stack.clear();
+        self.stack_clear();
         let root_ptr = TaggedPtr::from_raw(self.tree.raw_root().as_raw());
         if root_ptr.is_null() || root_ptr.is_leaf() {
             return;
@@ -117,7 +224,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
             depth += unsafe { (*header).prefix_len as usize };
 
             if depth == target_key.len() {
-                self.stack.push(CursorFrame {
+                self.stack_push(CursorFrame {
                     node: header,
                     current_pos: usize::MAX,
                 });
@@ -127,7 +234,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
             let next_byte = target_key[depth];
             match unsafe { child_pos_for_byte(header, next_byte) } {
                 Some((pos, child)) => {
-                    self.stack.push(CursorFrame {
+                    self.stack_push(CursorFrame {
                         node: header,
                         current_pos: pos,
                     });
@@ -143,7 +250,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
     }
 
     fn advance_forward(&mut self) -> Option<*mut Leaf<K, V>> {
-        while let Some(frame) = self.stack.last_mut() {
+        while let Some(frame) = self.stack_last_mut() {
             let header = frame.node;
             match unsafe { next_child_in_node(header, frame.current_pos) } {
                 Some((next_pos, child)) => {
@@ -151,7 +258,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
                     return self.push_and_descend_left(child);
                 }
                 None => {
-                    self.stack.pop();
+                    self.stack_pop();
                 }
             }
         }
@@ -175,15 +282,64 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, 
                     Bound::Unbounded => (&[][..], true),
                 };
 
-                let ptr = self.tree.find_successor(search_key, include_equal)?;
-                let leaf = unsafe { &*ptr };
-                self.seek_to_key(leaf.key.as_bytes());
-                ptr
+                let root_ptr = TaggedPtr::from_raw(self.tree.raw_root().as_raw());
+                if root_ptr.is_null() {
+                    self.exhausted = true;
+                    return None;
+                }
+
+                if root_ptr.is_leaf() {
+                    let leaf = unsafe { &*root_ptr.as_leaf_ptr::<K, V>() };
+                    let k = leaf.key.as_bytes();
+                    let cmp = k.cmp(search_key);
+                    if (include_equal && cmp >= std::cmp::Ordering::Equal)
+                        || (!include_equal && cmp == std::cmp::Ordering::Greater)
+                    {
+                        let ptr = root_ptr.as_leaf_ptr::<K, V>();
+                        self.set_cursor_front(k);
+                        let entry = EntryRef {
+                            leaf_ptr: ptr,
+                            tree: self.tree,
+                        };
+                        if !entry.is_removed() {
+                            return Some(entry);
+                        } else {
+                            self.exhausted = true;
+                            return None;
+                        }
+                    } else {
+                        self.exhausted = true;
+                        return None;
+                    }
+                }
+
+                if (search_key.is_empty() || (search_key == [0u8] && include_equal))
+                    && include_equal
+                {
+                    match self.push_and_descend_left(root_ptr) {
+                        Some(ptr) => ptr,
+                        None => {
+                            self.exhausted = true;
+                            return None;
+                        }
+                    }
+                } else {
+                    let ptr = match self.tree.find_successor(search_key, include_equal) {
+                        Some(p) => p,
+                        None => {
+                            self.exhausted = true;
+                            return None;
+                        }
+                    };
+                    let leaf = unsafe { &*ptr };
+                    self.seek_to_key(leaf.key.as_bytes());
+                    ptr
+                }
             } else {
                 match self.advance_forward() {
                     Some(ptr) => ptr,
                     None => {
-                        let ptr = self.tree.find_successor(&self.cursor_front, false)?;
+                        let ptr = self.tree.find_successor(self.cursor_front(), false)?;
                         let leaf = unsafe { &*ptr };
                         self.seek_to_key(leaf.key.as_bytes());
                         ptr
@@ -208,14 +364,12 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, 
             }
 
             // Check overlap with backward cursor
-            if self.has_back && k_bytes > self.cursor_back.as_slice() {
+            if self.has_back && k_bytes > self.cursor_back() {
                 self.exhausted = true;
                 return None;
             }
 
-            self.cursor_front.clear();
-            self.cursor_front.extend_from_slice(k_bytes);
-            self.has_front = true;
+            self.set_cursor_front(k_bytes);
 
             let entry = EntryRef {
                 leaf_ptr,
@@ -236,7 +390,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for
 
         loop {
             let (search_key, include_equal) = if self.has_back {
-                (self.cursor_back.as_slice(), false)
+                (self.cursor_back(), false)
             } else {
                 match &self.end_bound {
                     Bound::Included(k) => (k.as_slice(), true),
@@ -263,14 +417,12 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for
             }
 
             // Check overlap with forward cursor
-            if self.has_front && k_bytes < self.cursor_front.as_slice() {
+            if self.has_front && k_bytes < self.cursor_front() {
                 self.exhausted = true;
                 return None;
             }
 
-            self.cursor_back.clear();
-            self.cursor_back.extend_from_slice(k_bytes);
-            self.has_back = true;
+            self.set_cursor_back(k_bytes);
 
             let entry = EntryRef {
                 leaf_ptr,
