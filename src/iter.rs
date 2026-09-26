@@ -18,10 +18,20 @@
 
 use crossbeam_epoch::Guard;
 use std::ops::Bound;
+use std::sync::atomic::Ordering;
 
 use crate::entry::EntryRef;
 use crate::key::AsBytes;
+use crate::node::{
+    Leaf, Node16, Node256, Node4, Node48, NodeHeader, NodeType, TaggedPtr, NODE48_EMPTY,
+};
 use crate::tree::Tree;
+
+#[derive(Clone, Copy)]
+struct CursorFrame {
+    node: *mut NodeHeader,
+    current_pos: usize,
+}
 
 /// An iterator over a range of entries in an [`ArtMap`](crate::ArtMap).
 pub struct Range<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
@@ -29,6 +39,7 @@ pub struct Range<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
     _guard: Guard,
     start_bound: Bound<Vec<u8>>,
     end_bound: Bound<Vec<u8>>,
+    stack: Vec<CursorFrame>,
     cursor_front: Vec<u8>,
     cursor_back: Vec<u8>,
     has_front: bool,
@@ -48,12 +59,103 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
             _guard: guard,
             start_bound,
             end_bound,
+            stack: Vec::with_capacity(16),
             cursor_front: Vec::with_capacity(32),
             cursor_back: Vec::with_capacity(32),
             has_front: false,
             has_back: false,
             exhausted: false,
         }
+    }
+
+    fn push_and_descend_left(&mut self, mut ptr: TaggedPtr) -> Option<*mut Leaf<K, V>> {
+        while !ptr.is_null() {
+            if ptr.is_leaf() {
+                return Some(ptr.as_leaf_ptr());
+            }
+            let header = ptr.as_inner_ptr();
+            let exact = unsafe { (*header).load_exact_leaf::<K, V>(Ordering::Acquire) };
+            if let Some(leaf_ptr) = exact {
+                self.stack.push(CursorFrame {
+                    node: header,
+                    current_pos: usize::MAX,
+                });
+                return Some(leaf_ptr);
+            }
+
+            match unsafe { next_child_in_node(header, usize::MAX) } {
+                Some((pos, child)) => {
+                    self.stack.push(CursorFrame {
+                        node: header,
+                        current_pos: pos,
+                    });
+                    ptr = child;
+                }
+                None => return None,
+            }
+        }
+        None
+    }
+
+    fn seek_to_key(&mut self, target_key: &[u8]) {
+        self.stack.clear();
+        let root_ptr = TaggedPtr::from_raw(self.tree.raw_root().as_raw());
+        if root_ptr.is_null() || root_ptr.is_leaf() {
+            return;
+        }
+
+        let mut current = root_ptr;
+        let mut depth = 0;
+
+        while !current.is_null() && !current.is_leaf() {
+            let header = current.as_inner_ptr();
+            let (_matched, is_full) = unsafe { (*header).match_prefix(target_key, depth) };
+            if !is_full {
+                return;
+            }
+
+            depth += unsafe { (*header).prefix_len as usize };
+
+            if depth == target_key.len() {
+                self.stack.push(CursorFrame {
+                    node: header,
+                    current_pos: usize::MAX,
+                });
+                return;
+            }
+
+            let next_byte = target_key[depth];
+            match unsafe { child_pos_for_byte(header, next_byte) } {
+                Some((pos, child)) => {
+                    self.stack.push(CursorFrame {
+                        node: header,
+                        current_pos: pos,
+                    });
+                    if child.is_leaf() {
+                        return;
+                    }
+                    current = child;
+                    depth += 1;
+                }
+                None => return,
+            }
+        }
+    }
+
+    fn advance_forward(&mut self) -> Option<*mut Leaf<K, V>> {
+        while let Some(frame) = self.stack.last_mut() {
+            let header = frame.node;
+            match unsafe { next_child_in_node(header, frame.current_pos) } {
+                Some((next_pos, child)) => {
+                    frame.current_pos = next_pos;
+                    return self.push_and_descend_left(child);
+                }
+                None => {
+                    self.stack.pop();
+                }
+            }
+        }
+        None
     }
 }
 
@@ -66,17 +168,29 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, 
         }
 
         loop {
-            let (search_key, include_equal) = if self.has_front {
-                (self.cursor_front.as_slice(), false)
-            } else {
-                match &self.start_bound {
+            let leaf_ptr = if !self.has_front {
+                let (search_key, include_equal) = match &self.start_bound {
                     Bound::Included(k) => (k.as_slice(), true),
                     Bound::Excluded(k) => (k.as_slice(), false),
                     Bound::Unbounded => (&[][..], true),
+                };
+
+                let ptr = self.tree.find_successor(search_key, include_equal)?;
+                let leaf = unsafe { &*ptr };
+                self.seek_to_key(leaf.key.as_bytes());
+                ptr
+            } else {
+                match self.advance_forward() {
+                    Some(ptr) => ptr,
+                    None => {
+                        let ptr = self.tree.find_successor(&self.cursor_front, false)?;
+                        let leaf = unsafe { &*ptr };
+                        self.seek_to_key(leaf.key.as_bytes());
+                        ptr
+                    }
                 }
             };
 
-            let leaf_ptr = self.tree.find_successor(search_key, include_equal)?;
             let leaf = unsafe { &*leaf_ptr };
             let k_bytes = leaf.key.as_bytes();
 
@@ -238,9 +352,134 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Values<'a,
     }
 }
 
-pub(crate) unsafe fn first_leaf_in_subtree<K, V>(
-    ptr: crate::node::TaggedPtr,
-) -> Option<*mut crate::node::Leaf<K, V>> {
+unsafe fn next_child_in_node(
+    header: *mut NodeHeader,
+    current_pos: usize,
+) -> Option<(usize, TaggedPtr)> {
+    let h = &*header;
+    match h.node_type {
+        NodeType::Node4 => {
+            let n = &*(header as *const Node4);
+            let count = n.header.num_children as usize;
+            let next_idx = if current_pos == usize::MAX {
+                0
+            } else {
+                current_pos + 1
+            };
+            if next_idx < count {
+                let child = TaggedPtr::from_raw(n.children[next_idx].load(Ordering::Acquire));
+                if !child.is_null() {
+                    return Some((next_idx, child));
+                }
+            }
+            None
+        }
+        NodeType::Node16 => {
+            let n = &*(header as *const Node16);
+            let count = n.header.num_children as usize;
+            let next_idx = if current_pos == usize::MAX {
+                0
+            } else {
+                current_pos + 1
+            };
+            if next_idx < count {
+                let child = TaggedPtr::from_raw(n.children[next_idx].load(Ordering::Acquire));
+                if !child.is_null() {
+                    return Some((next_idx, child));
+                }
+            }
+            None
+        }
+        NodeType::Node48 => {
+            let n = &*(header as *const Node48);
+            let next_byte = if current_pos == usize::MAX {
+                0
+            } else {
+                current_pos + 1
+            };
+            for byte in next_byte..=255 {
+                let slot = n.child_indices[byte];
+                if slot != NODE48_EMPTY {
+                    let child =
+                        TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
+                    if !child.is_null() {
+                        return Some((byte, child));
+                    }
+                }
+            }
+            None
+        }
+        NodeType::Node256 => {
+            let n = &*(header as *const Node256);
+            let next_byte = if current_pos == usize::MAX {
+                0
+            } else {
+                current_pos + 1
+            };
+            for byte in next_byte..=255 {
+                let child = TaggedPtr::from_raw(n.children[byte].load(Ordering::Acquire));
+                if !child.is_null() {
+                    return Some((byte, child));
+                }
+            }
+            None
+        }
+    }
+}
+
+unsafe fn child_pos_for_byte(header: *mut NodeHeader, needle: u8) -> Option<(usize, TaggedPtr)> {
+    let h = &*header;
+    match h.node_type {
+        NodeType::Node4 => {
+            let n = &*(header as *const Node4);
+            let count = n.header.num_children as usize;
+            for i in 0..count {
+                if n.keys[i] == needle {
+                    let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
+                    if !child.is_null() {
+                        return Some((i, child));
+                    }
+                }
+            }
+            None
+        }
+        NodeType::Node16 => {
+            let n = &*(header as *const Node16);
+            let count = n.header.num_children as usize;
+            for i in 0..count {
+                if n.keys[i] == needle {
+                    let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
+                    if !child.is_null() {
+                        return Some((i, child));
+                    }
+                }
+            }
+            None
+        }
+        NodeType::Node48 => {
+            let n = &*(header as *const Node48);
+            let slot = n.child_indices[needle as usize];
+            if slot != NODE48_EMPTY {
+                let child = TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
+                if !child.is_null() {
+                    return Some((needle as usize, child));
+                }
+            }
+            None
+        }
+        NodeType::Node256 => {
+            let n = &*(header as *const Node256);
+            let child = TaggedPtr::from_raw(n.children[needle as usize].load(Ordering::Acquire));
+            if !child.is_null() {
+                Some((needle as usize, child))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+pub(crate) unsafe fn first_leaf_in_subtree<K, V>(ptr: TaggedPtr) -> Option<*mut Leaf<K, V>> {
     if ptr.is_null() {
         return None;
     }
@@ -248,17 +487,15 @@ pub(crate) unsafe fn first_leaf_in_subtree<K, V>(
         return Some(ptr.as_leaf_ptr());
     }
     let header = &*ptr.as_inner_ptr();
-    if let Some(leaf) = header.load_exact_leaf::<K, V>(std::sync::atomic::Ordering::Acquire) {
+    if let Some(leaf) = header.load_exact_leaf::<K, V>(Ordering::Acquire) {
         return Some(leaf);
     }
 
     match header.node_type {
-        crate::node::NodeType::Node4 => {
-            let n = &*(ptr.as_inner_ptr() as *const crate::node::Node4);
+        NodeType::Node4 => {
+            let n = &*(ptr.as_inner_ptr() as *const Node4);
             for i in 0..n.header.num_children as usize {
-                let child = crate::node::TaggedPtr::from_raw(
-                    n.children[i].load(std::sync::atomic::Ordering::Acquire),
-                );
+                let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
                 if !child.is_null() {
                     if let Some(leaf) = first_leaf_in_subtree(child) {
                         return Some(leaf);
@@ -267,12 +504,10 @@ pub(crate) unsafe fn first_leaf_in_subtree<K, V>(
             }
             None
         }
-        crate::node::NodeType::Node16 => {
-            let n = &*(ptr.as_inner_ptr() as *const crate::node::Node16);
+        NodeType::Node16 => {
+            let n = &*(ptr.as_inner_ptr() as *const Node16);
             for i in 0..n.header.num_children as usize {
-                let child = crate::node::TaggedPtr::from_raw(
-                    n.children[i].load(std::sync::atomic::Ordering::Acquire),
-                );
+                let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
                 if !child.is_null() {
                     if let Some(leaf) = first_leaf_in_subtree(child) {
                         return Some(leaf);
@@ -281,14 +516,13 @@ pub(crate) unsafe fn first_leaf_in_subtree<K, V>(
             }
             None
         }
-        crate::node::NodeType::Node48 => {
-            let n = &*(ptr.as_inner_ptr() as *const crate::node::Node48);
+        NodeType::Node48 => {
+            let n = &*(ptr.as_inner_ptr() as *const Node48);
             for byte in 0..=255u8 {
                 let slot = n.child_indices[byte as usize];
-                if slot != crate::node::NODE48_EMPTY {
-                    let child = crate::node::TaggedPtr::from_raw(
-                        n.children[slot as usize].load(std::sync::atomic::Ordering::Acquire),
-                    );
+                if slot != NODE48_EMPTY {
+                    let child =
+                        TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
                     if !child.is_null() {
                         if let Some(leaf) = first_leaf_in_subtree(child) {
                             return Some(leaf);
@@ -298,12 +532,10 @@ pub(crate) unsafe fn first_leaf_in_subtree<K, V>(
             }
             None
         }
-        crate::node::NodeType::Node256 => {
-            let n = &*(ptr.as_inner_ptr() as *const crate::node::Node256);
+        NodeType::Node256 => {
+            let n = &*(ptr.as_inner_ptr() as *const Node256);
             for byte in 0..=255u8 {
-                let child = crate::node::TaggedPtr::from_raw(
-                    n.children[byte as usize].load(std::sync::atomic::Ordering::Acquire),
-                );
+                let child = TaggedPtr::from_raw(n.children[byte as usize].load(Ordering::Acquire));
                 if !child.is_null() {
                     if let Some(leaf) = first_leaf_in_subtree(child) {
                         return Some(leaf);
@@ -315,9 +547,7 @@ pub(crate) unsafe fn first_leaf_in_subtree<K, V>(
     }
 }
 
-pub(crate) unsafe fn last_leaf_in_subtree<K, V>(
-    ptr: crate::node::TaggedPtr,
-) -> Option<*mut crate::node::Leaf<K, V>> {
+pub(crate) unsafe fn last_leaf_in_subtree<K, V>(ptr: TaggedPtr) -> Option<*mut Leaf<K, V>> {
     if ptr.is_null() {
         return None;
     }
@@ -327,42 +557,37 @@ pub(crate) unsafe fn last_leaf_in_subtree<K, V>(
     let header = &*ptr.as_inner_ptr();
 
     match header.node_type {
-        crate::node::NodeType::Node4 => {
-            let n = &*(ptr.as_inner_ptr() as *const crate::node::Node4);
+        NodeType::Node4 => {
+            let n = &*(ptr.as_inner_ptr() as *const Node4);
             for i in (0..n.header.num_children as usize).rev() {
-                let child = crate::node::TaggedPtr::from_raw(
-                    n.children[i].load(std::sync::atomic::Ordering::Acquire),
-                );
+                let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
                 if !child.is_null() {
                     if let Some(leaf) = last_leaf_in_subtree(child) {
                         return Some(leaf);
                     }
                 }
             }
-            header.load_exact_leaf::<K, V>(std::sync::atomic::Ordering::Acquire)
+            header.load_exact_leaf::<K, V>(Ordering::Acquire)
         }
-        crate::node::NodeType::Node16 => {
-            let n = &*(ptr.as_inner_ptr() as *const crate::node::Node16);
+        NodeType::Node16 => {
+            let n = &*(ptr.as_inner_ptr() as *const Node16);
             for i in (0..n.header.num_children as usize).rev() {
-                let child = crate::node::TaggedPtr::from_raw(
-                    n.children[i].load(std::sync::atomic::Ordering::Acquire),
-                );
+                let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
                 if !child.is_null() {
                     if let Some(leaf) = last_leaf_in_subtree(child) {
                         return Some(leaf);
                     }
                 }
             }
-            header.load_exact_leaf::<K, V>(std::sync::atomic::Ordering::Acquire)
+            header.load_exact_leaf::<K, V>(Ordering::Acquire)
         }
-        crate::node::NodeType::Node48 => {
-            let n = &*(ptr.as_inner_ptr() as *const crate::node::Node48);
+        NodeType::Node48 => {
+            let n = &*(ptr.as_inner_ptr() as *const Node48);
             for byte in (0..=255u8).rev() {
                 let slot = n.child_indices[byte as usize];
-                if slot != crate::node::NODE48_EMPTY {
-                    let child = crate::node::TaggedPtr::from_raw(
-                        n.children[slot as usize].load(std::sync::atomic::Ordering::Acquire),
-                    );
+                if slot != NODE48_EMPTY {
+                    let child =
+                        TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
                     if !child.is_null() {
                         if let Some(leaf) = last_leaf_in_subtree(child) {
                             return Some(leaf);
@@ -370,21 +595,19 @@ pub(crate) unsafe fn last_leaf_in_subtree<K, V>(
                     }
                 }
             }
-            header.load_exact_leaf::<K, V>(std::sync::atomic::Ordering::Acquire)
+            header.load_exact_leaf::<K, V>(Ordering::Acquire)
         }
-        crate::node::NodeType::Node256 => {
-            let n = &*(ptr.as_inner_ptr() as *const crate::node::Node256);
+        NodeType::Node256 => {
+            let n = &*(ptr.as_inner_ptr() as *const Node256);
             for byte in (0..=255u8).rev() {
-                let child = crate::node::TaggedPtr::from_raw(
-                    n.children[byte as usize].load(std::sync::atomic::Ordering::Acquire),
-                );
+                let child = TaggedPtr::from_raw(n.children[byte as usize].load(Ordering::Acquire));
                 if !child.is_null() {
                     if let Some(leaf) = last_leaf_in_subtree(child) {
                         return Some(leaf);
                     }
                 }
             }
-            header.load_exact_leaf::<K, V>(std::sync::atomic::Ordering::Acquire)
+            header.load_exact_leaf::<K, V>(Ordering::Acquire)
         }
     }
 }

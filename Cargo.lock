@@ -31,7 +31,7 @@ checksum = "33ca55ee147b1926dbea904f50fe4902494e97bc742205abbbf10c709e43815f"
 
 [[package]]
 name = "artmap"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "byteslice",
  "criterion",
