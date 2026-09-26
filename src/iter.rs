@@ -295,25 +295,12 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, 
                     if (include_equal && cmp >= std::cmp::Ordering::Equal)
                         || (!include_equal && cmp == std::cmp::Ordering::Greater)
                     {
-                        let ptr = root_ptr.as_leaf_ptr::<K, V>();
-                        self.set_cursor_front(k);
-                        let entry = EntryRef {
-                            leaf_ptr: ptr,
-                            tree: self.tree,
-                        };
-                        if !entry.is_removed() {
-                            return Some(entry);
-                        } else {
-                            self.exhausted = true;
-                            return None;
-                        }
+                        root_ptr.as_leaf_ptr::<K, V>()
                     } else {
                         self.exhausted = true;
                         return None;
                     }
-                }
-
-                if (search_key.is_empty() || (search_key == [0u8] && include_equal))
+                } else if (search_key.is_empty() || (search_key == [0u8] && include_equal))
                     && include_equal
                 {
                     match self.push_and_descend_left(root_ptr) {
