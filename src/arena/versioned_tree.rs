@@ -835,8 +835,15 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
             let rest_prefix = &prefix[MAX_PREFIX_LEN + 1..];
             let connector_byte = prefix[MAX_PREFIX_LEN];
 
-            let child_chain =
-                self.create_prefix_chain(rest_prefix, exact1, byte1, child1, exact2, byte2, child2)?;
+            let child_chain = self.create_prefix_chain(
+                rest_prefix,
+                exact1,
+                byte1,
+                child1,
+                exact2,
+                byte2,
+                child2,
+            )?;
 
             let n4_off = self.alloc_node4(head_prefix)?;
             let n4 = self.arena.get_pointer_mut(n4_off) as *mut Node4;

@@ -299,3 +299,15 @@ fn test_arena_versioned_artmap_range_and_crud() {
     assert_eq!(map.get_latest("k2"), None);
     assert_eq!(map.len(), 2);
 }
+
+#[test]
+fn test_arena_versioned_artmap_10k_iteration() {
+    let map = ArenaVersionedArtMap::<String, usize>::with_capacity(32 * 1024 * 1024);
+    for i in 0..10_000 {
+        let k = format!("key_{i:08}");
+        assert!(map.insert_versioned(k, 1, i));
+    }
+    assert_eq!(map.len(), 10_000);
+    let count = map.iter().count();
+    assert_eq!(count, 10_000);
+}

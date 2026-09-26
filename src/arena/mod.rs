@@ -178,7 +178,13 @@ impl Arena {
         let arena_id = self.buf.as_ptr() as usize;
         let current_epoch = self.epoch.load(Ordering::Relaxed);
 
-        if size <= MAX_LOCAL_ALLOC_SIZE && alignment <= NODE_ALIGNMENT {
+        let chunk_size = if self.buf.len() >= 1024 * 1024 {
+            CHUNK_SIZE
+        } else {
+            0
+        };
+
+        if chunk_size > 0 && size <= MAX_LOCAL_ALLOC_SIZE && alignment <= NODE_ALIGNMENT {
             let local_res = TLS_CHUNK.with(|cell| {
                 let mut chunk = cell.get();
                 if chunk.arena_id == arena_id && chunk.arena_epoch == current_epoch {
@@ -196,10 +202,10 @@ impl Arena {
                 return Some(off);
             }
 
-            // Chunk exhausted or epoch changed: reserve a new 64KB chunk from the global arena
-            if let Some(chunk_start) = self.alloc_global(CHUNK_SIZE, NODE_ALIGNMENT, overflow) {
+            // Chunk exhausted or epoch changed: reserve a new chunk from the global arena
+            if let Some(chunk_start) = self.alloc_global(chunk_size, NODE_ALIGNMENT, overflow) {
                 let aligned = (chunk_start + alignment - 1) & !(alignment - 1);
-                let chunk_limit = chunk_start + CHUNK_SIZE;
+                let chunk_limit = chunk_start + chunk_size;
                 TLS_CHUNK.with(|cell| {
                     cell.set(LocalChunk {
                         arena_id,
