@@ -21,8 +21,38 @@ use std::ops::Deref;
 use std::sync::atomic::Ordering;
 
 use crate::key::AsBytes;
-use crate::node::Leaf;
+use crate::node::{Leaf, NodeHeader};
 use crate::tree::Tree;
+
+/// An inserter cache optimizing sequential and localized inserts in [`ArtMap`](crate::ArtMap).
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Inserter {
+    pub(crate) last_parent: *mut NodeHeader,
+    pub(crate) last_parent_version: u64,
+    pub(crate) last_depth: usize,
+}
+
+// SAFETY: `Inserter` only caches raw pointers and versions that are validated via OLC.
+unsafe impl Send for Inserter {}
+unsafe impl Sync for Inserter {}
+
+impl Inserter {
+    /// Creates a new `Inserter`.
+    pub const fn new() -> Self {
+        Self {
+            last_parent: std::ptr::null_mut(),
+            last_parent_version: 0,
+            last_depth: 0,
+        }
+    }
+
+    /// Resets the cached insertion location.
+    pub fn reset(&mut self) {
+        self.last_parent = std::ptr::null_mut();
+        self.last_parent_version = 0;
+        self.last_depth = 0;
+    }
+}
 
 /// A reference to an entry in an [`ArtMap`](crate::ArtMap).
 pub struct EntryRef<'a, K: AsBytes + Send + 'static, V: Send + 'static> {

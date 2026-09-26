@@ -42,7 +42,7 @@ use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::Ordering;
 
 pub use arena::{Arena, ArenaArtMap};
-pub use entry::EntryRef;
+pub use entry::{EntryRef, Inserter};
 pub use iter::{Iter, Keys, Range, Values};
 pub use key::AsBytes;
 pub use tree::Tree;
@@ -157,10 +157,18 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
     }
 
     /// Inserts a key-value pair into the map, returning the previous value if present.
+    /// Inserts or updates a key-value pair in the map.
     #[inline]
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         let guard = &crossbeam_epoch::pin();
         self.tree.insert(key, value, guard)
+    }
+
+    /// Inserts a key-value pair using an [`Inserter`] cache to accelerate sequential or localized writes.
+    #[inline]
+    pub fn insert_with_inserter(&self, key: K, value: V, inserter: &mut Inserter) -> Option<V> {
+        let guard = &crossbeam_epoch::pin();
+        self.tree.insert_with_inserter(key, value, guard, inserter)
     }
 
     /// Inserts a key-value pair if the key is not present, returning an [`EntryRef`].
@@ -326,5 +334,20 @@ mod tests {
             assert!(entry.is_removed());
         }
         assert!(map.get("key").is_none());
+    }
+
+    #[test]
+    fn test_artmap_inserter() {
+        let map = ArtMap::<String, i32>::new();
+        let mut inserter = Inserter::new();
+
+        for i in 0..1000 {
+            map.insert_with_inserter(format!("user:{i:04}"), i, &mut inserter);
+        }
+        assert_eq!(map.len(), 1000);
+
+        for i in 0..1000 {
+            assert_eq!(map.get(&format!("user:{i:04}")).as_deref(), Some(&i));
+        }
     }
 }
