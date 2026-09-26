@@ -71,10 +71,10 @@ Benchmarked with 100,000 keys (64-bit integer keys and 64-bit values), measuring
 
 | Data Structure | Idle&nbsp;Memory<br><sup>(100k&nbsp;items)</sup> | Peak&nbsp;Memory<br><sup>(during&nbsp;ingest)</sup> | Allocations<br><sup>(per&nbsp;insert)</sup> | Teardown&nbsp;/&nbsp;Reset<br><sup>(deallocation&nbsp;cost)</sup> |
 | :--- | ---: | ---: | ---: | :--- |
-| **`artmap::ArenaArtMap`** | **4.71&nbsp;MB**<br><sup>(47.1 B/item)</sup> | **8.00&nbsp;MB** | **0** | **$O(1)$ zero-cost reset** (`arena.reset()`) |
-| **`artmap::ArenaVersionedArtMap`** | **5.52&nbsp;MB**<br><sup>(55.2 B/item)</sup> | **10.00&nbsp;MB** | **0** | **$O(1)$ zero-cost reset** (`arena.reset()`) |
 | **`artmap::ArtMap`** | **5.21&nbsp;MB**<br><sup>(52.1 B/item)</sup> | **5.21&nbsp;MB** | **1.0** | $O(N)$ epoch-deferred reclamation |
 | **`artmap::VersionedArtMap`** | **6.73&nbsp;MB**<br><sup>(67.3 B/item)</sup> | **6.73&nbsp;MB** | **1.0** | $O(N)$ epoch-deferred reclamation |
+| **`artmap::ArenaArtMap`** | **4.71&nbsp;MB**<br><sup>(47.1 B/item)</sup> | **8.00&nbsp;MB** | **0** | **$O(1)$ zero-cost reset** (`arena.reset()`) |
+| **`artmap::ArenaVersionedArtMap`** | **5.52&nbsp;MB**<br><sup>(55.2 B/item)</sup> | **10.00&nbsp;MB** | **0** | **$O(1)$ zero-cost reset** (`arena.reset()`) |
 | `arenaskiplist::SkipList` | 9.42&nbsp;MB<br><sup>(94.2 B/item)</sup> | 16.00&nbsp;MB | **0** | **$O(1)$ zero-cost reset** |
 | `crossbeam_skiplist::SkipMap` | 3.82&nbsp;MB<br><sup>(38.2 B/item)</sup> | 3.82&nbsp;MB | ~1.0 | $O(N)$ epoch-deferred reclamation |
 | `imbl::OrdMap` | 2.69&nbsp;MB<br><sup>(26.9 B/item)</sup> | 2.69&nbsp;MB | ~0.14 | $O(N)$ recursive heap drop |
