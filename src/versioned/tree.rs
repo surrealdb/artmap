@@ -417,11 +417,7 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                                 .exact_leaf
                                 .store(tagged_new_leaf.as_raw(), Ordering::Relaxed);
                         } else {
-                            let new_chain = self.create_single_leaf_chain(
-                                &key_bytes[(depth + matched + 1)..],
-                                tagged_new_leaf,
-                            );
-                            (*n4_ptr).insert_child(byte_new, new_chain);
+                            (*n4_ptr).insert_child(byte_new, tagged_new_leaf);
                         }
                     }
 
@@ -508,12 +504,8 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                             }
 
                             let new_node = self.grow_node(current.as_inner_ptr(), guard);
-                            let new_child = self.create_single_leaf_chain(
-                                &key_bytes[(depth + 1)..],
-                                tagged_new_leaf,
-                            );
                             unsafe {
-                                self.insert_child_into_node(new_node, next_byte, new_child);
+                                self.insert_child_into_node(new_node, next_byte, tagged_new_leaf);
                             }
 
                             let new_tagged = TaggedPtr::from_inner(new_node);
@@ -541,15 +533,11 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                                 continue 'retry;
                             }
 
-                            let new_child = self.create_single_leaf_chain(
-                                &key_bytes[(depth + 1)..],
-                                tagged_new_leaf,
-                            );
                             unsafe {
                                 self.insert_child_into_node(
                                     current.as_inner_ptr(),
                                     next_byte,
-                                    new_child,
+                                    tagged_new_leaf,
                                 );
                             }
                             header.latch.unlock();
@@ -646,24 +634,6 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
             self.len.fetch_sub(1, Ordering::Relaxed);
             Some((*leaf.value).clone())
         }
-    }
-
-    fn create_single_leaf_chain(&self, suffix: &[u8], leaf: TaggedPtr) -> TaggedPtr {
-        if suffix.is_empty() {
-            return leaf;
-        }
-        let take = suffix.len().min(MAX_PREFIX_LEN);
-        let prefix = &suffix[..take];
-        let remaining = &suffix[take..];
-
-        let mut n4 = Node4::new(prefix);
-        if remaining.is_empty() {
-            n4.header.exact_leaf.store(leaf.as_raw(), Ordering::Relaxed);
-        } else {
-            let child_chain = self.create_single_leaf_chain(&remaining[1..], leaf);
-            n4.insert_child(remaining[0], child_chain);
-        }
-        TaggedPtr::from_inner(Box::into_raw(n4) as *mut NodeHeader)
     }
 
     #[allow(clippy::too_many_arguments)]
