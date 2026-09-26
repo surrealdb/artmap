@@ -75,6 +75,35 @@ impl<'a, K: AsBytes + Clone, V: Clone> ArenaVersionedEntryRef<'a, K, V> {
     pub fn is_removed(&self) -> bool {
         unsafe { (*self.leaf_ptr).removed.load(Ordering::Acquire) }
     }
+
+    /// Returns the raw pointer to the underlying [`VersionedLeaf`].
+    #[inline]
+    pub fn leaf_ptr(&self) -> *const VersionedLeaf<K, V> {
+        self.leaf_ptr
+    }
+
+    /// Returns an iterator over all versions of this key in descending version order.
+    pub fn versions(&self, arena: &'a crate::arena::Arena) -> impl Iterator<Item = (u64, &'a V)>
+    where
+        V: 'a,
+    {
+        let mut cur = self.leaf_ptr;
+        std::iter::from_fn(move || {
+            if cur.is_null() {
+                None
+            } else {
+                let leaf = unsafe { &*cur };
+                let item = (leaf.version, &leaf.value);
+                let next_off = leaf.next_version_offset.load(Ordering::Acquire);
+                if next_off == 0 {
+                    cur = std::ptr::null();
+                } else {
+                    cur = arena.get_pointer(next_off) as *const VersionedLeaf<K, V>;
+                }
+                Some(item)
+            }
+        })
+    }
 }
 
 impl<'a, K: AsBytes + Clone + std::fmt::Debug, V: Clone + std::fmt::Debug> std::fmt::Debug
