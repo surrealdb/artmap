@@ -12,19 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # Range Iterators for ArenaArtMap
+//! # Versioned Range Iterators for ArenaVersionedArtMap
 //!
-//! Provides zero-allocation bidirectional range scanning for [`ArenaArtMap`](crate::arena::ArenaArtMap).
+//! Provides zero-allocation bidirectional range scanning for [`ArenaVersionedArtMap`](crate::arena::ArenaVersionedArtMap).
 
 use std::marker::PhantomData;
 use std::ops::{Bound, Deref};
 use std::sync::atomic::Ordering;
 
 use crate::arena::node::{
-    next_present_byte, prev_present_byte, Leaf, Node16, Node256, Node4, Node48, NodeHeader,
-    TaggedOffset,
+    next_present_byte, prev_present_byte, Node16, Node256, Node4, Node48, NodeHeader, TaggedOffset,
+    VersionedLeaf,
 };
-use crate::arena::tree::ArenaTree;
+use crate::arena::versioned_tree::ArenaVersionedTree;
 use crate::key::AsBytes;
 use crate::node::{NodeType, NODE48_EMPTY};
 use crate::simd::find_child_node16;
@@ -44,14 +44,14 @@ impl CursorFrame {
     };
 }
 
-/// An ergonomic reference to an entry in an [`ArenaArtMap`](crate::arena::ArenaArtMap).
+/// An ergonomic reference to a versioned entry in an [`ArenaVersionedArtMap`](crate::arena::ArenaVersionedArtMap).
 #[derive(Clone, Copy)]
-pub struct ArenaEntryRef<'a, K: AsBytes + Clone, V: Clone> {
-    pub(crate) leaf_ptr: *const Leaf<K, V>,
+pub struct ArenaVersionedEntryRef<'a, K: AsBytes + Clone, V: Clone> {
+    pub(crate) leaf_ptr: *const VersionedLeaf<K, V>,
     pub(crate) _marker: PhantomData<&'a ()>,
 }
 
-impl<'a, K: AsBytes + Clone, V: Clone> ArenaEntryRef<'a, K, V> {
+impl<'a, K: AsBytes + Clone, V: Clone> ArenaVersionedEntryRef<'a, K, V> {
     /// Returns a reference to the entry's key.
     #[inline]
     pub fn key(&self) -> &'a K {
@@ -64,6 +64,12 @@ impl<'a, K: AsBytes + Clone, V: Clone> ArenaEntryRef<'a, K, V> {
         unsafe { &(*self.leaf_ptr).value }
     }
 
+    /// Returns the entry's monotonic MVCC version number.
+    #[inline]
+    pub fn version(&self) -> u64 {
+        unsafe { (*self.leaf_ptr).version }
+    }
+
     /// Checks if this entry has been removed from the map.
     #[inline]
     pub fn is_removed(&self) -> bool {
@@ -72,11 +78,12 @@ impl<'a, K: AsBytes + Clone, V: Clone> ArenaEntryRef<'a, K, V> {
 }
 
 impl<'a, K: AsBytes + Clone + std::fmt::Debug, V: Clone + std::fmt::Debug> std::fmt::Debug
-    for ArenaEntryRef<'a, K, V>
+    for ArenaVersionedEntryRef<'a, K, V>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ArenaEntryRef")
+        f.debug_struct("ArenaVersionedEntryRef")
             .field("key", self.key())
+            .field("version", &self.version())
             .field("value", self.value())
             .field("is_removed", &self.is_removed())
             .finish()
@@ -84,16 +91,18 @@ impl<'a, K: AsBytes + Clone + std::fmt::Debug, V: Clone + std::fmt::Debug> std::
 }
 
 impl<'a, K: AsBytes + Clone + PartialEq, V: Clone + PartialEq> PartialEq
-    for ArenaEntryRef<'a, K, V>
+    for ArenaVersionedEntryRef<'a, K, V>
 {
     fn eq(&self, other: &Self) -> bool {
-        self.key() == other.key() && self.value() == other.value()
+        self.key() == other.key()
+            && self.value() == other.value()
+            && self.version() == other.version()
     }
 }
 
-impl<'a, K: AsBytes + Clone + Eq, V: Clone + Eq> Eq for ArenaEntryRef<'a, K, V> {}
+impl<'a, K: AsBytes + Clone + Eq, V: Clone + Eq> Eq for ArenaVersionedEntryRef<'a, K, V> {}
 
-impl<'a, K: AsBytes + Clone, V: Clone> Deref for ArenaEntryRef<'a, K, V> {
+impl<'a, K: AsBytes + Clone, V: Clone> Deref for ArenaVersionedEntryRef<'a, K, V> {
     type Target = V;
 
     #[inline]
@@ -102,22 +111,22 @@ impl<'a, K: AsBytes + Clone, V: Clone> Deref for ArenaEntryRef<'a, K, V> {
     }
 }
 
-/// An iterator over a range of entries in an [`ArenaArtMap`](crate::arena::ArenaArtMap).
-pub struct Range<'a, K: AsBytes + Clone, V: Clone> {
-    tree: &'a ArenaTree<K, V>,
+/// An iterator over a range of entries in an [`ArenaVersionedArtMap`](crate::arena::ArenaVersionedArtMap).
+pub struct ArenaVersionedRange<'a, K: AsBytes + Clone, V: Clone> {
+    tree: &'a ArenaVersionedTree<K, V>,
     start_bound: Bound<Vec<u8>>,
     end_bound: Bound<Vec<u8>>,
     stack: [CursorFrame; MAX_STACK_DEPTH],
     stack_len: usize,
     stack_overflow: Vec<CursorFrame>,
-    last_leaf_front: Option<*const Leaf<K, V>>,
-    last_leaf_back: Option<*const Leaf<K, V>>,
+    last_leaf_front: Option<*const VersionedLeaf<K, V>>,
+    last_leaf_back: Option<*const VersionedLeaf<K, V>>,
     exhausted: bool,
 }
 
-impl<'a, K: AsBytes + Clone, V: Clone> Range<'a, K, V> {
+impl<'a, K: AsBytes + Clone, V: Clone> ArenaVersionedRange<'a, K, V> {
     pub(crate) fn new(
-        tree: &'a ArenaTree<K, V>,
+        tree: &'a ArenaVersionedTree<K, V>,
         start_bound: Bound<Vec<u8>>,
         end_bound: Bound<Vec<u8>>,
     ) -> Self {
@@ -186,19 +195,24 @@ impl<'a, K: AsBytes + Clone, V: Clone> Range<'a, K, V> {
     }
 
     #[inline(always)]
-    fn set_cursor_front(&mut self, ptr: *const Leaf<K, V>) {
+    fn set_cursor_front(&mut self, ptr: *const VersionedLeaf<K, V>) {
         self.last_leaf_front = Some(ptr);
     }
 
     #[inline(always)]
-    fn set_cursor_back(&mut self, ptr: *const Leaf<K, V>) {
+    fn set_cursor_back(&mut self, ptr: *const VersionedLeaf<K, V>) {
         self.last_leaf_back = Some(ptr);
     }
 
-    fn push_and_descend_left(&mut self, mut offset: TaggedOffset) -> Option<*const Leaf<K, V>> {
+    fn push_and_descend_left(
+        &mut self,
+        mut offset: TaggedOffset,
+    ) -> Option<*const VersionedLeaf<K, V>> {
         while !offset.is_null() {
             if offset.is_leaf() {
-                return Some(self.tree.arena.get_pointer(offset.leaf_offset()) as *const Leaf<K, V>);
+                return Some(
+                    self.tree.arena.get_pointer(offset.leaf_offset()) as *const VersionedLeaf<K, V>
+                );
             }
             let node_offset = offset.inner_offset();
             let header_ptr = self.tree.arena.get_pointer(node_offset) as *const NodeHeader;
@@ -212,7 +226,7 @@ impl<'a, K: AsBytes + Clone, V: Clone> Range<'a, K, V> {
                     self.tree
                         .arena
                         .get_pointer(TaggedOffset(exact).leaf_offset())
-                        as *const Leaf<K, V>,
+                        as *const VersionedLeaf<K, V>,
                 );
             }
 
@@ -276,7 +290,7 @@ impl<'a, K: AsBytes + Clone, V: Clone> Range<'a, K, V> {
         }
     }
 
-    fn advance_forward(&mut self) -> Option<*const Leaf<K, V>> {
+    fn advance_forward(&mut self) -> Option<*const VersionedLeaf<K, V>> {
         while let Some(frame) = self.stack_last_mut() {
             let node_offset = frame.node_offset;
             let current_pos = frame.current_pos;
@@ -294,8 +308,8 @@ impl<'a, K: AsBytes + Clone, V: Clone> Range<'a, K, V> {
     }
 }
 
-impl<'a, K: AsBytes + Clone, V: Clone> Iterator for Range<'a, K, V> {
-    type Item = ArenaEntryRef<'a, K, V>;
+impl<'a, K: AsBytes + Clone, V: Clone> Iterator for ArenaVersionedRange<'a, K, V> {
+    type Item = ArenaVersionedEntryRef<'a, K, V>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.exhausted {
@@ -319,14 +333,14 @@ impl<'a, K: AsBytes + Clone, V: Clone> Iterator for Range<'a, K, V> {
                 if root_offset.is_leaf() {
                     let leaf = unsafe {
                         &*(self.tree.arena.get_pointer(root_offset.leaf_offset())
-                            as *const Leaf<K, V>)
+                            as *const VersionedLeaf<K, V>)
                     };
                     let k = leaf.key.as_bytes();
                     let cmp = k.cmp(search_key);
                     if (include_equal && cmp >= std::cmp::Ordering::Equal)
                         || (!include_equal && cmp == std::cmp::Ordering::Greater)
                     {
-                        leaf as *const Leaf<K, V>
+                        leaf as *const VersionedLeaf<K, V>
                     } else {
                         self.exhausted = true;
                         return None;
@@ -393,7 +407,7 @@ impl<'a, K: AsBytes + Clone, V: Clone> Iterator for Range<'a, K, V> {
 
             self.set_cursor_front(leaf_ptr);
 
-            let entry = ArenaEntryRef {
+            let entry = ArenaVersionedEntryRef {
                 leaf_ptr,
                 _marker: PhantomData,
             };
@@ -404,7 +418,7 @@ impl<'a, K: AsBytes + Clone, V: Clone> Iterator for Range<'a, K, V> {
     }
 }
 
-impl<'a, K: AsBytes + Clone, V: Clone> DoubleEndedIterator for Range<'a, K, V> {
+impl<'a, K: AsBytes + Clone, V: Clone> DoubleEndedIterator for ArenaVersionedRange<'a, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.exhausted {
             return None;
@@ -448,7 +462,7 @@ impl<'a, K: AsBytes + Clone, V: Clone> DoubleEndedIterator for Range<'a, K, V> {
 
             self.set_cursor_back(leaf_ptr);
 
-            let entry = ArenaEntryRef {
+            let entry = ArenaVersionedEntryRef {
                 leaf_ptr,
                 _marker: PhantomData,
             };
@@ -460,7 +474,7 @@ impl<'a, K: AsBytes + Clone, V: Clone> DoubleEndedIterator for Range<'a, K, V> {
 }
 
 unsafe fn next_child_in_node<K: AsBytes + Clone, V: Clone>(
-    tree: &ArenaTree<K, V>,
+    tree: &ArenaVersionedTree<K, V>,
     node_offset: u32,
     current_pos: usize,
 ) -> Option<(usize, TaggedOffset)> {
@@ -540,7 +554,7 @@ unsafe fn next_child_in_node<K: AsBytes + Clone, V: Clone>(
 }
 
 unsafe fn prev_child_in_node<K: AsBytes + Clone, V: Clone>(
-    tree: &ArenaTree<K, V>,
+    tree: &ArenaVersionedTree<K, V>,
     node_offset: u32,
     current_pos: usize,
 ) -> Option<(usize, TaggedOffset)> {
@@ -624,7 +638,7 @@ unsafe fn prev_child_in_node<K: AsBytes + Clone, V: Clone>(
 }
 
 unsafe fn child_pos_for_byte<K: AsBytes + Clone, V: Clone>(
-    tree: &ArenaTree<K, V>,
+    tree: &ArenaVersionedTree<K, V>,
     node_offset: u32,
     needle: u8,
 ) -> Option<(usize, TaggedOffset)> {
@@ -678,12 +692,13 @@ unsafe fn child_pos_for_byte<K: AsBytes + Clone, V: Clone>(
 }
 
 pub(crate) unsafe fn first_leaf_in_subtree<K: AsBytes + Clone, V: Clone>(
-    tree: &ArenaTree<K, V>,
+    tree: &ArenaVersionedTree<K, V>,
     mut offset: TaggedOffset,
-) -> Option<*const Leaf<K, V>> {
+) -> Option<*const VersionedLeaf<K, V>> {
     while !offset.is_null() {
         if offset.is_leaf() {
-            let leaf_ptr = tree.arena.get_pointer(offset.leaf_offset()) as *const Leaf<K, V>;
+            let leaf_ptr =
+                tree.arena.get_pointer(offset.leaf_offset()) as *const VersionedLeaf<K, V>;
             let leaf = &*leaf_ptr;
             if !leaf.removed.load(Ordering::Acquire) {
                 return Some(leaf_ptr);
@@ -694,8 +709,8 @@ pub(crate) unsafe fn first_leaf_in_subtree<K: AsBytes + Clone, V: Clone>(
         let header = &*header_ptr;
         let exact = header.exact_leaf.load(Ordering::Acquire);
         if exact != 0 {
-            let leaf_ptr =
-                tree.arena.get_pointer(TaggedOffset(exact).leaf_offset()) as *const Leaf<K, V>;
+            let leaf_ptr = tree.arena.get_pointer(TaggedOffset(exact).leaf_offset())
+                as *const VersionedLeaf<K, V>;
             let leaf = &*leaf_ptr;
             if !leaf.removed.load(Ordering::Acquire) {
                 return Some(leaf_ptr);
@@ -710,12 +725,13 @@ pub(crate) unsafe fn first_leaf_in_subtree<K: AsBytes + Clone, V: Clone>(
 }
 
 pub(crate) unsafe fn last_leaf_in_subtree<K: AsBytes + Clone, V: Clone>(
-    tree: &ArenaTree<K, V>,
+    tree: &ArenaVersionedTree<K, V>,
     mut offset: TaggedOffset,
-) -> Option<*const Leaf<K, V>> {
+) -> Option<*const VersionedLeaf<K, V>> {
     while !offset.is_null() {
         if offset.is_leaf() {
-            let leaf_ptr = tree.arena.get_pointer(offset.leaf_offset()) as *const Leaf<K, V>;
+            let leaf_ptr =
+                tree.arena.get_pointer(offset.leaf_offset()) as *const VersionedLeaf<K, V>;
             let leaf = &*leaf_ptr;
             if !leaf.removed.load(Ordering::Acquire) {
                 return Some(leaf_ptr);
@@ -730,7 +746,7 @@ pub(crate) unsafe fn last_leaf_in_subtree<K: AsBytes + Clone, V: Clone>(
                 let exact = header.exact_leaf.load(Ordering::Acquire);
                 if exact != 0 {
                     let leaf_ptr = tree.arena.get_pointer(TaggedOffset(exact).leaf_offset())
-                        as *const Leaf<K, V>;
+                        as *const VersionedLeaf<K, V>;
                     let leaf = &*leaf_ptr;
                     if !leaf.removed.load(Ordering::Acquire) {
                         return Some(leaf_ptr);

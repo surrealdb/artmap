@@ -32,6 +32,9 @@ pub mod iter;
 pub mod map;
 pub mod node;
 pub mod tree;
+pub mod versioned_iter;
+pub mod versioned_map;
+pub mod versioned_tree;
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -39,6 +42,8 @@ use std::sync::Arc;
 
 pub use iter::{ArenaEntryRef, Range};
 pub use map::{ArenaArtMap, ArenaInserter};
+pub use versioned_iter::{ArenaVersionedEntryRef, ArenaVersionedRange};
+pub use versioned_map::ArenaVersionedArtMap;
 
 /// Maximum arena size (`u32::MAX` to fit in 32-bit offsets).
 pub const MAX_ARENA_SIZE: usize = u32::MAX as usize;

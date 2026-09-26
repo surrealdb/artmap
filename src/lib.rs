@@ -36,16 +36,18 @@ pub mod latch;
 pub mod node;
 pub mod simd;
 pub mod tree;
+pub mod versioned;
 
 use std::borrow::Borrow;
 use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::Ordering;
 
-pub use arena::{Arena, ArenaArtMap};
+pub use arena::{Arena, ArenaArtMap, ArenaInserter, ArenaVersionedArtMap};
 pub use entry::EntryRef;
 pub use iter::{Iter, Keys, Range, Values};
 pub use key::AsBytes;
 pub use tree::Tree;
+pub use versioned::{VersionedArtMap, VersionedEntryRef};
 
 /// A concurrent associative map backed by an Adaptive Radix Tree.
 pub struct ArtMap<K, V> {

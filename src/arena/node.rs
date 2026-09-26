@@ -69,9 +69,36 @@ impl TaggedOffset {
     }
 }
 
-/// A leaf node allocated within the arena.
+/// Compact unversioned leaf node allocated within an [`Arena`].
 #[repr(C, align(8))]
 pub struct Leaf<K, V> {
+    pub removed: AtomicBool,
+    pub _pad: [u8; 7],
+    pub key: K,
+    pub value: V,
+}
+
+impl<K, V> Leaf<K, V> {
+    #[inline]
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn init(ptr: *mut Self, key: K, value: V) {
+        unsafe {
+            std::ptr::write(
+                ptr,
+                Self {
+                    removed: AtomicBool::new(false),
+                    _pad: [0; 7],
+                    key,
+                    value,
+                },
+            );
+        }
+    }
+}
+
+/// Multi-version (MVCC) leaf node allocated within an [`Arena`].
+#[repr(C, align(8))]
+pub struct VersionedLeaf<K, V> {
     pub removed: AtomicBool,
     pub _pad: [u8; 3],
     /// 32-bit offset to an older version of this key, or 0 if none.
@@ -82,7 +109,7 @@ pub struct Leaf<K, V> {
     pub value: V,
 }
 
-impl<K, V> Leaf<K, V> {
+impl<K, V> VersionedLeaf<K, V> {
     #[inline]
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn init(ptr: *mut Self, key: K, version: u64, value: V) {

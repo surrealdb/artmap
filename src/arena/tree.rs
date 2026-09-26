@@ -667,43 +667,19 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         }
     }
 
-    pub fn get_version_le(&self, key_bytes: &[u8], max_version: u64) -> Option<(u64, V)> {
-        let leaf_ptr = self.get_leaf(key_bytes)?;
-        let mut cur_leaf = leaf_ptr;
-
-        while !cur_leaf.is_null() {
-            let leaf = unsafe { &*cur_leaf };
-            if leaf.version <= max_version {
-                if leaf.removed.load(Ordering::Acquire) {
-                    return None;
-                }
-                return Some((leaf.version, leaf.value.clone()));
-            }
-            let next_off = leaf.next_version_offset.load(Ordering::Acquire);
-            if next_off == 0 {
-                break;
-            }
-            cur_leaf = self.arena.get_pointer(next_off) as *const Leaf<K, V>;
-        }
-
-        None
-    }
-
     /// Inserts a key-value pair, returning the previous value if replaced.
     pub fn insert(&self, key: K, value: V) -> Option<V> {
-        self.insert_internal(key, 0, value, true)
+        self.insert_internal(key, value)
     }
 
     /// Inserts a key-value pair using an [`ArenaInserter`] cache to accelerate sequential or localized writes.
     pub fn insert_with_inserter(
         &self,
         key: K,
-        version: u64,
         value: V,
-        replace_if_present: bool,
         inserter: &mut crate::arena::map::ArenaInserter,
     ) -> Option<V> {
-        let leaf_off = self.alloc_leaf(key, version, value).expect("arena full");
+        let leaf_off = self.alloc_leaf(key, value).expect("arena full");
         let new_leaf_ptr = self.arena.get_pointer_mut(leaf_off) as *mut Leaf<K, V>;
         let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
         let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
@@ -733,26 +709,15 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
             inserter.reset();
         }
 
-        self.insert_internal_cached(
-            key_bytes,
-            new_leaf_ptr,
-            tagged_new_leaf,
-            replace_if_present,
-            Some(inserter),
-        )
+        self.insert_internal_cached(key_bytes, new_leaf_ptr, tagged_new_leaf, Some(inserter))
     }
 
-    /// Inserts a versioned key-value pair.
-    pub fn insert_versioned(&self, key: K, version: u64, value: V) -> bool {
-        self.insert_internal(key, version, value, false).is_none()
-    }
-
-    fn alloc_leaf(&self, key: K, version: u64, value: V) -> Option<u32> {
+    fn alloc_leaf(&self, key: K, value: V) -> Option<u32> {
         let size = std::mem::size_of::<Leaf<K, V>>() as u32;
         let off = self.arena.alloc(size, 8, 0)?;
         let ptr = self.arena.get_pointer_mut(off) as *mut Leaf<K, V>;
         // SAFETY: `ptr` is allocated by the arena with sufficient alignment and size.
-        unsafe { Leaf::init(ptr, key, version, value) };
+        unsafe { Leaf::init(ptr, key, value) };
         Some(off)
     }
 
@@ -792,25 +757,13 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         Some(off)
     }
 
-    fn insert_internal(
-        &self,
-        key: K,
-        version: u64,
-        value: V,
-        replace_if_present: bool,
-    ) -> Option<V> {
-        let leaf_off = self.alloc_leaf(key, version, value).expect("arena full");
+    fn insert_internal(&self, key: K, value: V) -> Option<V> {
+        let leaf_off = self.alloc_leaf(key, value).expect("arena full");
         let new_leaf_ptr = self.arena.get_pointer_mut(leaf_off) as *mut Leaf<K, V>;
         let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
         let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
 
-        self.insert_internal_cached(
-            key_bytes,
-            new_leaf_ptr,
-            tagged_new_leaf,
-            replace_if_present,
-            None,
-        )
+        self.insert_internal_cached(key_bytes, new_leaf_ptr, tagged_new_leaf, None)
     }
 
     fn insert_internal_cached(
@@ -818,7 +771,6 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         key_bytes: &[u8],
         new_leaf_ptr: *mut Leaf<K, V>,
         tagged_new_leaf: TaggedOffset,
-        replace_if_present: bool,
         mut inserter: Option<&mut crate::arena::map::ArenaInserter>,
     ) -> Option<V> {
         'retry: loop {
@@ -853,24 +805,12 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                 let existing_leaf = unsafe { &mut *existing_leaf_ptr };
 
                 if existing_leaf.key.as_bytes() == key_bytes {
-                    if replace_if_present {
-                        let old = std::mem::replace(&mut existing_leaf.value, unsafe {
-                            (*new_leaf_ptr).value.clone()
-                        });
-                        existing_leaf.removed.store(false, Ordering::Release);
-                        self.root_latch.unlock();
-                        return Some(old);
-                    } else {
-                        // Versioned insert: prepend new leaf to version chain
-                        unsafe {
-                            (*new_leaf_ptr)
-                                .next_version_offset
-                                .store(cur_root.leaf_offset(), Ordering::Relaxed);
-                        }
-                        self.root.store(tagged_new_leaf.raw(), Ordering::Release);
-                        self.root_latch.unlock();
-                        return None;
-                    }
+                    let old = std::mem::replace(&mut existing_leaf.value, unsafe {
+                        (*new_leaf_ptr).value.clone()
+                    });
+                    existing_leaf.removed.store(false, Ordering::Release);
+                    self.root_latch.unlock();
+                    return Some(old);
                 }
 
                 let existing_key = existing_leaf.key.as_bytes();
@@ -1031,26 +971,12 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             as *mut Leaf<K, V>;
                         let existing_leaf = unsafe { &mut *existing_leaf_ptr };
 
-                        if replace_if_present {
-                            let old = std::mem::replace(&mut existing_leaf.value, unsafe {
-                                (*new_leaf_ptr).value.clone()
-                            });
-                            existing_leaf.removed.store(false, Ordering::Release);
-                            header.latch.unlock();
-                            return Some(old);
-                        } else {
-                            unsafe {
-                                (*new_leaf_ptr).next_version_offset.store(
-                                    TaggedOffset(exact_raw).leaf_offset(),
-                                    Ordering::Relaxed,
-                                );
-                                header
-                                    .exact_leaf
-                                    .store(tagged_new_leaf.raw(), Ordering::Release);
-                                header.latch.unlock();
-                            }
-                            return None;
-                        }
+                        let old = std::mem::replace(&mut existing_leaf.value, unsafe {
+                            (*new_leaf_ptr).value.clone()
+                        });
+                        existing_leaf.removed.store(false, Ordering::Release);
+                        header.latch.unlock();
+                        return Some(old);
                     } else {
                         header
                             .exact_leaf
@@ -1242,23 +1168,12 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             let existing_leaf = unsafe { &mut *existing_leaf_ptr };
 
                             if existing_leaf.key.as_bytes() == key_bytes {
-                                if replace_if_present {
-                                    let old = std::mem::replace(&mut existing_leaf.value, unsafe {
-                                        (*new_leaf_ptr).value.clone()
-                                    });
-                                    existing_leaf.removed.store(false, Ordering::Release);
-                                    header.latch.unlock();
-                                    return Some(old);
-                                } else {
-                                    unsafe {
-                                        (*new_leaf_ptr)
-                                            .next_version_offset
-                                            .store(child.leaf_offset(), Ordering::Relaxed);
-                                        self.replace_child(header_ptr, next_byte, tagged_new_leaf);
-                                        header.latch.unlock();
-                                    }
-                                    return None;
-                                }
+                                let old = std::mem::replace(&mut existing_leaf.value, unsafe {
+                                    (*new_leaf_ptr).value.clone()
+                                });
+                                existing_leaf.removed.store(false, Ordering::Release);
+                                header.latch.unlock();
+                                return Some(old);
                             }
 
                             let existing_key = existing_leaf.key.as_bytes();

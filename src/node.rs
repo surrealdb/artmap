@@ -58,6 +58,31 @@ impl<K, V> Leaf<K, V> {
     }
 }
 
+/// A multi-version (MVCC) leaf node holding a version chain.
+#[repr(C, align(8))]
+pub struct VersionedLeaf<K, V> {
+    pub(crate) removed: AtomicBool,
+    pub(crate) value_taken: AtomicBool,
+    pub version: u64,
+    pub next_version: AtomicPtr<VersionedLeaf<K, V>>,
+    pub key: K,
+    pub value: ManuallyDrop<V>,
+}
+
+impl<K, V> VersionedLeaf<K, V> {
+    #[inline]
+    pub fn new(key: K, version: u64, value: V) -> Box<Self> {
+        Box::new(Self {
+            removed: AtomicBool::new(false),
+            value_taken: AtomicBool::new(false),
+            version,
+            next_version: AtomicPtr::new(ptr::null_mut()),
+            key,
+            value: ManuallyDrop::new(value),
+        })
+    }
+}
+
 /// Tagged pointer wrapper distinguishing inner nodes from leaves.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct TaggedPtr {
@@ -69,6 +94,15 @@ impl TaggedPtr {
 
     #[inline]
     pub fn from_leaf<K, V>(ptr: *mut Leaf<K, V>) -> Self {
+        let raw = ptr as usize;
+        debug_assert_eq!(raw & TAG_LEAF, 0, "leaf pointer must be aligned");
+        Self {
+            raw: raw | TAG_LEAF,
+        }
+    }
+
+    #[inline]
+    pub fn from_versioned_leaf<K, V>(ptr: *mut VersionedLeaf<K, V>) -> Self {
         let raw = ptr as usize;
         debug_assert_eq!(raw & TAG_LEAF, 0, "leaf pointer must be aligned");
         Self {
@@ -110,6 +144,12 @@ impl TaggedPtr {
     }
 
     #[inline]
+    pub fn as_versioned_leaf_ptr<K, V>(self) -> *mut VersionedLeaf<K, V> {
+        debug_assert!(self.is_leaf());
+        (self.raw & !TAG_LEAF) as *mut VersionedLeaf<K, V>
+    }
+
+    #[inline]
     pub fn as_inner_ptr(self) -> *mut NodeHeader {
         debug_assert!(!self.is_leaf());
         self.raw as *mut NodeHeader
@@ -135,6 +175,19 @@ impl NodeHeader {
             None
         } else {
             Some(TaggedPtr::from_raw(raw).as_leaf_ptr::<K, V>())
+        }
+    }
+
+    #[inline]
+    pub fn load_exact_versioned_leaf<K, V>(
+        &self,
+        order: Ordering,
+    ) -> Option<*mut VersionedLeaf<K, V>> {
+        let raw = self.exact_leaf.load(order);
+        if raw.is_null() {
+            None
+        } else {
+            Some(TaggedPtr::from_raw(raw).as_versioned_leaf_ptr::<K, V>())
         }
     }
 
