@@ -658,6 +658,9 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
             Some(p) => p,
             None => return 0,
         };
+        if unsafe { (*cur).removed.load(Ordering::Acquire) } {
+            return 0;
+        }
         while !cur.is_null() {
             count += 1;
             cur = unsafe { (*cur).next_version.load(Ordering::Acquire) };
@@ -711,7 +714,20 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
             if leaf.version <= min_version {
                 if is_head && is_tombstone(&*leaf.value) {
                     self.remove(key, guard);
-                    return 1;
+                    let stale = leaf
+                        .next_version
+                        .swap(std::ptr::null_mut(), Ordering::AcqRel);
+                    let mut walk_stale = stale;
+                    while !walk_stale.is_null() {
+                        let next = unsafe { (*walk_stale).next_version.load(Ordering::Relaxed) };
+                        let to_drop = walk_stale as usize;
+                        guard.defer(move || {
+                            drop(unsafe { Box::from_raw(to_drop as *mut VersionedLeaf<K, V>) })
+                        });
+                        pruned += 1;
+                        walk_stale = next;
+                    }
+                    return pruned + 1;
                 }
 
                 let stale = leaf
