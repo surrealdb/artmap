@@ -222,7 +222,8 @@ fn bench_scan(c: &mut Criterion) {
 
 fn bench_concurrent_writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent_writes_8t");
-    const TOTAL_OPS: u64 = 8_000;
+    group.sample_size(20);
+    const TOTAL_OPS: u64 = 100_000;
     const NUM_THREADS: usize = 8;
     const PER_THREAD: u64 = TOTAL_OPS / NUM_THREADS as u64;
     group.throughput(Throughput::Elements(TOTAL_OPS));
@@ -397,8 +398,9 @@ fn bench_concurrent_writes(c: &mut Criterion) {
 
 fn bench_concurrent_mixed(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent_mixed_4r_4w");
-    const PRE_POPULATE: u64 = 10_000;
-    const OPS_PER_THREAD: u64 = 2_000;
+    group.sample_size(20);
+    const PRE_POPULATE: u64 = 100_000;
+    const OPS_PER_THREAD: u64 = 12_500;
     const NUM_READERS: usize = 4;
     const NUM_WRITERS: usize = 4;
     const TOTAL_OPS: u64 = (NUM_READERS + NUM_WRITERS) as u64 * OPS_PER_THREAD;
