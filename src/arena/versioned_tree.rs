@@ -82,7 +82,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                 }
                 return Some((leaf.version, leaf.value.clone()));
             }
-            let next_off = leaf.next_version_offset.load(Ordering::Acquire);
+            let next_off = leaf.next_version_offset.load(Ordering::Acquire) & !1;
             if next_off == 0 {
                 break;
             }
@@ -1399,24 +1399,26 @@ unsafe fn insert_into_version_chain<K, V>(
     new_leaf_offset: u32,
     new_leaf_ptr: *mut VersionedLeaf<K, V>,
 ) -> bool {
-    let head_ptr = arena.get_pointer_mut(head_offset) as *mut VersionedLeaf<K, V>;
+    let clean_head = head_offset & !1;
+    let clean_new = new_leaf_offset & !1;
+    let head_ptr = arena.get_pointer_mut(clean_head) as *mut VersionedLeaf<K, V>;
     let new_ver = (*new_leaf_ptr).version;
     if new_ver >= (*head_ptr).version {
         (*new_leaf_ptr)
             .next_version_offset
-            .store(head_offset, Ordering::Relaxed);
+            .store(clean_head, Ordering::Relaxed);
         true
     } else {
         let mut prev = head_ptr;
         loop {
-            let next_off = (*prev).next_version_offset.load(Ordering::Acquire);
+            let next_off = (*prev).next_version_offset.load(Ordering::Acquire) & !1;
             if next_off == 0 {
                 (*new_leaf_ptr)
                     .next_version_offset
                     .store(0, Ordering::Relaxed);
                 (*prev)
                     .next_version_offset
-                    .store(new_leaf_offset, Ordering::Release);
+                    .store(clean_new, Ordering::Release);
                 break;
             }
             let next_ptr = arena.get_pointer_mut(next_off) as *mut VersionedLeaf<K, V>;
@@ -1426,7 +1428,7 @@ unsafe fn insert_into_version_chain<K, V>(
                     .store(next_off, Ordering::Relaxed);
                 (*prev)
                     .next_version_offset
-                    .store(new_leaf_offset, Ordering::Release);
+                    .store(clean_new, Ordering::Release);
                 break;
             }
             prev = next_ptr;

@@ -37,7 +37,7 @@ pub mod versioned_map;
 pub mod versioned_tree;
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub use iter::{ArenaEntryRef, Range};
@@ -51,36 +51,13 @@ pub const MAX_ARENA_SIZE: usize = u32::MAX as usize;
 /// Node allocation alignment in the arena (8 bytes).
 pub const NODE_ALIGNMENT: u32 = 8;
 
-const CHUNK_SIZE: u32 = 64 * 1024;
-const MAX_LOCAL_ALLOC_SIZE: u32 = 520;
-
-#[derive(Default, Clone, Copy)]
-struct LocalChunk {
-    arena_id: usize,
-    arena_epoch: u32,
-    current: u32,
-    limit: u32,
-}
-
-thread_local! {
-    static TLS_CHUNK: std::cell::Cell<LocalChunk> = const {
-        std::cell::Cell::new(LocalChunk {
-            arena_id: 0,
-            arena_epoch: 0,
-            current: 0,
-            limit: 0,
-        })
-    };
-}
-
 /// A lock-free contiguous byte arena allocator for [`ArenaArtMap`].
 ///
 /// Memory is pre-allocated upon creation and allocated sequentially via atomic bump allocation.
 /// When dropped, the entire memory block is reclaimed in $O(1)$.
 pub struct Arena {
     n: AtomicU64,
-    epoch: AtomicU32,
-    _pad: [u8; 52],
+    _pad: [u8; 56],
     buf: Box<[UnsafeCell<u8>]>,
 }
 
@@ -103,8 +80,7 @@ impl Arena {
 
         Self {
             n: AtomicU64::new(NODE_ALIGNMENT as u64),
-            epoch: AtomicU32::new(1),
-            _pad: [0u8; 52],
+            _pad: [0u8; 56],
             buf,
         }
     }
@@ -144,7 +120,6 @@ impl Arena {
 
     /// Resets the allocation offset to allow reusing the allocated memory buffer in $O(1)$.
     pub fn reset(&mut self) {
-        self.epoch.fetch_add(1, Ordering::Relaxed);
         self.n.store(NODE_ALIGNMENT as u64, Ordering::Relaxed);
     }
 
@@ -172,55 +147,8 @@ impl Arena {
     }
 
     /// Allocates `size` bytes with the specified `alignment`.
-    ///
-    /// For allocations up to 520 bytes (leaves, Node4, Node16, Node48), uses a thread-local
-    /// 64 KB chunk to eliminate atomic cache-line contention across threads.
+    #[inline]
     pub fn alloc(&self, size: u32, alignment: u32, overflow: u32) -> Option<u32> {
-        debug_assert!(alignment.is_power_of_two());
-        let arena_id = self.buf.as_ptr() as usize;
-        let current_epoch = self.epoch.load(Ordering::Relaxed);
-
-        let chunk_size = if self.buf.len() > 1024 * 1024 {
-            CHUNK_SIZE
-        } else {
-            0
-        };
-
-        if chunk_size > 0 && size <= MAX_LOCAL_ALLOC_SIZE && alignment <= NODE_ALIGNMENT {
-            let local_res = TLS_CHUNK.with(|cell| {
-                let mut chunk = cell.get();
-                if chunk.arena_id == arena_id && chunk.arena_epoch == current_epoch {
-                    let aligned = (chunk.current + alignment - 1) & !(alignment - 1);
-                    if aligned + size <= chunk.limit {
-                        chunk.current = aligned + size;
-                        cell.set(chunk);
-                        return Some(aligned);
-                    }
-                }
-                None
-            });
-
-            if let Some(off) = local_res {
-                return Some(off);
-            }
-
-            // Chunk exhausted or epoch changed: reserve a new chunk from the global arena
-            if let Some(chunk_start) = self.alloc_global(chunk_size, NODE_ALIGNMENT, overflow) {
-                let aligned = (chunk_start + alignment - 1) & !(alignment - 1);
-                let chunk_limit = chunk_start + chunk_size;
-                TLS_CHUNK.with(|cell| {
-                    cell.set(LocalChunk {
-                        arena_id,
-                        arena_epoch: current_epoch,
-                        current: aligned + size,
-                        limit: chunk_limit,
-                    });
-                });
-                return Some(aligned);
-            }
-        }
-
-        // Fall back to direct global allocation (for Node256 or when remaining memory < 64KB)
         self.alloc_global(size, alignment, overflow)
     }
 
