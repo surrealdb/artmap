@@ -144,9 +144,7 @@ impl Arena {
     /// Returns a raw pointer to the data at the specified 32-bit offset.
     #[inline(always)]
     pub fn get_pointer(&self, offset: u32) -> *const u8 {
-        if offset == 0 {
-            return std::ptr::null();
-        }
+        debug_assert_ne!(offset, 0);
         debug_assert!((offset as usize) < self.buf.len());
         // SAFETY: `offset` was verified within bounds during `alloc`.
         unsafe { (self.buf.as_ptr() as *const u8).add(offset as usize) }
@@ -155,9 +153,7 @@ impl Arena {
     /// Returns a raw mutable pointer to the data at the specified 32-bit offset.
     #[inline(always)]
     pub fn get_pointer_mut(&self, offset: u32) -> *mut u8 {
-        if offset == 0 {
-            return std::ptr::null_mut();
-        }
+        debug_assert_ne!(offset, 0);
         debug_assert!((offset as usize) < self.buf.len());
         // SAFETY: `offset` was verified within bounds during `alloc`.
         unsafe { (self.buf.as_ptr() as *mut u8).add(offset as usize) }
