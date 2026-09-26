@@ -18,51 +18,76 @@
 //! matching `crossbeam-skiplist::map::Entry` conventions.
 
 use std::ops::Deref;
+use std::sync::atomic::Ordering;
 
 use crate::key::AsBytes;
+use crate::node::Leaf;
 use crate::tree::Tree;
 
 /// A reference to an entry in an [`ArtMap`](crate::ArtMap).
 pub struct EntryRef<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
-    pub(crate) key_ptr: *const K,
-    pub(crate) val_ptr: *const V,
+    pub(crate) leaf_ptr: *mut Leaf<K, V>,
     pub(crate) tree: &'a Tree<K, V>,
-    pub(crate) is_removed: bool,
+}
+
+impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Clone for EntryRef<'a, K, V> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            leaf_ptr: self.leaf_ptr,
+            tree: self.tree,
+        }
+    }
 }
 
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> EntryRef<'a, K, V> {
     /// Returns a reference to the entry's key.
     #[inline]
     pub fn key(&self) -> &'a K {
-        unsafe { &*self.key_ptr }
+        unsafe { &(*self.leaf_ptr).key }
     }
 
     /// Returns a reference to the entry's value.
     #[inline]
     pub fn value(&self) -> &'a V {
-        unsafe { &*self.val_ptr }
+        unsafe { &(*self.leaf_ptr).value }
     }
 
     /// Checks if this entry has been removed from the map.
     #[inline]
     pub fn is_removed(&self) -> bool {
-        self.is_removed
+        unsafe { (*self.leaf_ptr).removed.load(Ordering::Acquire) }
     }
 
     /// Removes this entry from the map.
-    pub fn remove(&mut self) -> bool {
-        if self.is_removed {
-            return false;
-        }
-        let key = self.key();
+    #[inline]
+    pub fn remove(&self) -> bool {
         let guard = &crossbeam_epoch::pin();
-        let removed = self.tree.remove(key, guard).is_some();
-        if removed {
-            self.is_removed = true;
-        }
-        removed
+        self.tree.remove_leaf(self.leaf_ptr, guard)
     }
 }
+
+impl<'a, K: AsBytes + Send + 'static + std::fmt::Debug, V: Send + 'static + std::fmt::Debug>
+    std::fmt::Debug for EntryRef<'a, K, V>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EntryRef")
+            .field("key", self.key())
+            .field("value", self.value())
+            .field("is_removed", &self.is_removed())
+            .finish()
+    }
+}
+
+impl<'a, K: AsBytes + Send + 'static + PartialEq, V: Send + 'static + PartialEq> PartialEq
+    for EntryRef<'a, K, V>
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key() && self.value() == other.value()
+    }
+}
+
+impl<'a, K: AsBytes + Send + 'static + Eq, V: Send + 'static + Eq> Eq for EntryRef<'a, K, V> {}
 
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Deref for EntryRef<'a, K, V> {
     type Target = V;

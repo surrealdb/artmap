@@ -25,13 +25,13 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 | Data Structure | Point&nbsp;Read (Random&nbsp;Hit) | Point&nbsp;Insert | Range&nbsp;Scan (100&nbsp;items) | Allocations /&nbsp;Insert |
 | :--- | ---: | ---: | ---: | ---: |
 | **`artmap::ArtMap`**<br><sup>&nbsp;(Slice Lookup)</sup> | **19.4&nbsp;ns**<br><sup>(51.5M/s)</sup> | — | — | **0&nbsp;allocs** |
-| **`artmap::ArtMap`**<br><sup>&nbsp;(Standard Key)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**15.0&nbsp;ns**<br><sup>(66.8M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**36.1&nbsp;ns**<br><sup>(27.7M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.51&nbsp;µs**<br><sup>(66.1M/s)</sup> | **1.0&nbsp;allocs** |
-| `crossbeam_skiplist::SkipMap` | 145.2&nbsp;ns<br><sup>(6.9M/s)</sup> | 96.9&nbsp;ns<br><sup>(10.3M/s)</sup> | 2.20&nbsp;µs<br><sup>(45.5M/s)</sup> | ~1.0&nbsp;allocs |
-| `imbl::OrdMap` | 40.6&nbsp;ns<br><sup>(24.6M/s)</sup> | 72.1&nbsp;ns<br><sup>(13.9M/s)</sup> | 319&nbsp;ns<br><sup>(314M/s)</sup> | ~0.14&nbsp;allocs |
-| `std::collections::BTreeMap` | 58.6&nbsp;ns<br><sup>(17.1M/s)</sup> | 38.1&nbsp;ns<br><sup>(26.2M/s)</sup> | 184&nbsp;ns<br><sup>(542M/s)</sup> | ~0.16&nbsp;allocs |
-| `std::collections::HashMap`* | 13.1&nbsp;ns<br><sup>(76.3M/s)</sup> | 29.0&nbsp;ns<br><sup>(34.4M/s)</sup> | N/A | ~0&nbsp;allocs |
+| **`artmap::ArtMap`**<br><sup>&nbsp;(Standard Key)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**15.0&nbsp;ns**<br><sup>(66.5M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**30.2&nbsp;ns**<br><sup>(33.1M/s)</sup> | **1.56&nbsp;µs**<br><sup>(63.8M/s)</sup> | **1.0&nbsp;allocs** |
+| `crossbeam_skiplist::SkipMap` | 143.8&nbsp;ns<br><sup>(7.0M/s)</sup> | 98.0&nbsp;ns<br><sup>(10.2M/s)</sup> | 2.17&nbsp;µs<br><sup>(46.0M/s)</sup> | ~1.0&nbsp;allocs |
+| `imbl::OrdMap` | 40.4&nbsp;ns<br><sup>(24.8M/s)</sup> | 71.9&nbsp;ns<br><sup>(13.9M/s)</sup> | 326&nbsp;ns<br><sup>(307M/s)</sup> | ~0.14&nbsp;allocs |
+| `std::collections::BTreeMap` | 58.6&nbsp;ns<br><sup>(17.1M/s)</sup> | 37.1&nbsp;ns<br><sup>(27.0M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**189&nbsp;ns**<br><sup>(529M/s)</sup> | ~0.16&nbsp;allocs |
+| `std::collections::HashMap`* | 13.1&nbsp;ns<br><sup>(76.1M/s)</sup> | 29.0&nbsp;ns<br><sup>(34.5M/s)</sup> | N/A | ~0&nbsp;allocs |
 
-<sup>* Rocket badge denotes the fastest implementation among ordered, concurrent range-scannable maps. `std::collections::HashMap` is included as an unordered $O(1)$ reference baseline and does not support range queries, sorted scans, or concurrent multi-writer scaling.</sup>
+<sup>* `std::collections::HashMap` is included as an unordered $O(1)$ reference baseline and does not support range queries, sorted scans, or concurrent multi-writer scaling. The rocket icon denotes the fastest implementation among ordered, concurrent range-scannable maps.</sup>
 
 ### Multi-Threaded Concurrent Performance
 
@@ -39,18 +39,18 @@ When running multi-threaded workloads with concurrent writers, non-concurrent da
 
 Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM**, Linux 6.8):
 
-| Data Structure | Concurrent&nbsp;Writes<br><sup>(8&nbsp;Threads)</sup> | Mixed&nbsp;Workload<br><sup>(4&nbsp;Readers&nbsp;+&nbsp;4&nbsp;Writers)</sup> | Concurrency&nbsp;Model |
+| Data Structure | Concurrent&nbsp;Writes<br><sup>(8&nbsp;Threads,&nbsp;100k&nbsp;Ops)</sup> | Mixed&nbsp;Workload<br><sup>(4R&nbsp;+&nbsp;4W,&nbsp;100k&nbsp;Ops)</sup> | Concurrency&nbsp;Model |
 | :--- | ---: | ---: | :--- |
-| **`artmap::ArtMap`** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**548&nbsp;µs**<br><sup>(14.6M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**857&nbsp;µs**<br><sup>(18.7M/s)</sup> | Non-Blocking Reads + OLC Writes |
-| `crossbeam_skiplist::SkipMap` | 885&nbsp;µs<br><sup>(9.04M/s)</sup> | 1.52&nbsp;ms<br><sup>(10.5M/s)</sup> | Lock-Free Atomic CAS |
-| `parking_lot::RwLock<BTreeMap>` | 5.77&nbsp;ms<br><sup>(1.39M/s)</sup> | 5.53&nbsp;ms<br><sup>(2.89M/s)</sup> | Coarse Exclusive Lock |
-| `parking_lot::RwLock<HashMap>`* | 7.78&nbsp;ms<br><sup>(1.03M/s)</sup> | 7.45&nbsp;ms<br><sup>(2.15M/s)</sup> | Coarse Exclusive Lock |
-| `parking_lot::RwLock<imbl::OrdMap>` | 7.05&nbsp;ms<br><sup>(1.13M/s)</sup> | 8.33&nbsp;ms<br><sup>(1.92M/s)</sup> | Coarse Exclusive Lock |
+| **`artmap::ArtMap`** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**5.73&nbsp;ms**<br><sup>(17.4M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**5.25&nbsp;ms**<br><sup>(19.1M/s)</sup> | Non-Blocking Reads + OLC Writes |
+| `crossbeam_skiplist::SkipMap` | 10.12&nbsp;ms<br><sup>(9.88M/s)</sup> | 9.65&nbsp;ms<br><sup>(10.4M/s)</sup> | Lock-Free Atomic CAS |
+| `parking_lot::RwLock<BTreeMap>` | 71.0&nbsp;ms<br><sup>(1.41M/s)</sup> | 38.0&nbsp;ms<br><sup>(2.63M/s)</sup> | Coarse Exclusive Lock |
+| `parking_lot::RwLock<HashMap>`* | 90.2&nbsp;ms<br><sup>(1.11M/s)</sup> | 45.6&nbsp;ms<br><sup>(2.19M/s)</sup> | Coarse Exclusive Lock |
+| `parking_lot::RwLock<imbl::OrdMap>` | 81.0&nbsp;ms<br><sup>(1.24M/s)</sup> | 57.1&nbsp;ms<br><sup>(1.75M/s)</sup> | Coarse Exclusive Lock |
 
-- **Outperforming SkipMap on Writes & Mixed Loads**: `artmap` is **1.62× faster on concurrent writes** (548 µs vs. 885 µs) and **1.77× faster on mixed read/write workloads** (857 µs vs. 1.52 ms) by eliminating parent-node contention and leveraging lock-free atomic CAS for wide nodes.
-- **9.7× Faster Point Reads**: `artmap` resolves random point lookups in **15.0 ns** (66.8M ops/sec), compared to **145.2 ns** for `crossbeam-skiplist::SkipMap` and **58.6 ns** for standard `BTreeMap`.
-- **1.45× Faster Range Scans**: `artmap` traverses 100 contiguous items in **1.51 µs** (66.1M items/sec) with zero heap allocations during iteration, outperforming `crossbeam-skiplist::SkipMap` (2.20 µs).
-- **Coarse Lock Bottleneck**: Non-concurrent collections (`RwLock<BTreeMap>`, `RwLock<HashMap>`, `RwLock<imbl::OrdMap>`) run **6.5× to 9.7× slower** on mixed workloads and up to **14× slower on concurrent writes** because exclusive write acquisitions serialize all threads.
+- **Outperforming SkipMap on Writes & Mixed Loads**: `artmap` is **1.77× faster on concurrent writes** (5.73 ms vs. 10.12 ms) and **1.84× faster on mixed read/write workloads** (5.25 ms vs. 9.65 ms) by eliminating parent-node contention and leveraging lock-free atomic CAS for wide nodes.
+- **9.6× Faster Point Reads**: `artmap` resolves random point lookups in **15.0 ns** (66.5M ops/sec), compared to **143.8 ns** for `crossbeam-skiplist::SkipMap` and **58.6 ns** for standard `BTreeMap`.
+- **1.39× Faster Concurrent Range Scans**: `artmap` traverses 100 contiguous items in **1.56 µs** (63.8M items/sec) with zero heap allocations during iteration, outperforming `crossbeam-skiplist::SkipMap` (2.17 µs).
+- **Coarse Lock Bottleneck**: Non-concurrent collections (`RwLock<BTreeMap>`, `RwLock<HashMap>`, `RwLock<imbl::OrdMap>`) run **7.2× to 10.9× slower** on mixed workloads and up to **15.7× slower on concurrent writes** because exclusive write acquisitions serialize all threads.
 - **True Multi-Writer Scaling**: Writers in `artmap` acquire fine-grained node locks only at the specific leaf or inner node being modified, allowing concurrent updates across disjoint prefixes to proceed in parallel.
 - **Epoch-Based Memory Safety**: Replaced or unlinked nodes are retired safely via `crossbeam-epoch` without reference-counting overhead on read traversal.
 

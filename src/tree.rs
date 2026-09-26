@@ -18,6 +18,7 @@
 
 use crossbeam_epoch::Guard;
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
@@ -58,11 +59,17 @@ impl<K, V> Drop for Tree<K, V> {
 
 unsafe fn drop_subtree<K, V>(ptr: TaggedPtr) {
     if ptr.is_leaf() {
-        drop(Box::from_raw(ptr.as_leaf_ptr::<K, V>()));
+        let mut leaf = Box::from_raw(ptr.as_leaf_ptr::<K, V>());
+        if !leaf.value_taken.load(Ordering::Acquire) {
+            ManuallyDrop::drop(&mut leaf.value);
+        }
     } else {
         let header = &*ptr.as_inner_ptr();
         if let Some(leaf_ptr) = header.load_exact_leaf::<K, V>(Ordering::Relaxed) {
-            drop(Box::from_raw(leaf_ptr));
+            let mut leaf = Box::from_raw(leaf_ptr);
+            if !leaf.value_taken.load(Ordering::Acquire) {
+                ManuallyDrop::drop(&mut leaf.value);
+            }
         }
         match header.node_type {
             NodeType::Node4 => {
@@ -120,6 +127,11 @@ impl<K, V> Tree<K, V> {
     }
 
     #[inline]
+    pub fn raw_root(&self) -> TaggedPtr {
+        TaggedPtr::from_raw(self.root.load(Ordering::Acquire))
+    }
+
+    #[inline]
     pub fn len(&self) -> usize {
         self.len.load(Ordering::Relaxed)
     }
@@ -131,8 +143,8 @@ impl<K, V> Tree<K, V> {
 }
 
 impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
-    /// Optimistic non-blocking lookup.
-    pub fn get<'g, Q>(&self, key: &Q, _guard: &'g Guard) -> Option<&'g V>
+    /// Optimistic non-blocking lookup returning a pointer to the leaf.
+    pub fn get_leaf<Q>(&self, key: &Q, _guard: &Guard) -> Option<*mut Leaf<K, V>>
     where
         Q: AsBytes + ?Sized,
     {
@@ -154,9 +166,10 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             continue 'retry;
                         }
                     }
-                    let leaf = unsafe { &*current.as_leaf_ptr::<K, V>() };
+                    let leaf_ptr = current.as_leaf_ptr::<K, V>();
+                    let leaf = unsafe { &*leaf_ptr };
                     if leaf.key.as_bytes() == key_bytes {
-                        return Some(&leaf.value);
+                        return Some(leaf_ptr);
                     } else {
                         return None;
                     }
@@ -189,7 +202,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                     let leaf_ptr = exact?;
                     let leaf = unsafe { &*leaf_ptr };
                     if leaf.key.as_bytes() == key_bytes {
-                        return Some(&leaf.value);
+                        return Some(leaf_ptr);
                     } else {
                         return None;
                     }
@@ -212,6 +225,19 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
         }
     }
 
+    /// Optimistic non-blocking lookup.
+    pub fn get<'g, Q>(&self, key: &Q, guard: &'g Guard) -> Option<&'g V>
+    where
+        Q: AsBytes + ?Sized,
+    {
+        let leaf_ptr = self.get_leaf(key, guard)?;
+        let leaf = unsafe { &*leaf_ptr };
+        if leaf.removed.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(&leaf.value)
+    }
+
     /// Inserts or updates a key-value pair.
     pub fn insert(&self, key: K, value: V, guard: &Guard) -> Option<V> {
         self.insert_or_modify(key, value, true, guard)
@@ -219,16 +245,15 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
             .unwrap_or(None)
     }
 
-    /// Inserts a key-value pair if absent, or returns reference to existing value.
-    pub fn get_or_insert_with<F>(&self, key: K, f: F, guard: &Guard) -> (*const K, *const V)
+    /// Inserts a key-value pair if absent, or returns a pointer to the existing leaf.
+    pub fn get_or_insert_with<F>(&self, key: K, f: F, guard: &Guard) -> *mut Leaf<K, V>
     where
         F: FnOnce() -> V,
     {
-        if let Some(val_ref) = self.get(&key, guard) {
-            let leaf_ptr = self.find_leaf_ptr(key.as_bytes());
-            if !leaf_ptr.is_null() {
-                let key_ref = unsafe { &*leaf_ptr };
-                return (&key_ref.key, val_ref);
+        if let Some(leaf_ptr) = self.get_leaf(&key, guard) {
+            let leaf = unsafe { &*leaf_ptr };
+            if !leaf.removed.load(Ordering::Acquire) {
+                return leaf_ptr;
             }
         }
 
@@ -237,45 +262,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
             .insert_or_modify(key, value, false, guard)
             .expect("insert_or_modify must return leaf pointer");
 
-        unsafe { (&(*leaf_ptr).key, &(*leaf_ptr).value) }
-    }
-
-    fn find_leaf_ptr(&self, key_bytes: &[u8]) -> *mut Leaf<K, V> {
-        let mut current = TaggedPtr::from_raw(self.root.load(Ordering::Acquire));
-        let mut depth = 0;
-        while !current.is_null() {
-            if current.is_leaf() {
-                let leaf = unsafe { &*current.as_leaf_ptr::<K, V>() };
-                if leaf.key.as_bytes() == key_bytes {
-                    return current.as_leaf_ptr::<K, V>();
-                }
-                return ptr::null_mut();
-            }
-            let header = unsafe { &*current.as_inner_ptr() };
-            let (_matched, is_full) = header.match_prefix(key_bytes, depth);
-            if !is_full {
-                return ptr::null_mut();
-            }
-            depth += header.prefix_len as usize;
-            if depth == key_bytes.len() {
-                if let Some(leaf_ptr) = header.load_exact_leaf::<K, V>(Ordering::Acquire) {
-                    let leaf = unsafe { &*leaf_ptr };
-                    if leaf.key.as_bytes() == key_bytes {
-                        return leaf_ptr;
-                    }
-                }
-                return ptr::null_mut();
-            }
-            let next_byte = key_bytes[depth];
-            match unsafe { find_child(header, next_byte) } {
-                Some(child) => {
-                    current = child;
-                    depth += 1;
-                }
-                None => return ptr::null_mut(),
-            }
-        }
-        ptr::null_mut()
+        leaf_ptr
     }
 
     fn insert_or_modify(
@@ -317,12 +304,15 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
 
                 let existing_leaf = unsafe { &mut *cur_root.as_leaf_ptr::<K, V>() };
                 if existing_leaf.key.as_bytes() == key_bytes {
-                    let new_leaf = unsafe { Box::from_raw(new_leaf_ptr) };
+                    let mut new_leaf = unsafe { Box::from_raw(new_leaf_ptr) };
                     if replace_if_present {
-                        let old_val = std::mem::replace(&mut existing_leaf.value, new_leaf.value);
+                        let old_val = unsafe { ManuallyDrop::take(&mut existing_leaf.value) };
+                        existing_leaf.value =
+                            ManuallyDrop::new(unsafe { ManuallyDrop::take(&mut new_leaf.value) });
                         self.root_latch.unlock();
                         return Ok((Some(old_val), cur_root.as_leaf_ptr::<K, V>()));
                     } else {
+                        unsafe { ManuallyDrop::drop(&mut new_leaf.value) };
                         self.root_latch.unlock();
                         return Ok((None, cur_root.as_leaf_ptr::<K, V>()));
                     }
@@ -457,13 +447,16 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
 
                     if let Some(leaf_ptr) = header.load_exact_leaf::<K, V>(Ordering::Acquire) {
                         let existing_leaf = unsafe { &mut *leaf_ptr };
-                        let new_leaf = unsafe { Box::from_raw(new_leaf_ptr) };
+                        let mut new_leaf = unsafe { Box::from_raw(new_leaf_ptr) };
                         if replace_if_present {
-                            let old_val =
-                                std::mem::replace(&mut existing_leaf.value, new_leaf.value);
+                            let old_val = unsafe { ManuallyDrop::take(&mut existing_leaf.value) };
+                            existing_leaf.value = ManuallyDrop::new(unsafe {
+                                ManuallyDrop::take(&mut new_leaf.value)
+                            });
                             header.latch.unlock();
                             return Ok((Some(old_val), leaf_ptr));
                         } else {
+                            unsafe { ManuallyDrop::drop(&mut new_leaf.value) };
                             header.latch.unlock();
                             return Ok((None, leaf_ptr));
                         }
@@ -601,13 +594,17 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
 
                             let existing_leaf = unsafe { &mut *child.as_leaf_ptr::<K, V>() };
                             if existing_leaf.key.as_bytes() == key_bytes {
-                                let new_leaf = unsafe { Box::from_raw(new_leaf_ptr) };
+                                let mut new_leaf = unsafe { Box::from_raw(new_leaf_ptr) };
                                 if replace_if_present {
                                     let old_val =
-                                        std::mem::replace(&mut existing_leaf.value, new_leaf.value);
+                                        unsafe { ManuallyDrop::take(&mut existing_leaf.value) };
+                                    existing_leaf.value = ManuallyDrop::new(unsafe {
+                                        ManuallyDrop::take(&mut new_leaf.value)
+                                    });
                                     header.latch.unlock();
                                     return Ok((Some(old_val), child.as_leaf_ptr::<K, V>()));
                                 } else {
+                                    unsafe { ManuallyDrop::drop(&mut new_leaf.value) };
                                     header.latch.unlock();
                                     return Ok((None, child.as_leaf_ptr::<K, V>()));
                                 }
@@ -675,13 +672,16 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                     self.root_latch.unlock();
                     continue 'retry;
                 }
-                let leaf = unsafe { &*cur_root.as_leaf_ptr::<K, V>() };
+                let leaf_ptr = cur_root.as_leaf_ptr::<K, V>();
+                let leaf = unsafe { &*leaf_ptr };
                 if leaf.key.as_bytes() == key_bytes {
                     self.root.store(ptr::null_mut(), Ordering::Release);
                     self.len.fetch_sub(1, Ordering::Relaxed);
                     self.root_latch.unlock();
-                    let val = unsafe { ptr::read(&leaf.value) };
-                    let raw_leaf = cur_root.as_leaf_ptr::<K, V>() as usize;
+                    leaf.removed.store(true, Ordering::Release);
+                    leaf.value_taken.store(true, Ordering::Release);
+                    let val = unsafe { ManuallyDrop::take(&mut (*leaf_ptr).value) };
+                    let raw_leaf = leaf_ptr as usize;
                     guard
                         .defer(move || unsafe { drop(Box::from_raw(raw_leaf as *mut Leaf<K, V>)) });
                     return Some(val);
@@ -713,7 +713,9 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             header.exact_leaf.store(ptr::null_mut(), Ordering::Release);
                             self.len.fetch_sub(1, Ordering::Relaxed);
                             header.latch.unlock();
-                            let val = unsafe { ptr::read(&leaf.value) };
+                            leaf.removed.store(true, Ordering::Release);
+                            leaf.value_taken.store(true, Ordering::Release);
+                            let val = unsafe { ManuallyDrop::take(&mut (*leaf_ptr).value) };
                             let raw_leaf = leaf_ptr as usize;
                             guard.defer(move || unsafe {
                                 drop(Box::from_raw(raw_leaf as *mut Leaf<K, V>))
@@ -737,13 +739,16 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                         continue 'retry;
                     }
 
-                    let leaf = unsafe { &*child.as_leaf_ptr::<K, V>() };
+                    let leaf_ptr = child.as_leaf_ptr::<K, V>();
+                    let leaf = unsafe { &*leaf_ptr };
                     if leaf.key.as_bytes() == key_bytes {
                         unsafe { remove_child_from_node(header, next_byte) };
                         self.len.fetch_sub(1, Ordering::Relaxed);
                         header.latch.unlock();
-                        let val = unsafe { ptr::read(&leaf.value) };
-                        let raw_leaf = child.as_leaf_ptr::<K, V>() as usize;
+                        leaf.removed.store(true, Ordering::Release);
+                        leaf.value_taken.store(true, Ordering::Release);
+                        let val = unsafe { ManuallyDrop::take(&mut (*leaf_ptr).value) };
+                        let raw_leaf = leaf_ptr as usize;
                         guard.defer(move || unsafe {
                             drop(Box::from_raw(raw_leaf as *mut Leaf<K, V>))
                         });
@@ -751,6 +756,134 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                     }
                     header.latch.unlock();
                     return None;
+                } else {
+                    current = child;
+                    depth += 1;
+                    continue 'traverse;
+                }
+            }
+        }
+    }
+
+    /// Removes a specific leaf from the tree, verifying identity by pointer equality.
+    pub(crate) fn remove_leaf(&self, leaf_ptr: *mut Leaf<K, V>, guard: &Guard) -> bool {
+        if leaf_ptr.is_null() {
+            return false;
+        }
+        let leaf = unsafe { &*leaf_ptr };
+        if leaf.removed.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let key_bytes = leaf.key.as_bytes();
+
+        'retry: loop {
+            let root_ptr = TaggedPtr::from_raw(self.root.load(Ordering::Acquire));
+            if root_ptr.is_null() {
+                leaf.removed.store(true, Ordering::Release);
+                return false;
+            }
+
+            if root_ptr.is_leaf() {
+                let _ = self.root_latch.lock();
+                let cur_root = TaggedPtr::from_raw(self.root.load(Ordering::Relaxed));
+                if !cur_root.is_leaf() {
+                    self.root_latch.unlock();
+                    continue 'retry;
+                }
+                if cur_root.as_leaf_ptr::<K, V>() != leaf_ptr {
+                    self.root_latch.unlock();
+                    leaf.removed.store(true, Ordering::Release);
+                    return false;
+                }
+                self.root.store(ptr::null_mut(), Ordering::Release);
+                self.len.fetch_sub(1, Ordering::Relaxed);
+                self.root_latch.unlock();
+                leaf.removed.store(true, Ordering::Release);
+                let raw = leaf_ptr as usize;
+                guard.defer(move || unsafe {
+                    let mut leaf = Box::from_raw(raw as *mut Leaf<K, V>);
+                    if !leaf.value_taken.load(Ordering::Acquire) {
+                        ManuallyDrop::drop(&mut leaf.value);
+                    }
+                });
+                return true;
+            }
+
+            let mut current = root_ptr;
+            let mut depth = 0;
+
+            'traverse: loop {
+                let header = unsafe { &mut *current.as_inner_ptr() };
+                let (_matched, is_full) = header.match_prefix(key_bytes, depth);
+                if !is_full {
+                    leaf.removed.store(true, Ordering::Release);
+                    return false;
+                }
+
+                depth += header.prefix_len as usize;
+
+                if depth == key_bytes.len() {
+                    if header.latch.lock().is_err() {
+                        continue 'retry;
+                    }
+
+                    if let Some(cur_leaf_ptr) = header.load_exact_leaf::<K, V>(Ordering::Acquire) {
+                        if cur_leaf_ptr == leaf_ptr {
+                            header.exact_leaf.store(ptr::null_mut(), Ordering::Release);
+                            self.len.fetch_sub(1, Ordering::Relaxed);
+                            header.latch.unlock();
+                            leaf.removed.store(true, Ordering::Release);
+                            let raw = leaf_ptr as usize;
+                            guard.defer(move || unsafe {
+                                let mut leaf = Box::from_raw(raw as *mut Leaf<K, V>);
+                                if !leaf.value_taken.load(Ordering::Acquire) {
+                                    ManuallyDrop::drop(&mut leaf.value);
+                                }
+                            });
+                            return true;
+                        }
+                    }
+                    header.latch.unlock();
+                    leaf.removed.store(true, Ordering::Release);
+                    return false;
+                }
+
+                let next_byte = key_bytes[depth];
+                let child = match unsafe { find_child(header, next_byte) } {
+                    Some(c) => c,
+                    None => {
+                        leaf.removed.store(true, Ordering::Release);
+                        return false;
+                    }
+                };
+
+                if child.is_leaf() {
+                    if header.latch.lock().is_err() {
+                        continue 'retry;
+                    }
+                    if unsafe { find_child(header, next_byte) } != Some(child) {
+                        header.latch.unlock();
+                        continue 'retry;
+                    }
+
+                    if child.as_leaf_ptr::<K, V>() == leaf_ptr {
+                        unsafe { remove_child_from_node(header, next_byte) };
+                        self.len.fetch_sub(1, Ordering::Relaxed);
+                        header.latch.unlock();
+                        leaf.removed.store(true, Ordering::Release);
+                        let raw = leaf_ptr as usize;
+                        guard.defer(move || unsafe {
+                            let mut leaf = Box::from_raw(raw as *mut Leaf<K, V>);
+                            if !leaf.value_taken.load(Ordering::Acquire) {
+                                ManuallyDrop::drop(&mut leaf.value);
+                            }
+                        });
+                        return true;
+                    }
+                    header.latch.unlock();
+                    leaf.removed.store(true, Ordering::Release);
+                    return false;
                 } else {
                     current = child;
                     depth += 1;

@@ -101,7 +101,7 @@ fn test_deterministic_simulation() {
                         // 30% Get & Verification
                         let o = oracle.lock().unwrap();
                         let oracle_val = o.get(&key).copied();
-                        let map_val = map.get(&key);
+                        let map_val = map.get(&key).map(|e| *e.value());
                         assert_eq!(map_val, oracle_val, "point get must match oracle");
                         assert_eq!(map.contains_key(&key), oracle_val.is_some());
                         assert_eq!(map.contains_key_slice(key.as_bytes()), oracle_val.is_some());
@@ -148,7 +148,7 @@ fn test_deterministic_simulation() {
 
     for (k, v) in o.iter() {
         assert_eq!(
-            map.get(k),
+            map.get(k).map(|e| *e.value()),
             Some(*v),
             "key {} must be present with matching value",
             k
