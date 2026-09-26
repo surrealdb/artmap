@@ -501,14 +501,14 @@ unsafe fn next_child_in_node<K: AsBytes + Clone, V: Clone>(
         }
         NodeType::Node48 => {
             let n = &*(header_ptr as *const Node48);
-            let next_byte = if current_pos == usize::MAX {
+            let mut next_byte = if current_pos == usize::MAX {
                 0
             } else if current_pos < 255 {
                 (current_pos + 1) as u8
             } else {
                 return None;
             };
-            if let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
+            while let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
                 let slot = n.child_indices[byte as usize];
                 if slot != NODE48_EMPTY {
                     let raw = n.children[slot as usize].load(Ordering::Acquire);
@@ -516,23 +516,31 @@ unsafe fn next_child_in_node<K: AsBytes + Clone, V: Clone>(
                         return Some((byte as usize, TaggedOffset(raw)));
                     }
                 }
+                if byte == 255 {
+                    break;
+                }
+                next_byte = byte + 1;
             }
             None
         }
         NodeType::Node256 => {
             let n = &*(header_ptr as *const Node256);
-            let next_byte = if current_pos == usize::MAX {
+            let mut next_byte = if current_pos == usize::MAX {
                 0
             } else if current_pos < 255 {
                 (current_pos + 1) as u8
             } else {
                 return None;
             };
-            if let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
+            while let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
                 let raw = n.children[byte as usize].load(Ordering::Acquire);
                 if raw != 0 {
                     return Some((byte as usize, TaggedOffset(raw)));
                 }
+                if byte == 255 {
+                    break;
+                }
+                next_byte = byte + 1;
             }
             None
         }
@@ -585,14 +593,14 @@ unsafe fn prev_child_in_node<K: AsBytes + Clone, V: Clone>(
         }
         NodeType::Node48 => {
             let n = &*(header_ptr as *const Node48);
-            let max_byte = if current_pos == usize::MAX {
+            let mut max_byte = if current_pos == usize::MAX {
                 255
             } else if current_pos > 0 {
                 (current_pos - 1) as u8
             } else {
                 return None;
             };
-            if let Some(byte) = prev_present_byte(&n.child_bitmap, max_byte) {
+            while let Some(byte) = prev_present_byte(&n.child_bitmap, max_byte) {
                 let slot = n.child_indices[byte as usize];
                 if slot != NODE48_EMPTY {
                     let raw = n.children[slot as usize].load(Ordering::Acquire);
@@ -600,23 +608,31 @@ unsafe fn prev_child_in_node<K: AsBytes + Clone, V: Clone>(
                         return Some((byte as usize, TaggedOffset(raw)));
                     }
                 }
+                if byte == 0 {
+                    break;
+                }
+                max_byte = byte - 1;
             }
             None
         }
         NodeType::Node256 => {
             let n = &*(header_ptr as *const Node256);
-            let max_byte = if current_pos == usize::MAX {
+            let mut max_byte = if current_pos == usize::MAX {
                 255
             } else if current_pos > 0 {
                 (current_pos - 1) as u8
             } else {
                 return None;
             };
-            if let Some(byte) = prev_present_byte(&n.child_bitmap, max_byte) {
+            while let Some(byte) = prev_present_byte(&n.child_bitmap, max_byte) {
                 let raw = n.children[byte as usize].load(Ordering::Acquire);
                 if raw != 0 {
                     return Some((byte as usize, TaggedOffset(raw)));
                 }
+                if byte == 0 {
+                    break;
+                }
+                max_byte = byte - 1;
             }
             None
         }
