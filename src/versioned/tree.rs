@@ -647,6 +647,23 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
         }
     }
 
+    /// Returns the number of versions stored for `key`.
+    pub fn version_count<Q>(&self, key: &Q, guard: &Guard) -> usize
+    where
+        Q: AsBytes + ?Sized,
+    {
+        let mut count = 0;
+        let mut cur = match self.get_leaf(key, guard) {
+            Some(p) => p,
+            None => return 0,
+        };
+        while !cur.is_null() {
+            count += 1;
+            cur = unsafe { (*cur).next_version.load(Ordering::Acquire) };
+        }
+        count
+    }
+
     /// Prunes stale versions older than `min_version` from the version chain of `key`.
     ///
     /// If the only remaining version is a tombstone and there are no newer versions,

@@ -148,6 +148,17 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedArtMap<K, 
         self.tree.remove(key, &guard)
     }
 
+    /// Returns the number of versions stored for `key`.
+    #[inline]
+    pub fn version_count<Q>(&self, key: &Q) -> usize
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        let guard = crossbeam_epoch::pin();
+        self.tree.version_count(key, &guard)
+    }
+
     /// Prunes stale versions older than `min_version` from the version chain of `key`.
     ///
     /// If the key has become a dead tombstone at or below `min_version` with no newer versions,
