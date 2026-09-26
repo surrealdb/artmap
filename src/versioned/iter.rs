@@ -152,69 +152,64 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Range<'a, K, V>
         }
     }
 
-    fn push_and_descend_left(
-        &mut self,
-        mut current: TaggedPtr,
-    ) -> Option<*mut VersionedLeaf<K, V>> {
-        loop {
-            if current.is_leaf() {
-                return Some(current.as_versioned_leaf_ptr());
+    fn push_and_descend_left(&mut self, mut ptr: TaggedPtr) -> Option<*mut VersionedLeaf<K, V>> {
+        while !ptr.is_null() {
+            if ptr.is_leaf() {
+                return Some(ptr.as_versioned_leaf_ptr());
             }
-
-            let header = current.as_inner_ptr();
-
-            if let Some(exact_leaf) =
-                unsafe { (*header).load_exact_versioned_leaf(Ordering::Acquire) }
-            {
+            let header = ptr.as_inner_ptr();
+            let exact = unsafe { (*header).load_exact_versioned_leaf::<K, V>(Ordering::Acquire) };
+            if let Some(leaf_ptr) = exact {
                 self.stack_push(CursorFrame {
                     node: header,
-                    current_pos: 0,
+                    current_pos: usize::MAX,
                 });
-                return Some(exact_leaf);
+                return Some(leaf_ptr);
             }
 
-            match unsafe { first_child_in_node(header) } {
+            match unsafe { next_child_in_node(header, usize::MAX) } {
                 Some((pos, child)) => {
                     self.stack_push(CursorFrame {
                         node: header,
                         current_pos: pos,
                     });
-                    current = child;
+                    ptr = child;
                 }
                 None => return None,
             }
         }
+        None
     }
 
     fn seek_to_key(&mut self, target_key: &[u8]) {
         self.stack_clear();
-        let root = TaggedPtr::from_raw(self.tree.raw_root().as_raw());
-        if root.is_null() || root.is_leaf() {
+        let root_ptr = TaggedPtr::from_raw(self.tree.raw_root().as_raw());
+        if root_ptr.is_null() || root_ptr.is_leaf() {
             return;
         }
 
-        let mut current = root;
+        let mut current = root_ptr;
         let mut depth = 0;
 
-        loop {
-            if current.is_leaf() {
+        while !current.is_null() && !current.is_leaf() {
+            let header = current.as_inner_ptr();
+            let (_matched, is_full) = unsafe { (*header).match_prefix(target_key, depth) };
+            if !is_full {
                 return;
             }
 
-            let header = current.as_inner_ptr();
-            let p_len = unsafe { (*header).prefix_len as usize };
-            depth += p_len;
+            depth += unsafe { (*header).prefix_len as usize };
 
-            if depth >= target_key.len() {
+            if depth == target_key.len() {
                 self.stack_push(CursorFrame {
                     node: header,
-                    current_pos: 0,
+                    current_pos: usize::MAX,
                 });
                 return;
             }
 
-            let byte = target_key[depth];
-            match unsafe { find_child_and_pos(header, byte) } {
+            let next_byte = target_key[depth];
+            match unsafe { child_pos_for_byte(header, next_byte) } {
                 Some((pos, child)) => {
                     self.stack_push(CursorFrame {
                         node: header,
@@ -572,94 +567,74 @@ pub(crate) unsafe fn last_leaf_in_subtree<K, V>(
     None
 }
 
-unsafe fn first_child_in_node(header: *mut NodeHeader) -> Option<(usize, TaggedPtr)> {
-    match (*header).node_type {
-        NodeType::Node4 => {
-            let n = &*(header as *const Node4);
-            if n.header.num_children > 0 {
-                let child = TaggedPtr::from_raw(n.children[0].load(Ordering::Acquire));
-                Some((0, child))
-            } else {
-                None
-            }
-        }
-        NodeType::Node16 => {
-            let n = &*(header as *const Node16);
-            if n.header.num_children > 0 {
-                let child = TaggedPtr::from_raw(n.children[0].load(Ordering::Acquire));
-                Some((0, child))
-            } else {
-                None
-            }
-        }
-        NodeType::Node48 => {
-            let n = &*(header as *const Node48);
-            for byte in 0..256 {
-                let idx = n.child_indices[byte];
-                if idx != NODE48_EMPTY {
-                    let child =
-                        TaggedPtr::from_raw(n.children[idx as usize].load(Ordering::Acquire));
-                    return Some((byte, child));
-                }
-            }
-            None
-        }
-        NodeType::Node256 => {
-            let n = &*(header as *const Node256);
-            for byte in 0..256 {
-                let raw = n.children[byte].load(Ordering::Acquire);
-                if !raw.is_null() {
-                    return Some((byte, TaggedPtr::from_raw(raw)));
-                }
-            }
-            None
-        }
-    }
-}
-
 unsafe fn next_child_in_node(
     header: *mut NodeHeader,
     current_pos: usize,
 ) -> Option<(usize, TaggedPtr)> {
-    match (*header).node_type {
+    let h = &*header;
+    match h.node_type {
         NodeType::Node4 => {
             let n = &*(header as *const Node4);
-            let next_idx = current_pos + 1;
-            if next_idx < n.header.num_children as usize {
-                let child = TaggedPtr::from_raw(n.children[next_idx].load(Ordering::Acquire));
-                Some((next_idx, child))
+            let count = n.header.num_children as usize;
+            let next_idx = if current_pos == usize::MAX {
+                0
             } else {
-                None
+                current_pos + 1
+            };
+            if next_idx < count {
+                let child = TaggedPtr::from_raw(n.children[next_idx].load(Ordering::Acquire));
+                if !child.is_null() {
+                    return Some((next_idx, child));
+                }
             }
+            None
         }
         NodeType::Node16 => {
             let n = &*(header as *const Node16);
-            let next_idx = current_pos + 1;
-            if next_idx < n.header.num_children as usize {
-                let child = TaggedPtr::from_raw(n.children[next_idx].load(Ordering::Acquire));
-                Some((next_idx, child))
+            let count = n.header.num_children as usize;
+            let next_idx = if current_pos == usize::MAX {
+                0
             } else {
-                None
+                current_pos + 1
+            };
+            if next_idx < count {
+                let child = TaggedPtr::from_raw(n.children[next_idx].load(Ordering::Acquire));
+                if !child.is_null() {
+                    return Some((next_idx, child));
+                }
             }
+            None
         }
         NodeType::Node48 => {
             let n = &*(header as *const Node48);
-            for byte in (current_pos + 1)..256 {
-                let idx = n.child_indices[byte];
-                if idx != NODE48_EMPTY {
+            let next_byte = if current_pos == usize::MAX {
+                0
+            } else {
+                current_pos + 1
+            };
+            for byte in next_byte..=255 {
+                let slot = n.child_indices[byte];
+                if slot != NODE48_EMPTY {
                     let child =
-                        TaggedPtr::from_raw(n.children[idx as usize].load(Ordering::Acquire));
-                    return Some((byte, child));
+                        TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
+                    if !child.is_null() {
+                        return Some((byte, child));
+                    }
                 }
             }
             None
         }
         NodeType::Node256 => {
             let n = &*(header as *const Node256);
-            for byte in (current_pos + 1)..256 {
-                let raw = n.children[byte].load(Ordering::Acquire);
-                if !raw.is_null() {
-                    return Some((byte, TaggedPtr::from_raw(raw)));
+            let next_byte = if current_pos == usize::MAX {
+                0
+            } else {
+                current_pos + 1
+            };
+            for byte in next_byte..=255 {
+                let child = TaggedPtr::from_raw(n.children[byte].load(Ordering::Acquire));
+                if !child.is_null() {
+                    return Some((byte, child));
                 }
             }
             None
@@ -667,43 +642,51 @@ unsafe fn next_child_in_node(
     }
 }
 
-unsafe fn find_child_and_pos(header: *mut NodeHeader, byte: u8) -> Option<(usize, TaggedPtr)> {
-    match (*header).node_type {
+unsafe fn child_pos_for_byte(header: *mut NodeHeader, needle: u8) -> Option<(usize, TaggedPtr)> {
+    let h = &*header;
+    match h.node_type {
         NodeType::Node4 => {
             let n = &*(header as *const Node4);
-            for i in 0..n.header.num_children as usize {
-                if n.keys[i] == byte {
+            let count = n.header.num_children as usize;
+            for i in 0..count {
+                if n.keys[i] == needle {
                     let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
-                    return Some((i, child));
+                    if !child.is_null() {
+                        return Some((i, child));
+                    }
                 }
             }
             None
         }
         NodeType::Node16 => {
             let n = &*(header as *const Node16);
-            for i in 0..n.header.num_children as usize {
-                if n.keys[i] == byte {
+            let count = n.header.num_children as usize;
+            for i in 0..count {
+                if n.keys[i] == needle {
                     let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
-                    return Some((i, child));
+                    if !child.is_null() {
+                        return Some((i, child));
+                    }
                 }
             }
             None
         }
         NodeType::Node48 => {
             let n = &*(header as *const Node48);
-            let idx = n.child_indices[byte as usize];
-            if idx != NODE48_EMPTY {
-                let child = TaggedPtr::from_raw(n.children[idx as usize].load(Ordering::Acquire));
-                Some((byte as usize, child))
-            } else {
-                None
+            let slot = n.child_indices[needle as usize];
+            if slot != NODE48_EMPTY {
+                let child = TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
+                if !child.is_null() {
+                    return Some((needle as usize, child));
+                }
             }
+            None
         }
         NodeType::Node256 => {
             let n = &*(header as *const Node256);
-            let raw = n.children[byte as usize].load(Ordering::Acquire);
-            if !raw.is_null() {
-                Some((byte as usize, TaggedPtr::from_raw(raw)))
+            let child = TaggedPtr::from_raw(n.children[needle as usize].load(Ordering::Acquire));
+            if !child.is_null() {
+                Some((needle as usize, child))
             } else {
                 None
             }
