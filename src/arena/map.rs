@@ -22,6 +22,36 @@ use crate::arena::tree::ArenaTree;
 use crate::arena::Arena;
 use crate::key::AsBytes;
 
+/// An inserter cache optimizing sequential and localized inserts in [`ArenaArtMap`].
+///
+/// By caching the parent inner node and depth from the previous insertion, subsequent
+/// keys that share the same parent node skip top-down tree traversal and insert directly
+/// in $O(1)$.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct ArenaInserter {
+    pub(crate) last_parent_offset: u32,
+    pub(crate) last_parent_version: u64,
+    pub(crate) last_depth: usize,
+}
+
+impl ArenaInserter {
+    /// Creates a new `ArenaInserter`.
+    pub const fn new() -> Self {
+        Self {
+            last_parent_offset: 0,
+            last_parent_version: 0,
+            last_depth: 0,
+        }
+    }
+
+    /// Resets the cached insertion location.
+    pub fn reset(&mut self) {
+        self.last_parent_offset = 0;
+        self.last_parent_version = 0;
+        self.last_depth = 0;
+    }
+}
+
 /// A concurrent associative map backed by an arena-allocated Adaptive Radix Tree.
 ///
 /// Uses 32-bit offsets for child pointers instead of 64-bit pointers, reducing inner node
@@ -121,6 +151,18 @@ impl<K: AsBytes + Clone, V: Clone> ArenaArtMap<K, V> {
         self.tree.insert(key, value)
     }
 
+    /// Inserts a key-value pair using an [`ArenaInserter`] cache to accelerate sequential or localized writes.
+    #[inline]
+    pub fn insert_with_inserter(
+        &self,
+        key: K,
+        value: V,
+        inserter: &mut ArenaInserter,
+    ) -> Option<V> {
+        self.tree
+            .insert_with_inserter(key, 0, value, true, inserter)
+    }
+
     /// Inserts a versioned key-value pair into the map.
     #[inline]
     pub fn insert_versioned(&self, key: K, version: u64, value: V) -> bool {
@@ -167,6 +209,22 @@ impl<K: AsBytes + Clone, V: Clone> ArenaArtMap<K, V> {
     /// Returns an iterator visiting all entries in ascending key order.
     pub fn iter(&self) -> Range<'_, K, V> {
         self.range::<std::ops::RangeFull, [u8]>(..)
+    }
+
+    /// Scans entries in the given key range, invoking `callback` for each entry.
+    ///
+    /// If `callback` returns `false`, scanning terminates early.
+    pub fn scan<R, Q, F>(&self, range: R, mut callback: F)
+    where
+        R: RangeBounds<Q>,
+        Q: AsBytes + ?Sized,
+        F: FnMut(&K, &V, u64) -> bool,
+    {
+        for entry in self.range(range) {
+            if !callback(entry.key(), entry.value(), entry.version()) {
+                break;
+            }
+        }
     }
 }
 

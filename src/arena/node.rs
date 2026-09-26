@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::latch::HybridLatch;
 use crate::node::{NodeType, MAX_PREFIX_LEN, NODE48_EMPTY};
@@ -107,13 +107,15 @@ impl<K, V> Leaf<K, V> {
 pub struct NodeHeader {
     pub latch: HybridLatch,
     pub node_type: NodeType,
-    pub num_children: u16,
+    pub num_children: AtomicU16,
     pub prefix_len: u16,
     pub prefix: [u8; MAX_PREFIX_LEN],
     pub _pad: u8,
     /// 32-bit TaggedOffset pointing to an exact leaf matching this prefix.
     pub exact_leaf: AtomicU32,
 }
+
+const _: () = assert!(std::mem::size_of::<NodeHeader>() == 40);
 
 impl NodeHeader {
     #[inline]
@@ -129,7 +131,7 @@ impl NodeHeader {
                 Self {
                     latch: HybridLatch::new(),
                     node_type,
-                    num_children: 0,
+                    num_children: AtomicU16::new(0),
                     prefix_len: prefix.len() as u16,
                     prefix: p,
                     _pad: 0,
@@ -137,6 +139,21 @@ impl NodeHeader {
                 },
             );
         }
+    }
+
+    #[inline(always)]
+    pub fn num_children(&self) -> u16 {
+        self.num_children.load(Ordering::Relaxed)
+    }
+
+    #[inline(always)]
+    pub fn inc_num_children(&self) -> u16 {
+        self.num_children.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[inline(always)]
+    pub fn dec_num_children(&self) -> u16 {
+        self.num_children.fetch_sub(1, Ordering::Relaxed)
     }
 
     #[inline(always)]
@@ -186,7 +203,7 @@ impl Node4 {
     }
 
     pub fn insert_child(&mut self, key: u8, child: TaggedOffset) {
-        let count = self.header.num_children as usize;
+        let count = self.header.num_children() as usize;
         debug_assert!(count < 4);
         let pos = self.keys[..count].partition_point(|&k| k < key);
         for i in (pos..count).rev() {
@@ -196,7 +213,7 @@ impl Node4 {
         }
         self.keys[pos] = key;
         self.children[pos].store(child.raw(), Ordering::Release);
-        self.header.num_children += 1;
+        self.header.inc_num_children();
     }
 }
 
@@ -217,7 +234,7 @@ impl Node16 {
     }
 
     pub fn insert_child(&mut self, key: u8, child: TaggedOffset) {
-        let count = self.header.num_children as usize;
+        let count = self.header.num_children() as usize;
         debug_assert!(count < 16);
         let pos = self.keys[..count].partition_point(|&k| k < key);
         for i in (pos..count).rev() {
@@ -227,56 +244,117 @@ impl Node16 {
         }
         self.keys[pos] = key;
         self.children[pos].store(child.raw(), Ordering::Release);
-        self.header.num_children += 1;
+        self.header.inc_num_children();
     }
 }
 
-/// Node with up to 48 children (488 bytes).
+/// Node with up to 48 children (520 bytes, with 256-bit presence bitmap).
 #[repr(C, align(8))]
 pub struct Node48 {
     pub header: NodeHeader,
     pub child_indices: [u8; 256],
+    pub child_bitmap: [AtomicU64; 4],
     pub children: [AtomicU32; 48],
 }
+
+const _: () = assert!(std::mem::size_of::<Node48>() == 520);
 
 impl Node48 {
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn init(ptr: *mut Self, prefix: &[u8]) {
         NodeHeader::init(&mut (*ptr).header, NodeType::Node48, prefix);
         (*ptr).child_indices = [NODE48_EMPTY; 256];
+        (*ptr).child_bitmap = [const { AtomicU64::new(0) }; 4];
         (*ptr).children = [const { AtomicU32::new(0) }; 48];
     }
 
     pub fn insert_child(&mut self, key: u8, child: TaggedOffset) {
-        let count = self.header.num_children as usize;
+        let count = self.header.num_children() as usize;
         debug_assert!(count < 48);
         let slot = (0..48)
             .find(|&i| self.children[i].load(Ordering::Relaxed) == 0)
             .expect("Node48 has room");
         self.children[slot].store(child.raw(), Ordering::Release);
         self.child_indices[key as usize] = slot as u8;
-        self.header.num_children += 1;
+        set_bitmap_bit(&self.child_bitmap, key);
+        self.header.inc_num_children();
     }
 }
 
-/// Node with up to 256 children (1,064 bytes, 50% smaller than 64-bit pointers).
+/// Node with up to 256 children (1,096 bytes, with 256-bit presence bitmap).
 #[repr(C, align(8))]
 pub struct Node256 {
     pub header: NodeHeader,
+    pub child_bitmap: [AtomicU64; 4],
     pub children: [AtomicU32; 256],
 }
+
+const _: () = assert!(std::mem::size_of::<Node256>() == 1096);
 
 impl Node256 {
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn init(ptr: *mut Self, prefix: &[u8]) {
         NodeHeader::init(&mut (*ptr).header, NodeType::Node256, prefix);
+        (*ptr).child_bitmap = [const { AtomicU64::new(0) }; 4];
         (*ptr).children = [const { AtomicU32::new(0) }; 256];
     }
 
     pub fn insert_child(&mut self, key: u8, child: TaggedOffset) {
         self.children[key as usize].store(child.raw(), Ordering::Release);
-        self.header.num_children += 1;
+        set_bitmap_bit(&self.child_bitmap, key);
+        self.header.inc_num_children();
     }
+}
+
+#[inline(always)]
+pub fn set_bitmap_bit(bitmap: &[AtomicU64; 4], byte: u8) {
+    let word = (byte / 64) as usize;
+    let bit = byte % 64;
+    bitmap[word].fetch_or(1u64 << bit, Ordering::Release);
+}
+
+#[inline(always)]
+pub fn clear_bitmap_bit(bitmap: &[AtomicU64; 4], byte: u8) {
+    let word = (byte / 64) as usize;
+    let bit = byte % 64;
+    bitmap[word].fetch_and(!(1u64 << bit), Ordering::Release);
+}
+
+#[inline(always)]
+#[allow(clippy::needless_range_loop)]
+pub fn next_present_byte(bitmap: &[AtomicU64; 4], min_byte: u8) -> Option<u8> {
+    let start_word = (min_byte / 64) as usize;
+    let start_bit = min_byte % 64;
+
+    for word_idx in start_word..4 {
+        let mut word = bitmap[word_idx].load(Ordering::Acquire);
+        if word_idx == start_word {
+            word &= !0u64 << start_bit;
+        }
+        if word != 0 {
+            let bit = word.trailing_zeros();
+            return Some((word_idx * 64 + bit as usize) as u8);
+        }
+    }
+    None
+}
+
+#[inline(always)]
+pub fn prev_present_byte(bitmap: &[AtomicU64; 4], max_byte: u8) -> Option<u8> {
+    let end_word = (max_byte / 64) as usize;
+    let end_bit = max_byte % 64;
+
+    for word_idx in (0..=end_word).rev() {
+        let mut word = bitmap[word_idx].load(Ordering::Acquire);
+        if word_idx == end_word && end_bit < 63 {
+            word &= (1u64 << (end_bit + 1)) - 1;
+        }
+        if word != 0 {
+            let bit = 63 - word.leading_zeros();
+            return Some((word_idx * 64 + bit as usize) as u8);
+        }
+    }
+    None
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -285,7 +363,7 @@ pub unsafe fn find_child(header: *mut NodeHeader, byte: u8) -> Option<TaggedOffs
     match n_type {
         NodeType::Node4 => {
             let n = &*(header as *const Node4);
-            let count = n.header.num_children as usize;
+            let count = n.header.num_children() as usize;
             for i in 0..count {
                 if n.keys[i] == byte {
                     let raw = n.children[i].load(Ordering::Acquire);
@@ -300,7 +378,7 @@ pub unsafe fn find_child(header: *mut NodeHeader, byte: u8) -> Option<TaggedOffs
         }
         NodeType::Node16 => {
             let n = &*(header as *const Node16);
-            let count = n.header.num_children as usize;
+            let count = n.header.num_children() as usize;
             if let Some(idx) = find_child_node16(&n.keys, count, byte) {
                 let raw = n.children[idx].load(Ordering::Acquire);
                 if raw == 0 {
