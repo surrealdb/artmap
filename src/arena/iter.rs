@@ -14,20 +14,22 @@
 
 //! # Range Iterators for ArenaArtMap
 //!
-//! Provides bidirectional range scanning for [`ArenaArtMap`](crate::arena::ArenaArtMap).
+//! Provides zero-allocation bidirectional range scanning for [`ArenaArtMap`](crate::arena::ArenaArtMap).
 
 use std::marker::PhantomData;
 use std::ops::{Bound, Deref};
 use std::sync::atomic::Ordering;
 
-use crate::arena::node::{Leaf, Node16, Node256, Node4, Node48, NodeHeader, TaggedOffset};
+use crate::arena::node::{
+    next_present_byte, prev_present_byte, Leaf, Node16, Node256, Node4, Node48, NodeHeader,
+    TaggedOffset,
+};
 use crate::arena::tree::ArenaTree;
 use crate::key::AsBytes;
 use crate::node::{NodeType, NODE48_EMPTY};
 use crate::simd::find_child_node16;
 
 const MAX_STACK_DEPTH: usize = 16;
-const INLINE_KEY_BUF: usize = 64;
 
 #[derive(Clone, Copy)]
 struct CursorFrame {
@@ -117,14 +119,8 @@ pub struct Range<'a, K: AsBytes + Clone, V: Clone> {
     stack: [CursorFrame; MAX_STACK_DEPTH],
     stack_len: usize,
     stack_overflow: Vec<CursorFrame>,
-    cursor_front_buf: [u8; INLINE_KEY_BUF],
-    cursor_front_len: usize,
-    cursor_front_overflow: Vec<u8>,
-    cursor_back_buf: [u8; INLINE_KEY_BUF],
-    cursor_back_len: usize,
-    cursor_back_overflow: Vec<u8>,
-    has_front: bool,
-    has_back: bool,
+    last_leaf_front: Option<*const Leaf<K, V>>,
+    last_leaf_back: Option<*const Leaf<K, V>>,
     exhausted: bool,
 }
 
@@ -141,14 +137,8 @@ impl<'a, K: AsBytes + Clone, V: Clone> Range<'a, K, V> {
             stack: [CursorFrame::NULL; MAX_STACK_DEPTH],
             stack_len: 0,
             stack_overflow: Vec::new(),
-            cursor_front_buf: [0u8; INLINE_KEY_BUF],
-            cursor_front_len: 0,
-            cursor_front_overflow: Vec::new(),
-            cursor_back_buf: [0u8; INLINE_KEY_BUF],
-            cursor_back_len: 0,
-            cursor_back_overflow: Vec::new(),
-            has_front: false,
-            has_back: false,
+            last_leaf_front: None,
+            last_leaf_back: None,
             exhausted: false,
         }
     }
@@ -192,50 +182,26 @@ impl<'a, K: AsBytes + Clone, V: Clone> Range<'a, K, V> {
         self.stack_overflow.clear();
     }
 
-    #[inline]
-    fn set_cursor_front(&mut self, bytes: &[u8]) {
-        self.has_front = true;
-        if bytes.len() <= INLINE_KEY_BUF {
-            self.cursor_front_buf[..bytes.len()].copy_from_slice(bytes);
-            self.cursor_front_len = bytes.len();
-            self.cursor_front_overflow.clear();
-        } else {
-            self.cursor_front_len = 0;
-            self.cursor_front_overflow.clear();
-            self.cursor_front_overflow.extend_from_slice(bytes);
-        }
+    #[inline(always)]
+    fn cursor_front(&self) -> Option<&[u8]> {
+        self.last_leaf_front
+            .map(|ptr| unsafe { (*ptr).key.as_bytes() })
     }
 
-    #[inline]
-    fn cursor_front(&self) -> &[u8] {
-        if self.cursor_front_len > 0 {
-            &self.cursor_front_buf[..self.cursor_front_len]
-        } else {
-            &self.cursor_front_overflow
-        }
+    #[inline(always)]
+    fn cursor_back(&self) -> Option<&[u8]> {
+        self.last_leaf_back
+            .map(|ptr| unsafe { (*ptr).key.as_bytes() })
     }
 
-    #[inline]
-    fn set_cursor_back(&mut self, bytes: &[u8]) {
-        self.has_back = true;
-        if bytes.len() <= INLINE_KEY_BUF {
-            self.cursor_back_buf[..bytes.len()].copy_from_slice(bytes);
-            self.cursor_back_len = bytes.len();
-            self.cursor_back_overflow.clear();
-        } else {
-            self.cursor_back_len = 0;
-            self.cursor_back_overflow.clear();
-            self.cursor_back_overflow.extend_from_slice(bytes);
-        }
+    #[inline(always)]
+    fn set_cursor_front(&mut self, ptr: *const Leaf<K, V>) {
+        self.last_leaf_front = Some(ptr);
     }
 
-    #[inline]
-    fn cursor_back(&self) -> &[u8] {
-        if self.cursor_back_len > 0 {
-            &self.cursor_back_buf[..self.cursor_back_len]
-        } else {
-            &self.cursor_back_overflow
-        }
+    #[inline(always)]
+    fn set_cursor_back(&mut self, ptr: *const Leaf<K, V>) {
+        self.last_leaf_back = Some(ptr);
     }
 
     fn push_and_descend_left(&mut self, mut offset: TaggedOffset) -> Option<*const Leaf<K, V>> {
@@ -346,7 +312,7 @@ impl<'a, K: AsBytes + Clone, V: Clone> Iterator for Range<'a, K, V> {
         }
 
         loop {
-            let leaf_ptr = if !self.has_front {
+            let leaf_ptr = if self.last_leaf_front.is_none() {
                 let (search_key, include_equal) = match &self.start_bound {
                     Bound::Included(k) => (k.as_slice(), true),
                     Bound::Excluded(k) => (k.as_slice(), false),
@@ -400,7 +366,9 @@ impl<'a, K: AsBytes + Clone, V: Clone> Iterator for Range<'a, K, V> {
                 match self.advance_forward() {
                     Some(ptr) => ptr,
                     None => {
-                        let ptr = self.tree.find_successor(self.cursor_front(), false)?;
+                        let ptr = self
+                            .tree
+                            .find_successor(self.cursor_front().unwrap(), false)?;
                         let leaf = unsafe { &*ptr };
                         self.seek_to_key(leaf.key.as_bytes());
                         ptr
@@ -425,12 +393,14 @@ impl<'a, K: AsBytes + Clone, V: Clone> Iterator for Range<'a, K, V> {
             }
 
             // Check overlap with backward cursor
-            if self.has_back && k_bytes > self.cursor_back() {
-                self.exhausted = true;
-                return None;
+            if let Some(back_key) = self.cursor_back() {
+                if k_bytes > back_key {
+                    self.exhausted = true;
+                    return None;
+                }
             }
 
-            self.set_cursor_front(k_bytes);
+            self.set_cursor_front(leaf_ptr);
 
             let entry = ArenaEntryRef {
                 leaf_ptr,
@@ -450,8 +420,8 @@ impl<'a, K: AsBytes + Clone, V: Clone> DoubleEndedIterator for Range<'a, K, V> {
         }
 
         loop {
-            let (search_key, include_equal) = if self.has_back {
-                (self.cursor_back(), false)
+            let (search_key, include_equal) = if let Some(back_key) = self.cursor_back() {
+                (back_key, false)
             } else {
                 match &self.end_bound {
                     Bound::Included(k) => (k.as_slice(), true),
@@ -478,12 +448,14 @@ impl<'a, K: AsBytes + Clone, V: Clone> DoubleEndedIterator for Range<'a, K, V> {
             }
 
             // Check overlap with forward cursor
-            if self.has_front && k_bytes < self.cursor_front() {
-                self.exhausted = true;
-                return None;
+            if let Some(front_key) = self.cursor_front() {
+                if k_bytes < front_key {
+                    self.exhausted = true;
+                    return None;
+                }
             }
 
-            self.set_cursor_back(k_bytes);
+            self.set_cursor_back(leaf_ptr);
 
             let entry = ArenaEntryRef {
                 leaf_ptr,
@@ -506,7 +478,7 @@ unsafe fn next_child_in_node<K: AsBytes + Clone, V: Clone>(
     match h.node_type {
         NodeType::Node4 => {
             let n = &*(header_ptr as *const Node4);
-            let count = n.header.num_children as usize;
+            let count = n.header.num_children() as usize;
             let next_idx = if current_pos == usize::MAX {
                 0
             } else {
@@ -522,7 +494,7 @@ unsafe fn next_child_in_node<K: AsBytes + Clone, V: Clone>(
         }
         NodeType::Node16 => {
             let n = &*(header_ptr as *const Node16);
-            let count = n.header.num_children as usize;
+            let count = n.header.num_children() as usize;
             let next_idx = if current_pos == usize::MAX {
                 0
             } else {
@@ -540,15 +512,17 @@ unsafe fn next_child_in_node<K: AsBytes + Clone, V: Clone>(
             let n = &*(header_ptr as *const Node48);
             let next_byte = if current_pos == usize::MAX {
                 0
+            } else if current_pos < 255 {
+                (current_pos + 1) as u8
             } else {
-                current_pos + 1
+                return None;
             };
-            for byte in next_byte..=255 {
-                let slot = n.child_indices[byte];
+            if let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
+                let slot = n.child_indices[byte as usize];
                 if slot != NODE48_EMPTY {
                     let raw = n.children[slot as usize].load(Ordering::Acquire);
                     if raw != 0 {
-                        return Some((byte, TaggedOffset(raw)));
+                        return Some((byte as usize, TaggedOffset(raw)));
                     }
                 }
             }
@@ -558,13 +532,15 @@ unsafe fn next_child_in_node<K: AsBytes + Clone, V: Clone>(
             let n = &*(header_ptr as *const Node256);
             let next_byte = if current_pos == usize::MAX {
                 0
+            } else if current_pos < 255 {
+                (current_pos + 1) as u8
             } else {
-                current_pos + 1
+                return None;
             };
-            for byte in next_byte..=255 {
-                let raw = n.children[byte].load(Ordering::Acquire);
+            if let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
+                let raw = n.children[byte as usize].load(Ordering::Acquire);
                 if raw != 0 {
-                    return Some((byte, TaggedOffset(raw)));
+                    return Some((byte as usize, TaggedOffset(raw)));
                 }
             }
             None
@@ -582,7 +558,7 @@ unsafe fn prev_child_in_node<K: AsBytes + Clone, V: Clone>(
     match h.node_type {
         NodeType::Node4 => {
             let n = &*(header_ptr as *const Node4);
-            let count = n.header.num_children as usize;
+            let count = n.header.num_children() as usize;
             let start = if current_pos == usize::MAX {
                 count.saturating_sub(1)
             } else if current_pos > 0 {
@@ -600,7 +576,7 @@ unsafe fn prev_child_in_node<K: AsBytes + Clone, V: Clone>(
         }
         NodeType::Node16 => {
             let n = &*(header_ptr as *const Node16);
-            let count = n.header.num_children as usize;
+            let count = n.header.num_children() as usize;
             let start = if current_pos == usize::MAX {
                 count.saturating_sub(1)
             } else if current_pos > 0 {
@@ -618,19 +594,19 @@ unsafe fn prev_child_in_node<K: AsBytes + Clone, V: Clone>(
         }
         NodeType::Node48 => {
             let n = &*(header_ptr as *const Node48);
-            let start = if current_pos == usize::MAX {
+            let max_byte = if current_pos == usize::MAX {
                 255
             } else if current_pos > 0 {
-                current_pos - 1
+                (current_pos - 1) as u8
             } else {
                 return None;
             };
-            for byte in (0..=start).rev() {
-                let slot = n.child_indices[byte];
+            if let Some(byte) = prev_present_byte(&n.child_bitmap, max_byte) {
+                let slot = n.child_indices[byte as usize];
                 if slot != NODE48_EMPTY {
                     let raw = n.children[slot as usize].load(Ordering::Acquire);
                     if raw != 0 {
-                        return Some((byte, TaggedOffset(raw)));
+                        return Some((byte as usize, TaggedOffset(raw)));
                     }
                 }
             }
@@ -638,17 +614,17 @@ unsafe fn prev_child_in_node<K: AsBytes + Clone, V: Clone>(
         }
         NodeType::Node256 => {
             let n = &*(header_ptr as *const Node256);
-            let start = if current_pos == usize::MAX {
+            let max_byte = if current_pos == usize::MAX {
                 255
             } else if current_pos > 0 {
-                current_pos - 1
+                (current_pos - 1) as u8
             } else {
                 return None;
             };
-            for byte in (0..=start).rev() {
-                let raw = n.children[byte].load(Ordering::Acquire);
+            if let Some(byte) = prev_present_byte(&n.child_bitmap, max_byte) {
+                let raw = n.children[byte as usize].load(Ordering::Acquire);
                 if raw != 0 {
-                    return Some((byte, TaggedOffset(raw)));
+                    return Some((byte as usize, TaggedOffset(raw)));
                 }
             }
             None
@@ -666,7 +642,7 @@ unsafe fn child_pos_for_byte<K: AsBytes + Clone, V: Clone>(
     match h.node_type {
         NodeType::Node4 => {
             let n = &*(header_ptr as *const Node4);
-            let count = n.header.num_children as usize;
+            let count = n.header.num_children() as usize;
             for i in 0..count {
                 if n.keys[i] == needle {
                     let raw = n.children[i].load(Ordering::Acquire);
@@ -679,7 +655,7 @@ unsafe fn child_pos_for_byte<K: AsBytes + Clone, V: Clone>(
         }
         NodeType::Node16 => {
             let n = &*(header_ptr as *const Node16);
-            let count = n.header.num_children as usize;
+            let count = n.header.num_children() as usize;
             if let Some(idx) = find_child_node16(&n.keys, count, needle) {
                 let raw = n.children[idx].load(Ordering::Acquire);
                 if raw != 0 {

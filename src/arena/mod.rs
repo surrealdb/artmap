@@ -34,11 +34,11 @@ pub mod node;
 pub mod tree;
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub use iter::{ArenaEntryRef, Range};
-pub use map::ArenaArtMap;
+pub use map::{ArenaArtMap, ArenaInserter};
 
 /// Maximum arena size (`u32::MAX` to fit in 32-bit offsets).
 pub const MAX_ARENA_SIZE: usize = u32::MAX as usize;
@@ -46,13 +46,36 @@ pub const MAX_ARENA_SIZE: usize = u32::MAX as usize;
 /// Node allocation alignment in the arena (8 bytes).
 pub const NODE_ALIGNMENT: u32 = 8;
 
+const CHUNK_SIZE: u32 = 64 * 1024;
+const MAX_LOCAL_ALLOC_SIZE: u32 = 520;
+
+#[derive(Default, Clone, Copy)]
+struct LocalChunk {
+    arena_id: usize,
+    arena_epoch: u32,
+    current: u32,
+    limit: u32,
+}
+
+thread_local! {
+    static TLS_CHUNK: std::cell::Cell<LocalChunk> = const {
+        std::cell::Cell::new(LocalChunk {
+            arena_id: 0,
+            arena_epoch: 0,
+            current: 0,
+            limit: 0,
+        })
+    };
+}
+
 /// A lock-free contiguous byte arena allocator for [`ArenaArtMap`].
 ///
 /// Memory is pre-allocated upon creation and allocated sequentially via atomic bump allocation.
 /// When dropped, the entire memory block is reclaimed in $O(1)$.
 pub struct Arena {
     n: AtomicU64,
-    _pad: [u8; 56],
+    epoch: AtomicU32,
+    _pad: [u8; 52],
     buf: Box<[UnsafeCell<u8>]>,
 }
 
@@ -75,7 +98,8 @@ impl Arena {
 
         Self {
             n: AtomicU64::new(NODE_ALIGNMENT as u64),
-            _pad: [0u8; 56],
+            epoch: AtomicU32::new(1),
+            _pad: [0u8; 52],
             buf,
         }
     }
@@ -115,6 +139,7 @@ impl Arena {
 
     /// Resets the allocation offset to allow reusing the allocated memory buffer in $O(1)$.
     pub fn reset(&mut self) {
+        self.epoch.fetch_add(1, Ordering::Relaxed);
         self.n.store(NODE_ALIGNMENT as u64, Ordering::Relaxed);
     }
 
@@ -124,10 +149,8 @@ impl Arena {
         ((ptr as usize) - (self.buf.as_ptr() as usize)) as u32
     }
 
-    /// Atomically reserves `size` bytes with the specified `alignment`.
-    ///
-    /// Returns the allocated 32-bit byte offset, or `None` if the arena is full.
-    pub fn alloc(&self, size: u32, alignment: u32, overflow: u32) -> Option<u32> {
+    /// Reserves `size` bytes directly from the global atomic bump cursor.
+    pub fn alloc_global(&self, size: u32, alignment: u32, overflow: u32) -> Option<u32> {
         debug_assert!(alignment.is_power_of_two());
 
         let padded = size as u64 + alignment as u64 - 1;
@@ -139,6 +162,53 @@ impl Arena {
         let offset = (new_size as u32 - size) & !(alignment - 1);
         debug_assert_eq!(offset % alignment, 0);
         Some(offset)
+    }
+
+    /// Allocates `size` bytes with the specified `alignment`.
+    ///
+    /// For allocations up to 520 bytes (leaves, Node4, Node16, Node48), uses a thread-local
+    /// 64 KB chunk to eliminate atomic cache-line contention across threads.
+    pub fn alloc(&self, size: u32, alignment: u32, overflow: u32) -> Option<u32> {
+        debug_assert!(alignment.is_power_of_two());
+        let arena_id = self.buf.as_ptr() as usize;
+        let current_epoch = self.epoch.load(Ordering::Relaxed);
+
+        if size <= MAX_LOCAL_ALLOC_SIZE && alignment <= NODE_ALIGNMENT {
+            let local_res = TLS_CHUNK.with(|cell| {
+                let mut chunk = cell.get();
+                if chunk.arena_id == arena_id && chunk.arena_epoch == current_epoch {
+                    let aligned = (chunk.current + alignment - 1) & !(alignment - 1);
+                    if aligned + size <= chunk.limit {
+                        chunk.current = aligned + size;
+                        cell.set(chunk);
+                        return Some(aligned);
+                    }
+                }
+                None
+            });
+
+            if let Some(off) = local_res {
+                return Some(off);
+            }
+
+            // Chunk exhausted or epoch changed: reserve a new 64KB chunk from the global arena
+            if let Some(chunk_start) = self.alloc_global(CHUNK_SIZE, NODE_ALIGNMENT, overflow) {
+                let aligned = (chunk_start + alignment - 1) & !(alignment - 1);
+                let chunk_limit = chunk_start + CHUNK_SIZE;
+                TLS_CHUNK.with(|cell| {
+                    cell.set(LocalChunk {
+                        arena_id,
+                        arena_epoch: current_epoch,
+                        current: aligned + size,
+                        limit: chunk_limit,
+                    });
+                });
+                return Some(aligned);
+            }
+        }
+
+        // Fall back to direct global allocation (for Node256 or when remaining memory < 64KB)
+        self.alloc_global(size, alignment, overflow)
     }
 
     /// Returns a raw pointer to the data at the specified 32-bit offset.

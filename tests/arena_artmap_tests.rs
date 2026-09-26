@@ -1,4 +1,4 @@
-use artmap::arena::{Arena, ArenaArtMap};
+use artmap::arena::{Arena, ArenaArtMap, ArenaInserter};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -193,4 +193,53 @@ fn test_arena_artmap_reset() {
     }
     assert_eq!(map2.len(), 1000);
     assert_eq!(map2.get("new_key:0500"), Some(5000));
+}
+
+#[test]
+fn test_arena_artmap_inserter() {
+    let map = ArenaArtMap::<String, usize>::with_capacity(16 * 1024 * 1024);
+    let mut inserter = ArenaInserter::new();
+
+    // Insert 5000 sequential items with inserter
+    for i in 0..5000 {
+        map.insert_with_inserter(format!("seq:{i:05}"), i, &mut inserter);
+    }
+    assert_eq!(map.len(), 5000);
+
+    for i in 0..5000 {
+        assert_eq!(map.get(&format!("seq:{i:05}")), Some(i));
+    }
+
+    // Interleaved inserts with inserter
+    inserter.reset();
+    for i in 5000..6000 {
+        map.insert_with_inserter(format!("interleaved:{i:05}"), i * 2, &mut inserter);
+    }
+    assert_eq!(map.len(), 6000);
+}
+
+#[test]
+fn test_arena_artmap_scan_api() {
+    let map = ArenaArtMap::<String, usize>::with_capacity(16 * 1024 * 1024);
+
+    for i in 0..500 {
+        map.insert(format!("user:{i:04}"), i);
+    }
+
+    let mut scanned = Vec::new();
+    map.scan("user:0100".."user:0200", |k, v, _ver| {
+        scanned.push((k.clone(), *v));
+        true
+    });
+    assert_eq!(scanned.len(), 100);
+    assert_eq!(scanned[0], ("user:0100".to_string(), 100));
+    assert_eq!(scanned[99], ("user:0199".to_string(), 199));
+
+    // Early termination
+    let mut count = 0;
+    map.scan("user:0000".., |_k, _v, _ver| {
+        count += 1;
+        count < 25
+    });
+    assert_eq!(count, 25);
 }

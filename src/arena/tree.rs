@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::arena::node::{
-    find_child, Leaf, Node16, Node256, Node4, Node48, NodeHeader, TaggedOffset,
+    clear_bitmap_bit, find_child, next_present_byte, prev_present_byte, set_bitmap_bit, Leaf,
+    Node16, Node256, Node4, Node48, NodeHeader, TaggedOffset,
 };
 use crate::arena::Arena;
 use crate::key::AsBytes;
@@ -78,7 +79,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
             let header = unsafe { &*header_ptr };
             let (matched, complete) = header.match_prefix(key_bytes, depth);
             println!("INNER NODE {:?} at depth {}: prefix={:02x?}, prefix_len={}, matched={}, complete={}, num_children={}",
-    				header.node_type, depth, header.prefix_slice(), header.prefix_len, matched, complete, header.num_children);
+    				header.node_type, depth, header.prefix_slice(), header.prefix_len, matched, complete, header.num_children());
             if !complete {
                 println!(
                     "FAILED PREFIX MATCH: remaining key={:02x?}, node_prefix={:02x?}",
@@ -117,14 +118,14 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             let n = unsafe { &*(header_ptr as *const Node4) };
                             println!(
                                 "Node4 keys: {:?}",
-                                &n.keys[..n.header.num_children as usize]
+                                &n.keys[..n.header.num_children() as usize]
                             );
                         }
                         NodeType::Node16 => {
                             let n = unsafe { &*(header_ptr as *const Node16) };
                             println!(
                                 "Node16 keys: {:?}",
-                                &n.keys[..n.header.num_children as usize]
+                                &n.keys[..n.header.num_children() as usize]
                             );
                         }
                         NodeType::Node48 => {
@@ -287,7 +288,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         match n_type {
             NodeType::Node4 => {
                 let n = &*(header as *const Node4);
-                let count = n.header.num_children as usize;
+                let count = n.header.num_children() as usize;
                 for i in 0..count {
                     if n.keys[i] >= min_byte {
                         let raw = n.children[i].load(Ordering::Acquire);
@@ -304,7 +305,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
             }
             NodeType::Node16 => {
                 let n = &*(header as *const Node16);
-                let count = n.header.num_children as usize;
+                let count = n.header.num_children() as usize;
                 for i in 0..count {
                     if n.keys[i] >= min_byte {
                         let raw = n.children[i].load(Ordering::Acquire);
@@ -321,7 +322,8 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
             }
             NodeType::Node48 => {
                 let n = &*(header as *const Node48);
-                for byte in min_byte..=255u8 {
+                let mut b = min_byte;
+                while let Some(byte) = next_present_byte(&n.child_bitmap, b) {
                     let slot = n.child_indices[byte as usize];
                     if slot != NODE48_EMPTY {
                         let raw = n.children[slot as usize].load(Ordering::Acquire);
@@ -333,12 +335,17 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             }
                         }
                     }
+                    if byte == 255 {
+                        break;
+                    }
+                    b = byte + 1;
                 }
                 None
             }
             NodeType::Node256 => {
                 let n = &*(header as *const Node256);
-                for byte in min_byte..=255u8 {
+                let mut b = min_byte;
+                while let Some(byte) = next_present_byte(&n.child_bitmap, b) {
                     let raw = n.children[byte as usize].load(Ordering::Acquire);
                     if raw != 0 {
                         if let Some(leaf) =
@@ -347,6 +354,10 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             return Some(leaf);
                         }
                     }
+                    if byte == 255 {
+                        break;
+                    }
+                    b = byte + 1;
                 }
                 None
             }
@@ -495,7 +506,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         match n_type {
             NodeType::Node4 => {
                 let n = &*(header as *const Node4);
-                for i in (0..n.header.num_children as usize).rev() {
+                for i in (0..n.header.num_children() as usize).rev() {
                     if n.keys[i] <= max_byte {
                         let raw = n.children[i].load(Ordering::Acquire);
                         if raw != 0 {
@@ -511,7 +522,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
             }
             NodeType::Node16 => {
                 let n = &*(header as *const Node16);
-                for i in (0..n.header.num_children as usize).rev() {
+                for i in (0..n.header.num_children() as usize).rev() {
                     if n.keys[i] <= max_byte {
                         let raw = n.children[i].load(Ordering::Acquire);
                         if raw != 0 {
@@ -527,7 +538,8 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
             }
             NodeType::Node48 => {
                 let n = &*(header as *const Node48);
-                for byte in (0..=max_byte).rev() {
+                let mut b = max_byte;
+                while let Some(byte) = prev_present_byte(&n.child_bitmap, b) {
                     let slot = n.child_indices[byte as usize];
                     if slot != NODE48_EMPTY {
                         let raw = n.children[slot as usize].load(Ordering::Acquire);
@@ -539,12 +551,17 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             }
                         }
                     }
+                    if byte == 0 {
+                        break;
+                    }
+                    b = byte - 1;
                 }
                 None
             }
             NodeType::Node256 => {
                 let n = &*(header as *const Node256);
-                for byte in (0..=max_byte).rev() {
+                let mut b = max_byte;
+                while let Some(byte) = prev_present_byte(&n.child_bitmap, b) {
                     let raw = n.children[byte as usize].load(Ordering::Acquire);
                     if raw != 0 {
                         if let Some(leaf) =
@@ -553,6 +570,10 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             return Some(leaf);
                         }
                     }
+                    if byte == 0 {
+                        break;
+                    }
+                    b = byte - 1;
                 }
                 None
             }
@@ -673,10 +694,57 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         self.insert_internal(key, 0, value, true)
     }
 
+    /// Inserts a key-value pair using an [`ArenaInserter`] cache to accelerate sequential or localized writes.
+    pub fn insert_with_inserter(
+        &self,
+        key: K,
+        version: u64,
+        value: V,
+        replace_if_present: bool,
+        inserter: &mut crate::arena::map::ArenaInserter,
+    ) -> Option<V> {
+        let leaf_off = self.alloc_leaf(key, version, value).expect("arena full");
+        let new_leaf_ptr = self.arena.get_pointer_mut(leaf_off) as *mut Leaf<K, V>;
+        let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
+        let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
+
+        // Fast path: check if cached parent node can absorb this key directly
+        if inserter.last_parent_offset != 0 && key_bytes.len() > inserter.last_depth {
+            let header_ptr =
+                self.arena.get_pointer_mut(inserter.last_parent_offset) as *mut NodeHeader;
+            let header = unsafe { &mut *header_ptr };
+            if header
+                .latch
+                .lock_version(inserter.last_parent_version)
+                .is_ok()
+            {
+                let next_byte = key_bytes[inserter.last_depth];
+                let is_full = is_node_full(header);
+                let child = unsafe { find_child(header_ptr, next_byte) };
+                if !is_full && child.is_none() {
+                    unsafe { self.insert_child_into_node(header_ptr, next_byte, tagged_new_leaf) };
+                    header.latch.unlock();
+                    self.len.fetch_add(1, Ordering::Relaxed);
+                    inserter.last_parent_version = header.latch.read_version().unwrap_or(0);
+                    return None;
+                }
+                header.latch.unlock();
+            }
+            inserter.reset();
+        }
+
+        self.insert_internal_cached(
+            key_bytes,
+            new_leaf_ptr,
+            tagged_new_leaf,
+            replace_if_present,
+            Some(inserter),
+        )
+    }
+
     /// Inserts a versioned key-value pair.
     pub fn insert_versioned(&self, key: K, version: u64, value: V) -> bool {
-        self.insert_internal(key, version, value, false);
-        true
+        self.insert_internal(key, version, value, false).is_none()
     }
 
     fn alloc_leaf(&self, key: K, version: u64, value: V) -> Option<u32> {
@@ -736,6 +804,23 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
         let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
 
+        self.insert_internal_cached(
+            key_bytes,
+            new_leaf_ptr,
+            tagged_new_leaf,
+            replace_if_present,
+            None,
+        )
+    }
+
+    fn insert_internal_cached(
+        &self,
+        key_bytes: &[u8],
+        new_leaf_ptr: *mut Leaf<K, V>,
+        tagged_new_leaf: TaggedOffset,
+        replace_if_present: bool,
+        mut inserter: Option<&mut crate::arena::map::ArenaInserter>,
+    ) -> Option<V> {
         'retry: loop {
             let root_raw = self.root.load(Ordering::Acquire);
 
@@ -913,6 +998,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             None => self.root_latch.unlock(),
                         }
                     }
+                    if let Some(ref mut ins) = inserter {
+                        ins.reset();
+                    }
                     return None;
                 }
 
@@ -978,6 +1066,45 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
 
                 match next_child {
                     None => {
+                        // 1A: Node256 lock-free atomic insertion fast-path
+                        if header.node_type == NodeType::Node256 {
+                            let n256 = unsafe { &*(header_ptr as *const Node256) };
+                            if n256.children[next_byte as usize]
+                                .compare_exchange(
+                                    0,
+                                    tagged_new_leaf.raw(),
+                                    Ordering::Release,
+                                    Ordering::Acquire,
+                                )
+                                .is_ok()
+                            {
+                                set_bitmap_bit(&n256.child_bitmap, next_byte);
+                                let parent_valid = match parent {
+                                    Some(p) => unsafe {
+                                        !(*p).latch.is_obsolete()
+                                            && find_child(p, parent_byte) == Some(current)
+                                    },
+                                    None => self.root.load(Ordering::Acquire) == current.raw(),
+                                };
+                                if header.latch.validate(v_header) && parent_valid {
+                                    n256.header.inc_num_children();
+                                    self.len.fetch_add(1, Ordering::Relaxed);
+                                    if let Some(ref mut ins) = inserter {
+                                        ins.last_parent_offset = current.inner_offset();
+                                        ins.last_parent_version =
+                                            header.latch.read_version().unwrap_or(0);
+                                        ins.last_depth = depth;
+                                    }
+                                    return None;
+                                } else {
+                                    clear_bitmap_bit(&n256.child_bitmap, next_byte);
+                                    n256.children[next_byte as usize].store(0, Ordering::Release);
+                                    continue 'retry;
+                                }
+                            }
+                            continue 'retry;
+                        }
+
                         if is_node_full(header) {
                             // Node needs to grow: lock parent and header
                             let parent_ok = match parent {
@@ -1043,6 +1170,12 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                                 None => self.root_latch.unlock(),
                             }
                             self.len.fetch_add(1, Ordering::Relaxed);
+                            if let Some(ref mut ins) = inserter {
+                                ins.last_parent_offset = new_node_off;
+                                ins.last_parent_version =
+                                    unsafe { (*new_node_ptr).latch.read_version().unwrap_or(0) };
+                                ins.last_depth = depth;
+                            }
                             return None;
                         } else {
                             // Node has room: lock header only
@@ -1074,6 +1207,11 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             }
                             header.latch.unlock();
                             self.len.fetch_add(1, Ordering::Relaxed);
+                            if let Some(ref mut ins) = inserter {
+                                ins.last_parent_offset = current.inner_offset();
+                                ins.last_parent_version = header.latch.read_version().unwrap_or(0);
+                                ins.last_depth = depth;
+                            }
                             return None;
                         }
                     }
@@ -1151,6 +1289,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             unsafe { self.replace_child(header_ptr, next_byte, new_inner) };
                             self.len.fetch_add(1, Ordering::Relaxed);
                             header.latch.unlock();
+                            if let Some(ref mut ins) = inserter {
+                                ins.reset();
+                            }
                             return None;
                         } else {
                             if !header.latch.validate(v_header) {
@@ -1172,7 +1313,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         match (*header).node_type {
             NodeType::Node4 => {
                 let n = &mut *(header as *mut Node4);
-                for i in 0..n.header.num_children as usize {
+                for i in 0..n.header.num_children() as usize {
                     if n.keys[i] == byte {
                         n.children[i].store(new_child.raw(), Ordering::Release);
                         return;
@@ -1181,7 +1322,8 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
             }
             NodeType::Node16 => {
                 let n = &mut *(header as *mut Node16);
-                if let Some(idx) = find_child_node16(&n.keys, n.header.num_children as usize, byte)
+                if let Some(idx) =
+                    find_child_node16(&n.keys, n.header.num_children() as usize, byte)
                 {
                     n.children[idx].store(new_child.raw(), Ordering::Release);
                 }
@@ -1277,7 +1419,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                     old.header.exact_leaf.load(Ordering::Relaxed),
                     Ordering::Relaxed,
                 );
-                for i in 0..old.header.num_children as usize {
+                for i in 0..old.header.num_children() as usize {
                     let child = TaggedOffset(old.children[i].load(Ordering::Relaxed));
                     (*n16).insert_child(old.keys[i], child);
                 }
@@ -1293,7 +1435,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                     old.header.exact_leaf.load(Ordering::Relaxed),
                     Ordering::Relaxed,
                 );
-                for i in 0..old.header.num_children as usize {
+                for i in 0..old.header.num_children() as usize {
                     let child = TaggedOffset(old.children[i].load(Ordering::Relaxed));
                     (*n48).insert_child(old.keys[i], child);
                 }
@@ -1309,13 +1451,15 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                     old.header.exact_leaf.load(Ordering::Relaxed),
                     Ordering::Relaxed,
                 );
-                for byte in 0..=255u8 {
+                let mut min_byte = 0u8;
+                while let Some(byte) = next_present_byte(&old.child_bitmap, min_byte) {
                     let slot = old.child_indices[byte as usize];
-                    if slot != NODE48_EMPTY {
-                        let child =
-                            TaggedOffset(old.children[slot as usize].load(Ordering::Relaxed));
-                        (*n256).insert_child(byte, child);
+                    let child = TaggedOffset(old.children[slot as usize].load(Ordering::Relaxed));
+                    (*n256).insert_child(byte, child);
+                    if byte == 255 {
+                        break;
                     }
+                    min_byte = byte + 1;
                 }
                 n256_off
             }
@@ -1327,9 +1471,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
 #[inline(always)]
 fn is_node_full(header: &NodeHeader) -> bool {
     match header.node_type {
-        NodeType::Node4 => header.num_children >= 4,
-        NodeType::Node16 => header.num_children >= 16,
-        NodeType::Node48 => header.num_children >= 48,
+        NodeType::Node4 => header.num_children() >= 4,
+        NodeType::Node16 => header.num_children() >= 16,
+        NodeType::Node48 => header.num_children() >= 48,
         NodeType::Node256 => false,
     }
 }
