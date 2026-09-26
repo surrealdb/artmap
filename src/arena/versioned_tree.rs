@@ -191,7 +191,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
 
     /// Inserts a versioned key-value pair.
     pub fn insert(&self, key: K, version: u64, value: V) -> bool {
-        let leaf_off = self.alloc_leaf(key, version, value).expect("arena full");
+        let Some(leaf_off) = self.alloc_leaf(key, version, value) else {
+            return false;
+        };
         let new_leaf_ptr = self.arena.get_pointer_mut(leaf_off) as *mut VersionedLeaf<K, V>;
         let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
         let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
@@ -207,7 +209,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
         value: V,
         inserter: &mut crate::arena::map::ArenaInserter,
     ) -> bool {
-        let leaf_off = self.alloc_leaf(key, version, value).expect("arena full");
+        let Some(leaf_off) = self.alloc_leaf(key, version, value) else {
+            return false;
+        };
         let new_leaf_ptr = self.arena.get_pointer_mut(leaf_off) as *mut VersionedLeaf<K, V>;
         let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
         let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
@@ -339,7 +343,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                 let exact2 = key_bytes.len() == common_len;
                 let byte2 = if !exact2 { key_bytes[common_len] } else { 0 };
 
-                let new_root = self.create_prefix_chain(
+                let Some(new_inner) = self.create_prefix_chain(
                     &key_bytes[..common_len],
                     exact1,
                     byte1,
@@ -347,8 +351,11 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                     exact2,
                     byte2,
                     tagged_new_leaf,
-                );
-                self.root.store(new_root.raw(), Ordering::Release);
+                ) else {
+                    self.root_latch.unlock();
+                    return false;
+                };
+                self.root.store(new_inner.raw(), Ordering::Release);
                 self.len.fetch_add(1, Ordering::Relaxed);
                 self.root_latch.unlock();
                 return true;
@@ -413,9 +420,14 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
 
                     let mismatch_char_existing = cur_prefix[matched];
 
-                    let split_node_off = self
-                        .alloc_node4(&cur_prefix[..matched])
-                        .expect("arena full");
+                    let Some(split_node_off) = self.alloc_node4(&cur_prefix[..matched]) else {
+                        header.latch.unlock();
+                        match parent {
+                            Some(p) => unsafe { (*p).latch.unlock() },
+                            None => self.root_latch.unlock(),
+                        }
+                        return false;
+                    };
                     let split_node = self.arena.get_pointer_mut(split_node_off) as *mut Node4;
 
                     let remaining_prefix = &cur_prefix[(matched + 1)..];
@@ -586,7 +598,14 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                                 continue 'retry;
                             }
 
-                            let new_node_off = unsafe { self.grow_node(header_ptr) };
+                            let Some(new_node_off) = (unsafe { self.grow_node(header_ptr) }) else {
+                                header.latch.unlock();
+                                match parent {
+                                    Some(p) => unsafe { (*p).latch.unlock() },
+                                    None => self.root_latch.unlock(),
+                                }
+                                return false;
+                            };
                             let new_node_ptr =
                                 self.arena.get_pointer_mut(new_node_off) as *mut NodeHeader;
                             unsafe {
@@ -709,7 +728,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                             let exact2 = suffix_new.len() == common_len;
                             let byte2 = if !exact2 { suffix_new[common_len] } else { 0 };
 
-                            let new_inner = self.create_prefix_chain(
+                            let Some(new_inner) = self.create_prefix_chain(
                                 &suffix_new[..common_len],
                                 exact1,
                                 byte1,
@@ -717,7 +736,10 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                                 exact2,
                                 byte2,
                                 tagged_new_leaf,
-                            );
+                            ) else {
+                                header.latch.unlock();
+                                return false;
+                            };
 
                             unsafe { self.replace_child(header_ptr, next_byte, new_inner) };
                             self.len.fetch_add(1, Ordering::Relaxed);
@@ -785,9 +807,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
         exact2: bool,
         byte2: u8,
         child2: TaggedOffset,
-    ) -> TaggedOffset {
+    ) -> Option<TaggedOffset> {
         if prefix.len() <= MAX_PREFIX_LEN {
-            let n4_off = self.alloc_node4(prefix).expect("arena full");
+            let n4_off = self.alloc_node4(prefix)?;
             let n4 = self.arena.get_pointer_mut(n4_off) as *mut Node4;
             unsafe {
                 if exact1 {
@@ -807,21 +829,21 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                     (*n4).insert_child(byte2, child2);
                 }
             }
-            TaggedOffset::from_inner(n4_off)
+            Some(TaggedOffset::from_inner(n4_off))
         } else {
             let head_prefix = &prefix[..MAX_PREFIX_LEN];
             let rest_prefix = &prefix[MAX_PREFIX_LEN + 1..];
             let connector_byte = prefix[MAX_PREFIX_LEN];
 
             let child_chain =
-                self.create_prefix_chain(rest_prefix, exact1, byte1, child1, exact2, byte2, child2);
+                self.create_prefix_chain(rest_prefix, exact1, byte1, child1, exact2, byte2, child2)?;
 
-            let n4_off = self.alloc_node4(head_prefix).expect("arena full");
+            let n4_off = self.alloc_node4(head_prefix)?;
             let n4 = self.arena.get_pointer_mut(n4_off) as *mut Node4;
             unsafe {
                 (*n4).insert_child(connector_byte, child_chain);
             }
-            TaggedOffset::from_inner(n4_off)
+            Some(TaggedOffset::from_inner(n4_off))
         }
     }
 
@@ -840,13 +862,11 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
         }
     }
 
-    unsafe fn grow_node(&self, header: *mut NodeHeader) -> u32 {
+    unsafe fn grow_node(&self, header: *mut NodeHeader) -> Option<u32> {
         match (*header).node_type {
             NodeType::Node4 => {
                 let old = &*(header as *const Node4);
-                let n16_off = self
-                    .alloc_node16(old.header.prefix_slice())
-                    .expect("arena full");
+                let n16_off = self.alloc_node16(old.header.prefix_slice())?;
                 let n16 = self.arena.get_pointer_mut(n16_off) as *mut Node16;
                 (*n16).header.exact_leaf.store(
                     old.header.exact_leaf.load(Ordering::Relaxed),
@@ -856,13 +876,11 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                     let child = TaggedOffset(old.children[i].load(Ordering::Relaxed));
                     (*n16).insert_child(old.keys[i], child);
                 }
-                n16_off
+                Some(n16_off)
             }
             NodeType::Node16 => {
                 let old = &*(header as *const Node16);
-                let n48_off = self
-                    .alloc_node48(old.header.prefix_slice())
-                    .expect("arena full");
+                let n48_off = self.alloc_node48(old.header.prefix_slice())?;
                 let n48 = self.arena.get_pointer_mut(n48_off) as *mut Node48;
                 (*n48).header.exact_leaf.store(
                     old.header.exact_leaf.load(Ordering::Relaxed),
@@ -872,13 +890,11 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                     let child = TaggedOffset(old.children[i].load(Ordering::Relaxed));
                     (*n48).insert_child(old.keys[i], child);
                 }
-                n48_off
+                Some(n48_off)
             }
             NodeType::Node48 => {
                 let old = &*(header as *const Node48);
-                let n256_off = self
-                    .alloc_node256(old.header.prefix_slice())
-                    .expect("arena full");
+                let n256_off = self.alloc_node256(old.header.prefix_slice())?;
                 let n256 = self.arena.get_pointer_mut(n256_off) as *mut Node256;
                 (*n256).header.exact_leaf.store(
                     old.header.exact_leaf.load(Ordering::Relaxed),
@@ -894,9 +910,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                     }
                     min_byte = byte + 1;
                 }
-                n256_off
+                Some(n256_off)
             }
-            NodeType::Node256 => panic!("cannot grow Node256"),
+            NodeType::Node256 => unreachable!("Node256 is maximum node type"),
         }
     }
 
