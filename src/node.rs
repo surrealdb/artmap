@@ -16,8 +16,9 @@
 //!
 //! Implements `Node4`, `Node16`, `Node48`, and `Node256` layouts with prefix compression.
 
+use std::mem::ManuallyDrop;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::latch::HybridLatch;
 use crate::simd::find_child_node16;
@@ -39,14 +40,21 @@ pub enum NodeType {
 /// A leaf node holding the stored key-value pair.
 #[repr(C, align(8))]
 pub struct Leaf<K, V> {
+    pub(crate) removed: AtomicBool,
+    pub(crate) value_taken: AtomicBool,
     pub key: K,
-    pub value: V,
+    pub value: ManuallyDrop<V>,
 }
 
 impl<K, V> Leaf<K, V> {
     #[inline]
     pub fn new(key: K, value: V) -> Box<Self> {
-        Box::new(Self { key, value })
+        Box::new(Self {
+            removed: AtomicBool::new(false),
+            value_taken: AtomicBool::new(false),
+            key,
+            value: ManuallyDrop::new(value),
+        })
     }
 }
 
@@ -113,7 +121,7 @@ impl TaggedPtr {
 pub struct NodeHeader {
     pub latch: HybridLatch,
     pub node_type: NodeType,
-    pub num_children: u8,
+    pub num_children: u16,
     pub prefix_len: u16,
     pub prefix: [u8; MAX_PREFIX_LEN],
     pub exact_leaf: AtomicPtr<u8>,
@@ -412,9 +420,12 @@ mod tests {
         let tagged = TaggedPtr::from_leaf(leaf_ptr);
         assert!(tagged.is_leaf());
         assert_eq!(unsafe { &*tagged.as_leaf_ptr::<u32, u32>() }.key, 10);
-        assert_eq!(unsafe { &*tagged.as_leaf_ptr::<u32, u32>() }.value, 20);
+        assert_eq!(*unsafe { &*tagged.as_leaf_ptr::<u32, u32>() }.value, 20);
 
-        unsafe { drop(Box::from_raw(leaf_ptr)) };
+        unsafe {
+            let mut leaf = Box::from_raw(leaf_ptr);
+            ManuallyDrop::drop(&mut leaf.value);
+        };
 
         let n4 = Node4::new(b"test");
         let n4_ptr = Box::into_raw(n4);

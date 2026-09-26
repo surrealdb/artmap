@@ -38,6 +38,7 @@ pub mod tree;
 
 use std::borrow::Borrow;
 use std::ops::{Bound, RangeBounds};
+use std::sync::atomic::Ordering;
 
 pub use entry::EntryRef;
 pub use iter::{Iter, Keys, Range, Values};
@@ -77,14 +78,43 @@ impl<K, V> ArtMap<K, V> {
 }
 
 impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
-    /// Removes all key-value pairs from the map.
+    /// Returns an entry reference corresponding to the key, if present.
     #[inline]
-    pub fn clear(&self) {
-        self.tree.clear();
+    pub fn get<Q>(&self, key: &Q) -> Option<EntryRef<'_, K, V>>
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        let guard = &crossbeam_epoch::pin();
+        let leaf_ptr = self.tree.get_leaf(key.as_bytes(), guard)?;
+        let leaf = unsafe { &*leaf_ptr };
+        if leaf.removed.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(EntryRef {
+            leaf_ptr,
+            tree: &self.tree,
+        })
     }
+
+    /// Returns an entry reference corresponding to a raw byte slice key, if present.
+    #[inline]
+    pub fn get_by_slice(&self, key: &[u8]) -> Option<EntryRef<'_, K, V>> {
+        let guard = &crossbeam_epoch::pin();
+        let leaf_ptr = self.tree.get_leaf(key, guard)?;
+        let leaf = unsafe { &*leaf_ptr };
+        if leaf.removed.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(EntryRef {
+            leaf_ptr,
+            tree: &self.tree,
+        })
+    }
+
     /// Returns a copy of the value corresponding to the key, if present.
     #[inline]
-    pub fn get<Q>(&self, key: &Q) -> Option<V>
+    pub fn get_value<Q>(&self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
@@ -92,16 +122,6 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
     {
         let guard = &crossbeam_epoch::pin();
         self.tree.get(key.as_bytes(), guard).cloned()
-    }
-
-    /// Returns a copy of the value corresponding to a raw byte slice key, if present.
-    #[inline]
-    pub fn get_by_slice(&self, key: &[u8]) -> Option<V>
-    where
-        V: Clone,
-    {
-        let guard = &crossbeam_epoch::pin();
-        self.tree.get(key, guard).cloned()
     }
 
     /// Accesses the value corresponding to the key via a closure without cloning.
@@ -148,13 +168,11 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
         F: FnOnce() -> V,
     {
         let guard = crossbeam_epoch::pin();
-        let (key_ptr, val_ptr) = self.tree.get_or_insert_with(key, f, &guard);
+        let leaf_ptr = self.tree.get_or_insert_with(key, f, &guard);
 
         EntryRef {
-            key_ptr,
-            val_ptr,
+            leaf_ptr,
             tree: &self.tree,
-            is_removed: false,
         }
     }
 
@@ -211,6 +229,12 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
         Values::new(self.iter())
     }
 
+    /// Removes all key-value pairs from the map.
+    #[inline]
+    pub fn clear(&self) {
+        self.tree.clear();
+    }
+
     /// Validates all structural invariants of the tree.
     #[inline]
     pub fn validate_invariants(&self) {
@@ -242,8 +266,8 @@ mod tests {
         assert_eq!(map.insert("users:300".to_string(), 3), None);
         assert_eq!(map.len(), 3);
 
-        assert_eq!(map.get("users:100"), Some(1));
-        assert_eq!(map.get_by_slice(b"users:200"), Some(2));
+        assert_eq!(map.get("users:100").as_deref(), Some(&1));
+        assert_eq!(map.get_by_slice(b"users:200").as_deref(), Some(&2));
         assert!(map.contains_key("users:300"));
         assert!(map.contains_key_slice(b"users:100"));
         assert!(!map.contains_key("users:400"));
@@ -254,11 +278,11 @@ mod tests {
 
         // Update
         assert_eq!(map.insert("users:100".to_string(), 10), Some(1));
-        assert_eq!(map.get("users:100"), Some(10));
+        assert_eq!(map.get("users:100").as_deref(), Some(&10));
 
         // Remove
         assert_eq!(map.remove("users:200"), Some(2));
-        assert_eq!(map.get("users:200"), None);
+        assert!(map.get("users:200").is_none());
         assert_eq!(map.len(), 2);
 
         map.validate_invariants();
@@ -291,7 +315,7 @@ mod tests {
     fn test_artmap_get_or_insert_with() {
         let map = ArtMap::<String, i32>::new();
         {
-            let mut entry = map.get_or_insert_with("key".to_string(), || 42);
+            let entry = map.get_or_insert_with("key".to_string(), || 42);
             assert_eq!(*entry, 42);
             assert_eq!(entry.key(), "key");
             assert_eq!(entry.value(), &42);
@@ -299,6 +323,6 @@ mod tests {
             assert!(entry.remove());
             assert!(entry.is_removed());
         }
-        assert_eq!(map.get("key"), None);
+        assert!(map.get("key").is_none());
     }
 }
