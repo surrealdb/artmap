@@ -647,6 +647,59 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
         }
     }
 
+    /// Prunes stale versions older than `min_version` from the version chain of `key`.
+    ///
+    /// If the only remaining version is a tombstone and there are no newer versions,
+    /// the key is unlinked from the tree. Returns the count of retired stale nodes.
+    pub fn prune_key<Q, F>(
+        &self,
+        key: &Q,
+        min_version: u64,
+        is_tombstone: F,
+        guard: &Guard,
+    ) -> usize
+    where
+        Q: AsBytes + ?Sized,
+        F: Fn(&V) -> bool,
+    {
+        let leaf_ptr = match self.get_leaf(key, guard) {
+            Some(p) => p,
+            None => return 0,
+        };
+        let mut pruned = 0;
+        let mut cur = leaf_ptr;
+        let mut is_head = true;
+
+        while !cur.is_null() {
+            let leaf = unsafe { &*cur };
+            if leaf.version <= min_version {
+                if is_head && is_tombstone(&*leaf.value) {
+                    self.remove(key, guard);
+                    return 1;
+                }
+
+                let stale = leaf
+                    .next_version
+                    .swap(std::ptr::null_mut(), Ordering::AcqRel);
+                let mut walk_stale = stale;
+                while !walk_stale.is_null() {
+                    let next = unsafe { (*walk_stale).next_version.load(Ordering::Relaxed) };
+                    let to_drop = walk_stale as usize;
+                    guard.defer(move || {
+                        drop(unsafe { Box::from_raw(to_drop as *mut VersionedLeaf<K, V>) })
+                    });
+                    pruned += 1;
+                    walk_stale = next;
+                }
+                break;
+            }
+            cur = leaf.next_version.load(Ordering::Acquire);
+            is_head = false;
+        }
+
+        pruned
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn create_prefix_chain(
         &self,

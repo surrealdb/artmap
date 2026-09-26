@@ -154,3 +154,32 @@ fn test_versioned_artmap_concurrent_writes() {
         }
     }
 }
+
+#[test]
+fn test_versioned_artmap_pruning() {
+    let map = VersionedArtMap::<String, Option<String>>::new();
+
+    map.insert("account:1".to_string(), 100, Some("bal: 50".to_string()));
+    map.insert("account:1".to_string(), 200, Some("bal: 80".to_string()));
+    map.insert("account:1".to_string(), 300, Some("bal: 120".to_string()));
+
+    // Prune versions older than 150 -> v=100 is pruned
+    let pruned = map.prune_key("account:1", 150, |v| v.is_none());
+    assert_eq!(pruned, 0); // v=100 is kept as the version visible at 150
+
+    // Prune versions older than 250 -> v=100 is pruned because v=200 is visible at 250
+    let pruned = map.prune_key("account:1", 250, |v| v.is_none());
+    assert_eq!(pruned, 1);
+    assert_eq!(map.get_version_le("account:1", 150), None);
+    assert_eq!(
+        map.get_version_le("account:1", 250),
+        Some((200, Some("bal: 80".to_string())))
+    );
+
+    // Delete at version 400
+    map.insert("account:1".to_string(), 400, None);
+    // At watermark 500, tombstone at 400 is the only version -> key is unlinked
+    map.prune_key("account:1", 500, |v| v.is_none());
+    assert_eq!(map.len(), 0);
+    assert_eq!(map.get("account:1"), None);
+}

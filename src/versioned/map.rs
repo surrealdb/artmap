@@ -148,6 +148,36 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedArtMap<K, 
         self.tree.remove(key, &guard)
     }
 
+    /// Prunes stale versions older than `min_version` from the version chain of `key`.
+    ///
+    /// If the key has become a dead tombstone at or below `min_version` with no newer versions,
+    /// the key is unlinked from the tree.
+    #[inline]
+    pub fn prune_key<Q, F>(&self, key: &Q, min_version: u64, is_tombstone: F) -> usize
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+        F: Fn(&V) -> bool,
+    {
+        let guard = crossbeam_epoch::pin();
+        self.tree.prune_key(key, min_version, is_tombstone, &guard)
+    }
+
+    /// Prunes stale versions older than `min_version` across all keys in the map.
+    pub fn prune_all<F>(&self, min_version: u64, is_tombstone: F) -> usize
+    where
+        F: Fn(&V) -> bool + Copy,
+    {
+        let guard = crossbeam_epoch::pin();
+        let mut total = 0;
+        for entry in self.iter() {
+            total += self
+                .tree
+                .prune_key(entry.key(), min_version, is_tombstone, &guard);
+        }
+        total
+    }
+
     /// Returns an iterator over a sub-range of entries.
     pub fn range<R, Q>(&self, range: R) -> Range<'_, K, V>
     where
