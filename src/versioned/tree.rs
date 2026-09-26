@@ -323,13 +323,12 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                 let existing_leaf = unsafe { &*existing_leaf_ptr };
 
                 if existing_leaf.key.as_bytes() == key_bytes {
-                    // Prepend new leaf to version chain
-                    unsafe {
-                        (*new_leaf_ptr)
-                            .next_version
-                            .store(existing_leaf_ptr, Ordering::Relaxed);
+                    let is_new_head = unsafe {
+                        insert_into_version_chain(existing_leaf_ptr, new_leaf_ptr)
+                    };
+                    if is_new_head {
+                        self.root.store(tagged_new_leaf.as_raw(), Ordering::Release);
                     }
-                    self.root.store(tagged_new_leaf.as_raw(), Ordering::Release);
                     self.root_latch.unlock();
                     return true;
                 }
@@ -459,15 +458,15 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                     if let Some(leaf_ptr) =
                         header.load_exact_versioned_leaf::<K, V>(Ordering::Acquire)
                     {
-                        unsafe {
-                            (*new_leaf_ptr)
-                                .next_version
-                                .store(leaf_ptr, Ordering::Relaxed);
+                        let is_new_head = unsafe {
+                            insert_into_version_chain(leaf_ptr, new_leaf_ptr)
+                        };
+                        if is_new_head {
                             header
                                 .exact_leaf
                                 .store(tagged_new_leaf.as_raw(), Ordering::Release);
-                            header.latch.unlock();
                         }
+                        header.latch.unlock();
                         return true;
                     } else {
                         header
@@ -571,17 +570,19 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                             let existing_leaf = unsafe { &*existing_leaf_ptr };
 
                             if existing_leaf.key.as_bytes() == key_bytes {
-                                unsafe {
-                                    (*new_leaf_ptr)
-                                        .next_version
-                                        .store(existing_leaf_ptr, Ordering::Relaxed);
-                                    self.replace_child(
-                                        current.as_inner_ptr(),
-                                        next_byte,
-                                        tagged_new_leaf,
-                                    );
-                                    header.latch.unlock();
+                                let is_new_head = unsafe {
+                                    insert_into_version_chain(existing_leaf_ptr, new_leaf_ptr)
+                                };
+                                if is_new_head {
+                                    unsafe {
+                                        self.replace_child(
+                                            current.as_inner_ptr(),
+                                            next_byte,
+                                            tagged_new_leaf,
+                                        );
+                                    }
                                 }
+                                header.latch.unlock();
                                 return true;
                             }
 
@@ -1259,6 +1260,29 @@ unsafe fn find_child(header: &NodeHeader, byte: u8) -> Option<TaggedPtr> {
         NodeType::Node16 => (*(header as *const NodeHeader as *const Node16)).find_child(byte),
         NodeType::Node48 => (*(header as *const NodeHeader as *const Node48)).find_child(byte),
         NodeType::Node256 => (*(header as *const NodeHeader as *const Node256)).find_child(byte),
+    }
+}
+
+unsafe fn insert_into_version_chain<K: AsBytes + Send + 'static, V: Send + Clone + 'static>(
+    head_ptr: *mut VersionedLeaf<K, V>,
+    new_leaf_ptr: *mut VersionedLeaf<K, V>,
+) -> bool {
+    let new_ver = (*new_leaf_ptr).version;
+    if new_ver >= (*head_ptr).version {
+        (*new_leaf_ptr).next_version.store(head_ptr, Ordering::Relaxed);
+        true
+    } else {
+        let mut prev = head_ptr;
+        loop {
+            let next = (*prev).next_version.load(Ordering::Acquire);
+            if next.is_null() || (*next).version <= new_ver {
+                (*new_leaf_ptr).next_version.store(next, Ordering::Relaxed);
+                (*prev).next_version.store(new_leaf_ptr, Ordering::Release);
+                break;
+            }
+            prev = next;
+        }
+        false
     }
 }
 
