@@ -83,6 +83,40 @@ fn test_arena_versioned_artmap_snapshot_reads() {
 }
 
 #[test]
+fn test_arena_versioned_artmap_out_of_order_versions() {
+    let map = ArenaVersionedArtMap::<String, u64>::with_capacity(16 * 1024 * 1024);
+
+    // Insert versions out of order: 10, then 30, then 5, then 20
+    map.insert_versioned("k".to_string(), 10, 100);
+    map.insert_versioned("k".to_string(), 30, 300);
+    map.insert_versioned("k".to_string(), 5, 50);
+    map.insert_versioned("k".to_string(), 20, 200);
+
+    // Should find highest version <= 35 -> 30
+    let v = map.get_version_le("k", 35).unwrap();
+    assert_eq!(v.0, 30);
+    assert_eq!(v.1, 300);
+
+    // <= 25 -> 20
+    let v = map.get_version_le("k", 25).unwrap();
+    assert_eq!(v.0, 20);
+    assert_eq!(v.1, 200);
+
+    // <= 15 -> 10
+    let v = map.get_version_le("k", 15).unwrap();
+    assert_eq!(v.0, 10);
+    assert_eq!(v.1, 100);
+
+    // <= 8 -> 5
+    let v = map.get_version_le("k", 8).unwrap();
+    assert_eq!(v.0, 5);
+    assert_eq!(v.1, 50);
+
+    // <= 4 -> None
+    assert!(map.get_version_le("k", 4).is_none());
+}
+
+#[test]
 fn test_arena_artmap_concurrent_writes() {
     let arena = Arena::with_capacity(32 * 1024 * 1024);
     let map = Arc::new(ArenaArtMap::<[u8; 8], u64>::new(arena));

@@ -324,12 +324,17 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                 let existing_leaf = unsafe { &mut *existing_leaf_ptr };
 
                 if existing_leaf.key.as_bytes() == key_bytes {
-                    unsafe {
-                        (*new_leaf_ptr)
-                            .next_version_offset
-                            .store(cur_root.leaf_offset(), Ordering::Relaxed);
+                    let is_new_head = unsafe {
+                        insert_into_version_chain(
+                            &self.arena,
+                            cur_root.leaf_offset(),
+                            tagged_new_leaf.leaf_offset(),
+                            new_leaf_ptr,
+                        )
+                    };
+                    if is_new_head {
+                        self.root.store(tagged_new_leaf.raw(), Ordering::Release);
                     }
-                    self.root.store(tagged_new_leaf.raw(), Ordering::Release);
                     self.root_latch.unlock();
                     return true;
                 }
@@ -494,15 +499,20 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
 
                     let exact_raw = header.exact_leaf.load(Ordering::Acquire);
                     if exact_raw != 0 {
-                        unsafe {
-                            (*new_leaf_ptr)
-                                .next_version_offset
-                                .store(TaggedOffset(exact_raw).leaf_offset(), Ordering::Relaxed);
+                        let is_new_head = unsafe {
+                            insert_into_version_chain(
+                                &self.arena,
+                                TaggedOffset(exact_raw).leaf_offset(),
+                                tagged_new_leaf.leaf_offset(),
+                                new_leaf_ptr,
+                            )
+                        };
+                        if is_new_head {
                             header
                                 .exact_leaf
                                 .store(tagged_new_leaf.raw(), Ordering::Release);
-                            header.latch.unlock();
                         }
+                        header.latch.unlock();
                         return true;
                     } else {
                         header
@@ -703,13 +713,20 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                             let existing_leaf = unsafe { &mut *existing_leaf_ptr };
 
                             if existing_leaf.key.as_bytes() == key_bytes {
-                                unsafe {
-                                    (*new_leaf_ptr)
-                                        .next_version_offset
-                                        .store(child.leaf_offset(), Ordering::Relaxed);
-                                    self.replace_child(header_ptr, next_byte, tagged_new_leaf);
-                                    header.latch.unlock();
+                                let is_new_head = unsafe {
+                                    insert_into_version_chain(
+                                        &self.arena,
+                                        child.leaf_offset(),
+                                        tagged_new_leaf.leaf_offset(),
+                                        new_leaf_ptr,
+                                    )
+                                };
+                                if is_new_head {
+                                    unsafe {
+                                        self.replace_child(header_ptr, next_byte, tagged_new_leaf);
+                                    }
                                 }
+                                header.latch.unlock();
                                 return true;
                             }
 
@@ -1364,6 +1381,49 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                 None
             }
         }
+    }
+}
+
+#[inline]
+unsafe fn insert_into_version_chain<K, V>(
+    arena: &crate::arena::Arena,
+    head_offset: u32,
+    new_leaf_offset: u32,
+    new_leaf_ptr: *mut VersionedLeaf<K, V>,
+) -> bool {
+    let head_ptr = arena.get_pointer_mut(head_offset) as *mut VersionedLeaf<K, V>;
+    let new_ver = (*new_leaf_ptr).version;
+    if new_ver >= (*head_ptr).version {
+        (*new_leaf_ptr)
+            .next_version_offset
+            .store(head_offset, Ordering::Relaxed);
+        true
+    } else {
+        let mut prev = head_ptr;
+        loop {
+            let next_off = (*prev).next_version_offset.load(Ordering::Acquire);
+            if next_off == 0 {
+                (*new_leaf_ptr)
+                    .next_version_offset
+                    .store(0, Ordering::Relaxed);
+                (*prev)
+                    .next_version_offset
+                    .store(new_leaf_offset, Ordering::Release);
+                break;
+            }
+            let next_ptr = arena.get_pointer_mut(next_off) as *mut VersionedLeaf<K, V>;
+            if (*next_ptr).version <= new_ver {
+                (*new_leaf_ptr)
+                    .next_version_offset
+                    .store(next_off, Ordering::Relaxed);
+                (*prev)
+                    .next_version_offset
+                    .store(new_leaf_offset, Ordering::Release);
+                break;
+            }
+            prev = next_ptr;
+        }
+        false
     }
 }
 
