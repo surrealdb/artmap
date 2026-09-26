@@ -1160,6 +1160,14 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
         }
     }
 
+    pub(crate) fn last_leaf(&self) -> Option<*const VersionedLeaf<K, V>> {
+        let root_raw = self.root.load(Ordering::Acquire);
+        if root_raw == 0 {
+            return None;
+        }
+        unsafe { crate::arena::versioned_iter::last_leaf_in_subtree(self, TaggedOffset(root_raw)) }
+    }
+
     pub(crate) fn find_predecessor(
         &self,
         search_key: &[u8],

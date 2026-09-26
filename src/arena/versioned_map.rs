@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::borrow::Borrow;
+use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -178,6 +179,53 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
     /// Returns an iterator visiting all entries in ascending key order.
     pub fn iter(&self) -> ArenaVersionedRange<'_, K, V> {
         self.range::<std::ops::RangeFull, [u8]>(..)
+    }
+
+    /// Finds the entry matching `search_key` or its successor in lexicographical key order.
+    #[inline]
+    pub fn find_successor(
+        &self,
+        search_key: &[u8],
+        include_equal: bool,
+    ) -> Option<ArenaVersionedEntryRef<'_, K, V>> {
+        self.tree
+            .find_successor(search_key, include_equal)
+            .map(|leaf_ptr| ArenaVersionedEntryRef {
+                leaf_ptr,
+                _marker: PhantomData,
+            })
+    }
+
+    /// Finds the entry matching `search_key` or its predecessor in lexicographical key order.
+    #[inline]
+    pub fn find_predecessor(
+        &self,
+        search_key: &[u8],
+        include_equal: bool,
+    ) -> Option<ArenaVersionedEntryRef<'_, K, V>> {
+        self.tree
+            .find_predecessor(search_key, include_equal)
+            .map(|leaf_ptr| ArenaVersionedEntryRef {
+                leaf_ptr,
+                _marker: PhantomData,
+            })
+    }
+
+    /// Finds the first entry in lexicographical key order.
+    #[inline]
+    pub fn first_entry(&self) -> Option<ArenaVersionedEntryRef<'_, K, V>> {
+        self.find_successor(&[], true)
+    }
+
+    /// Finds the last entry in lexicographical key order.
+    #[inline]
+    pub fn last_entry(&self) -> Option<ArenaVersionedEntryRef<'_, K, V>> {
+        self.tree
+            .last_leaf()
+            .map(|leaf_ptr| ArenaVersionedEntryRef {
+                leaf_ptr,
+                _marker: PhantomData,
+            })
     }
 
     /// Scans entries in the given key range, invoking `callback` for each entry with its key, value, and version.

@@ -117,6 +117,42 @@ fn test_arena_versioned_artmap_out_of_order_versions() {
 }
 
 #[test]
+fn test_arena_versioned_artmap_successor_predecessor() {
+    let map = ArenaVersionedArtMap::<String, u64>::with_capacity(16 * 1024 * 1024);
+
+    map.insert_versioned("apple".to_string(), 1, 10);
+    map.insert_versioned("cherry".to_string(), 1, 20);
+    map.insert_versioned("date".to_string(), 1, 30);
+
+    assert_eq!(map.first_entry().unwrap().key(), "apple");
+    assert_eq!(map.last_entry().unwrap().key(), "date");
+
+    // Successor
+    assert_eq!(
+        map.find_successor(b"banana", false).unwrap().key(),
+        "cherry"
+    );
+    assert_eq!(map.find_successor(b"cherry", true).unwrap().key(), "cherry");
+    assert_eq!(map.find_successor(b"cherry", false).unwrap().key(), "date");
+    assert!(map.find_successor(b"date", false).is_none());
+
+    // Predecessor
+    assert_eq!(
+        map.find_predecessor(b"banana", false).unwrap().key(),
+        "apple"
+    );
+    assert_eq!(
+        map.find_predecessor(b"cherry", true).unwrap().key(),
+        "cherry"
+    );
+    assert_eq!(
+        map.find_predecessor(b"cherry", false).unwrap().key(),
+        "apple"
+    );
+    assert!(map.find_predecessor(b"apple", false).is_none());
+}
+
+#[test]
 fn test_arena_artmap_concurrent_writes() {
     let arena = Arena::with_capacity(32 * 1024 * 1024);
     let map = Arc::new(ArenaArtMap::<[u8; 8], u64>::new(arena));

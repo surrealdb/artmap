@@ -178,7 +178,7 @@ impl Arena {
         let arena_id = self.buf.as_ptr() as usize;
         let current_epoch = self.epoch.load(Ordering::Relaxed);
 
-        let chunk_size = if self.buf.len() >= 1024 * 1024 {
+        let chunk_size = if self.buf.len() > 1024 * 1024 {
             CHUNK_SIZE
         } else {
             0
