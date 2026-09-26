@@ -719,7 +719,11 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
             let leaf = unsafe { &*cur };
             if leaf.version <= min_version {
                 if is_head && is_tombstone(&*leaf.value) {
-                    self.remove(key, guard);
+                    if self.get_leaf(key, guard) == Some(leaf_ptr)
+                        && !leaf.removed.swap(true, Ordering::AcqRel)
+                    {
+                        self.len.fetch_sub(1, Ordering::Relaxed);
+                    }
                     let stale = leaf
                         .next_version
                         .swap(std::ptr::null_mut(), Ordering::AcqRel);
