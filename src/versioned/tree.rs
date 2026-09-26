@@ -664,6 +664,24 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
         count
     }
 
+    /// Returns all versions stored for `key`, ordered from newest to oldest.
+    pub fn get_all_versions<Q>(&self, key: &Q, guard: &Guard) -> Vec<(u64, V)>
+    where
+        Q: AsBytes + ?Sized,
+    {
+        let mut versions = Vec::new();
+        let mut cur = match self.get_leaf(key, guard) {
+            Some(p) => p,
+            None => return versions,
+        };
+        while !cur.is_null() {
+            let leaf = unsafe { &*cur };
+            versions.push((leaf.version, (*leaf.value).clone()));
+            cur = unsafe { (*cur).next_version.load(Ordering::Acquire) };
+        }
+        versions
+    }
+
     /// Prunes stale versions older than `min_version` from the version chain of `key`.
     ///
     /// If the only remaining version is a tombstone and there are no newer versions,
