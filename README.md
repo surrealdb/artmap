@@ -33,7 +33,7 @@ It provides four concurrent map variants:
 
 Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM**, Linux 6.8):
 
-| Data Structure | &nbsp;&nbsp;Read&nbsp;&nbsp;<br><sup>&nbsp;&nbsp;&nbsp;&nbsp;(with&nbsp;standard&nbsp;key)&nbsp;&nbsp;&nbsp;&nbsp;</sup> | &nbsp;&nbsp;Read&nbsp;&nbsp;<br><sup>&nbsp;&nbsp;&nbsp;&nbsp;(with&nbsp;slice&nbsp;key)&nbsp;&nbsp;&nbsp;&nbsp;</sup> | &nbsp;&nbsp;Insert&nbsp;&nbsp;<br><sup>&nbsp;&nbsp;&nbsp;&nbsp;(sequential&nbsp;entries)&nbsp;&nbsp;&nbsp;&nbsp;</sup> | &nbsp;&nbsp;Insert&nbsp;&nbsp;<br><sup>&nbsp;&nbsp;&nbsp;&nbsp;(random&nbsp;entries)&nbsp;&nbsp;&nbsp;&nbsp;</sup> | Range&nbsp;scans<br><sup>(100&nbsp;items)</sup> | Allocations<br><sup>(per&nbsp;insert)</sup> |
+| Data Structure | Read<br><sup>(with&nbsp;standard&nbsp;key)</sup> | Read<br><sup>(with&nbsp;slice&nbsp;key)</sup> | Insert<br><sup>(sequential&nbsp;entries)</sup> | Insert<br><sup>(random&nbsp;entries)</sup> | Range&nbsp;scans<br><sup>(100&nbsp;items)</sup> | Allocations<br><sup>(per&nbsp;insert)</sup> |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
 | **`artmap::ArtMap`** | **15.0&nbsp;ns**<br><sup>(66.6M/s)</sup> | **19.6&nbsp;ns**<br><sup>(50.8M/s)</sup> | **26.1&nbsp;ns**<br><sup>(38.2M/s)</sup> | **52.5&nbsp;ns**<br><sup>(19.0M/s)</sup> | **657&nbsp;ns**<br><sup>(152.3M/s)</sup> | **1.0** |
 | **`artmap::VersionedArtMap`** | **15.2&nbsp;ns**<br><sup>(65.8M/s)</sup> | **19.8&nbsp;ns**<br><sup>(50.5M/s)</sup> | **26.5&nbsp;ns**<br><sup>(37.7M/s)</sup> | **54.2&nbsp;ns**<br><sup>(18.5M/s)</sup> | **665&nbsp;ns**<br><sup>(150.4M/s)</sup> | **1.0** |
