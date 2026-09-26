@@ -67,22 +67,28 @@ unsafe fn drop_subtree<K: AsBytes + Send + 'static, V: Send + Clone + 'static>(p
     if ptr.is_leaf() {
         let mut cur = ptr.as_versioned_leaf_ptr::<K, V>();
         while !cur.is_null() {
-            let mut leaf = Box::from_raw(cur);
+            let leaf = unsafe { &*cur };
             let next = leaf.next_version.load(Ordering::Relaxed);
-            if !leaf.value_taken.load(Ordering::Acquire) {
-                ManuallyDrop::drop(&mut leaf.value);
+            if !leaf.removed.swap(true, Ordering::AcqRel) {
+                let mut leaf = unsafe { Box::from_raw(cur) };
+                if !leaf.value_taken.load(Ordering::Acquire) {
+                    ManuallyDrop::drop(&mut leaf.value);
+                }
             }
             cur = next;
         }
     } else {
-        let header = &*ptr.as_inner_ptr();
+        let header = unsafe { &*ptr.as_inner_ptr() };
         if let Some(leaf_ptr) = header.load_exact_versioned_leaf::<K, V>(Ordering::Relaxed) {
             let mut cur = leaf_ptr;
             while !cur.is_null() {
-                let mut leaf = Box::from_raw(cur);
+                let leaf = unsafe { &*cur };
                 let next = leaf.next_version.load(Ordering::Relaxed);
-                if !leaf.value_taken.load(Ordering::Acquire) {
-                    ManuallyDrop::drop(&mut leaf.value);
+                if !leaf.removed.swap(true, Ordering::AcqRel) {
+                    let mut leaf = unsafe { Box::from_raw(cur) };
+                    if !leaf.value_taken.load(Ordering::Acquire) {
+                        ManuallyDrop::drop(&mut leaf.value);
+                    }
                 }
                 cur = next;
             }
@@ -719,12 +725,19 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                         .swap(std::ptr::null_mut(), Ordering::AcqRel);
                     let mut walk_stale = stale;
                     while !walk_stale.is_null() {
-                        let next = unsafe { (*walk_stale).next_version.load(Ordering::Relaxed) };
-                        let to_drop = walk_stale as usize;
-                        guard.defer(move || {
-                            drop(unsafe { Box::from_raw(to_drop as *mut VersionedLeaf<K, V>) })
-                        });
-                        pruned += 1;
+                        let node = unsafe { &*walk_stale };
+                        let next = node.next_version.load(Ordering::Acquire);
+                        if !node.removed.swap(true, Ordering::AcqRel) {
+                            let to_drop = walk_stale as usize;
+                            guard.defer(move || {
+                                let mut leaf =
+                                    unsafe { Box::from_raw(to_drop as *mut VersionedLeaf<K, V>) };
+                                if !leaf.value_taken.load(Ordering::Acquire) {
+                                    unsafe { ManuallyDrop::drop(&mut leaf.value) };
+                                }
+                            });
+                            pruned += 1;
+                        }
                         walk_stale = next;
                     }
                     return pruned + 1;
@@ -735,12 +748,19 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                     .swap(std::ptr::null_mut(), Ordering::AcqRel);
                 let mut walk_stale = stale;
                 while !walk_stale.is_null() {
-                    let next = unsafe { (*walk_stale).next_version.load(Ordering::Relaxed) };
-                    let to_drop = walk_stale as usize;
-                    guard.defer(move || {
-                        drop(unsafe { Box::from_raw(to_drop as *mut VersionedLeaf<K, V>) })
-                    });
-                    pruned += 1;
+                    let node = unsafe { &*walk_stale };
+                    let next = node.next_version.load(Ordering::Acquire);
+                    if !node.removed.swap(true, Ordering::AcqRel) {
+                        let to_drop = walk_stale as usize;
+                        guard.defer(move || {
+                            let mut leaf =
+                                unsafe { Box::from_raw(to_drop as *mut VersionedLeaf<K, V>) };
+                            if !leaf.value_taken.load(Ordering::Acquire) {
+                                unsafe { ManuallyDrop::drop(&mut leaf.value) };
+                            }
+                        });
+                        pruned += 1;
+                    }
                     walk_stale = next;
                 }
                 break;
