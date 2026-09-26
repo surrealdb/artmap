@@ -28,6 +28,7 @@
 //! - **Epoch-Based Memory Reclamation**: Memory for unlinked or resized nodes is safely reclaimed via `crossbeam-epoch`.
 //! - **Multi-Writer Scalability**: Fine-grained node locking permits parallel inserts across disjoint prefixes.
 
+pub mod arena;
 pub mod entry;
 pub mod iter;
 pub mod key;
@@ -40,6 +41,7 @@ use std::borrow::Borrow;
 use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::Ordering;
 
+pub use arena::{Arena, ArenaArtMap};
 pub use entry::EntryRef;
 pub use iter::{Iter, Keys, Range, Values};
 pub use key::AsBytes;
