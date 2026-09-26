@@ -78,19 +78,6 @@ fn alloc_artmap_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
 }
 
 #[divan::bench(args = COUNTS)]
-fn alloc_artmap_with_inserter(bencher: divan::Bencher<'_, '_>, count: usize) {
-    let map = ArtMap::<[u8; 8], usize>::new();
-    let mut ins = artmap::Inserter::new();
-    let mut key = 0usize;
-
-    bencher.counter(count).bench_local(|| {
-        let k = (key as u64).to_be_bytes();
-        let _ = map.insert_with_inserter(k, key, &mut ins);
-        key += 1;
-    });
-}
-
-#[divan::bench(args = COUNTS)]
 fn alloc_crossbeam_skipmap_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
     let map = SkipMap::<[u8; 8], usize>::new();
     let mut key = 0usize;
