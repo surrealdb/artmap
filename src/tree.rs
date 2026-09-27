@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use crate::key::AsBytes;
 use crate::latch::{CachePadded, HybridLatch};
 use crate::node::{
-    Leaf, Node16, Node256, Node4, Node48, NodeHeader, NodeType, TaggedPtr, MAX_PREFIX_LEN,
-    NODE48_EMPTY,
+    clear_bitmap_bit, next_present_byte, prev_present_byte, set_bitmap_bit, Leaf, Node16, Node256,
+    Node4, Node48, NodeHeader, NodeType, TaggedPtr, MAX_PREFIX_LEN, NODE48_EMPTY,
 };
 
 /// An inserter cache optimizing sequential and localized inserts in [`ArtMap`](crate::ArtMap).
@@ -518,6 +518,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 )
                                 .is_ok()
                             {
+                                set_bitmap_bit(&n256.child_bitmap, next_byte);
                                 let parent_valid = match parent {
                                     Some(p) => unsafe {
                                         !(*p).latch.is_obsolete()
@@ -530,6 +531,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                     self.len.fetch_add(1, Ordering::Relaxed);
                                     return Ok((None, new_leaf_ptr));
                                 } else {
+                                    clear_bitmap_bit(&n256.child_bitmap, next_byte);
                                     n256.children[next_byte as usize]
                                         .store(ptr::null_mut(), Ordering::Release);
                                     continue 'retry;
@@ -1580,7 +1582,8 @@ unsafe fn find_first_child_leaf<K, V>(
         }
         NodeType::Node48 => {
             let n = &*(header as *const NodeHeader as *const Node48);
-            for byte in min_byte..=255u8 {
+            let mut next_byte = min_byte;
+            while let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
                 let slot = n.child_indices[byte as usize];
                 if slot != NODE48_EMPTY {
                     let child =
@@ -1589,18 +1592,27 @@ unsafe fn find_first_child_leaf<K, V>(
                         return Some(leaf);
                     }
                 }
+                if byte == 255 {
+                    break;
+                }
+                next_byte = byte + 1;
             }
             None
         }
         NodeType::Node256 => {
             let n = &*(header as *const NodeHeader as *const Node256);
-            for byte in min_byte..=255u8 {
+            let mut next_byte = min_byte;
+            while let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
                 let child = TaggedPtr::from_raw(n.children[byte as usize].load(Ordering::Acquire));
                 if !child.is_null() {
                     if let Some(leaf) = crate::iter::first_leaf_in_subtree(child) {
                         return Some(leaf);
                     }
                 }
+                if byte == 255 {
+                    break;
+                }
+                next_byte = byte + 1;
             }
             None
         }
@@ -1635,7 +1647,8 @@ unsafe fn find_last_child_leaf<K, V>(header: &NodeHeader, max_byte: u8) -> Optio
         }
         NodeType::Node48 => {
             let n = &*(header as *const NodeHeader as *const Node48);
-            for byte in (0..=max_byte).rev() {
+            let mut max_b = max_byte;
+            while let Some(byte) = prev_present_byte(&n.child_bitmap, max_b) {
                 let slot = n.child_indices[byte as usize];
                 if slot != NODE48_EMPTY {
                     let child =
@@ -1644,18 +1657,27 @@ unsafe fn find_last_child_leaf<K, V>(header: &NodeHeader, max_byte: u8) -> Optio
                         return Some(leaf);
                     }
                 }
+                if byte == 0 {
+                    break;
+                }
+                max_b = byte - 1;
             }
             None
         }
         NodeType::Node256 => {
             let n = &*(header as *const NodeHeader as *const Node256);
-            for byte in (0..=max_byte).rev() {
+            let mut max_b = max_byte;
+            while let Some(byte) = prev_present_byte(&n.child_bitmap, max_b) {
                 let child = TaggedPtr::from_raw(n.children[byte as usize].load(Ordering::Acquire));
                 if !child.is_null() {
                     if let Some(leaf) = crate::iter::last_leaf_in_subtree(child) {
                         return Some(leaf);
                     }
                 }
+                if byte == 0 {
+                    break;
+                }
+                max_b = byte - 1;
             }
             None
         }
