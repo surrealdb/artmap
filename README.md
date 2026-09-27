@@ -63,7 +63,7 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 | :--- | ---: | ---: | :--- |
 | **`artmap::ArtMap`** | **3.85&nbsp;ms**<br><sup>(25.9M/s)</sup> | **2.82&nbsp;ms**<br><sup>(35.4M/s)</sup> | Non-Blocking Reads + OLC Node Latching |
 | **`artmap::VersionedArtMap`** | **4.18&nbsp;ms**<br><sup>(23.9M/s)</sup> | **3.33&nbsp;ms**<br><sup>(30.0M/s)</sup> | Non-Blocking Reads + OLC + Atomic Version Prepend |
-| **`artmap::ArenaArtMap`** | **3.34&nbsp;ms**<br><sup>(29.9M/s)</sup> | **2.50&nbsp;ms**<br><sup>(39.9M/s)</sup> | Lock-Free CAS + 32-Bit Offsets + Direct Atomic Bump |
+| **`artmap::ArenaArtMap`** | **3.34&nbsp;ms**<br><sup>(29.9M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**2.50&nbsp;ms**<br><sup>(39.9M/s)</sup> | Lock-Free CAS + 32-Bit Offsets + Direct Atomic Bump |
 | **`artmap::ArenaVersionedArtMap`** | **3.34&nbsp;ms**<br><sup>(29.9M/s)</sup> | **2.90&nbsp;ms**<br><sup>(34.4M/s)</sup> | Lock-Free CAS + 32-Bit Offsets + MVCC Prepend |
 | `arenaskiplist::SkipList` | 40.50&nbsp;ms<br><sup>(2.47M/s)</sup> | 28.28&nbsp;ms<br><sup>(3.54M/s)</sup> | Lock-Free Atomic CAS (Contiguous Arena) |
 | `concread::bptree::BPTree` | 8.63&nbsp;ms<br><sup>(11.6M/s)</sup> | 6.23&nbsp;ms<br><sup>(16.1M/s)</sup> | Lock-Free Reads + Single-Writer CoW (MVCC) |
@@ -71,7 +71,7 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 | `parking_lot::RwLock<BTreeMap>` | 68.19&nbsp;ms<br><sup>(1.47M/s)</sup> | 38.05&nbsp;ms<br><sup>(2.63M/s)</sup> | Coarse Exclusive Lock |
 | `parking_lot::RwLock<imbl::OrdMap>` | 76.39&nbsp;ms<br><sup>(1.31M/s)</sup> | 54.98&nbsp;ms<br><sup>(1.82M/s)</sup> | Coarse Exclusive Lock |
 | `parking_lot::RwLock<vart::Tree>` | 74.12&nbsp;ms<br><sup>(1.35M/s)</sup> | 41.25&nbsp;ms<br><sup>(2.42M/s)</sup> | Coarse Exclusive Lock (Persistent CoW) |
-| `scc::TreeIndex` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.96&nbsp;ms**<br><sup>(51.0M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**3.67&nbsp;ms**<br><sup>(27.2M/s)</sup> | Lock-Free Reads + Node Latching (B-Link) |
+| `scc::TreeIndex` | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.96&nbsp;ms**<br><sup>(51.0M/s)</sup> | **3.67&nbsp;ms**<br><sup>(27.2M/s)</sup> | Lock-Free Reads + Node Latching (B-Link) |
 | `dashmap::DashMap`* | 3.67&nbsp;ms<br><sup>(27.2M/s)</sup> | 5.10&nbsp;ms<br><sup>(19.6M/s)</sup> | Fine-Grained Sharded RwLock |
 | `papaya::HashMap`* | 4.26&nbsp;ms<br><sup>(23.5M/s)</sup> | 6.12&nbsp;ms<br><sup>(16.3M/s)</sup> | Lock-Free Reads + Fine-Grained Latching (EBR) |
 | `parking_lot::RwLock<HashMap>`* | 76.64&nbsp;ms<br><sup>(1.30M/s)</sup> | 43.17&nbsp;ms<br><sup>(2.32M/s)</sup> | Coarse Exclusive Lock |
