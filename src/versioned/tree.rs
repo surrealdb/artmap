@@ -284,7 +284,7 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
         if let Some(leaf_ptr) = self.get_leaf(key_bytes, guard) {
             let leaf = unsafe { &*leaf_ptr };
             if leaf.key.as_bytes() == key_bytes {
-                let new_node = Box::into_raw(VersionNode::new(version, value));
+                let new_node = leaf.alloc_version_node(version, value);
                 let was_removed = unsafe { insert_version_into_leaf(leaf_ptr, new_node, guard) };
                 if was_removed {
                     self.len.fetch_add(1, Ordering::Relaxed);
@@ -327,15 +327,16 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                 let existing_leaf = unsafe { &*existing_leaf_ptr };
 
                 if existing_leaf.key.as_bytes() == key_bytes {
-                    let node = unsafe {
-                        (*new_leaf_ptr).versions.swap(ptr::null_mut(), Ordering::Relaxed)
-                    };
+                    let val =
+                        unsafe { ManuallyDrop::take(&mut (*(*new_leaf_ptr).slot0.get()).value) };
+                    let ver = unsafe { (*(*new_leaf_ptr).slot0.get()).version };
+                    unsafe { drop(Box::from_raw(new_leaf_ptr)) };
+                    let node = existing_leaf.alloc_version_node(ver, val);
                     let was_removed =
                         unsafe { insert_version_into_leaf(existing_leaf_ptr, node, guard) };
                     if was_removed {
                         self.len.fetch_add(1, Ordering::Relaxed);
                     }
-                    unsafe { drop(Box::from_raw(new_leaf_ptr)) };
                     self.root_latch.unlock();
                     return true;
                 }
@@ -465,15 +466,18 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                     if let Some(leaf_ptr) =
                         header.load_exact_versioned_leaf::<K, V>(Ordering::Acquire)
                     {
-                        let node = unsafe {
-                            (*new_leaf_ptr).versions.swap(ptr::null_mut(), Ordering::Relaxed)
+                        let existing_leaf = unsafe { &*leaf_ptr };
+                        let val = unsafe {
+                            ManuallyDrop::take(&mut (*(*new_leaf_ptr).slot0.get()).value)
                         };
+                        let ver = unsafe { (*(*new_leaf_ptr).slot0.get()).version };
+                        unsafe { drop(Box::from_raw(new_leaf_ptr)) };
+                        let node = existing_leaf.alloc_version_node(ver, val);
                         let was_removed =
                             unsafe { insert_version_into_leaf(leaf_ptr, node, guard) };
                         if was_removed {
                             self.len.fetch_add(1, Ordering::Relaxed);
                         }
-                        unsafe { drop(Box::from_raw(new_leaf_ptr)) };
                         header.latch.unlock();
                         return true;
                     } else {
@@ -578,15 +582,18 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                             let existing_leaf = unsafe { &*existing_leaf_ptr };
 
                             if existing_leaf.key.as_bytes() == key_bytes {
-                                let node = unsafe {
-                                    (*new_leaf_ptr).versions.swap(ptr::null_mut(), Ordering::Relaxed)
+                                let val = unsafe {
+                                    ManuallyDrop::take(&mut (*(*new_leaf_ptr).slot0.get()).value)
                                 };
-                                let was_removed =
-                                    unsafe { insert_version_into_leaf(existing_leaf_ptr, node, guard) };
+                                let ver = unsafe { (*(*new_leaf_ptr).slot0.get()).version };
+                                unsafe { drop(Box::from_raw(new_leaf_ptr)) };
+                                let node = existing_leaf.alloc_version_node(ver, val);
+                                let was_removed = unsafe {
+                                    insert_version_into_leaf(existing_leaf_ptr, node, guard)
+                                };
                                 if was_removed {
                                     self.len.fetch_add(1, Ordering::Relaxed);
                                 }
-                                unsafe { drop(Box::from_raw(new_leaf_ptr)) };
                                 header.latch.unlock();
                                 return true;
                             }
@@ -1326,13 +1333,21 @@ unsafe fn insert_version_into_leaf<K: AsBytes + Send + 'static, V: Send + Clone 
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    let to_drop = cur_head as usize;
-                    guard.defer(move || {
-                        let mut n = Box::from_raw(to_drop as *mut VersionNode<V>);
-                        if !n.value_taken.load(Ordering::Acquire) {
-                            ManuallyDrop::drop(&mut n.value);
+                    let old_node = &*cur_head;
+                    if old_node.is_inline {
+                        if !old_node.value_taken.swap(true, Ordering::AcqRel) {
+                            let val = ManuallyDrop::take(&mut (*cur_head).value);
+                            guard.defer(move || drop(val));
                         }
-                    });
+                    } else {
+                        let to_drop = cur_head as usize;
+                        guard.defer(move || {
+                            let mut n = Box::from_raw(to_drop as *mut VersionNode<V>);
+                            if !n.value_taken.swap(true, Ordering::AcqRel) {
+                                ManuallyDrop::drop(&mut n.value);
+                            }
+                        });
+                    }
                     return false;
                 }
                 Err(actual) => cur_head = actual,
@@ -1367,13 +1382,21 @@ unsafe fn insert_version_into_leaf<K: AsBytes + Send + 'static, V: Send + Clone 
                         Ordering::Acquire,
                     ) {
                         Ok(_) => {
-                            let to_drop = next as usize;
-                            guard.defer(move || {
-                                let mut n = Box::from_raw(to_drop as *mut VersionNode<V>);
-                                if !n.value_taken.load(Ordering::Acquire) {
-                                    ManuallyDrop::drop(&mut n.value);
+                            let old_node = &*next;
+                            if old_node.is_inline {
+                                if !old_node.value_taken.swap(true, Ordering::AcqRel) {
+                                    let val = ManuallyDrop::take(&mut (*next).value);
+                                    guard.defer(move || drop(val));
                                 }
-                            });
+                            } else {
+                                let to_drop = next as usize;
+                                guard.defer(move || {
+                                    let mut n = Box::from_raw(to_drop as *mut VersionNode<V>);
+                                    if !n.value_taken.swap(true, Ordering::AcqRel) {
+                                        ManuallyDrop::drop(&mut n.value);
+                                    }
+                                });
+                            }
                             return false;
                         }
                         Err(_) => {
@@ -1395,12 +1418,28 @@ unsafe fn drop_versioned_leaf<K: AsBytes + Send + 'static, V: Send + Clone + 'st
     let mut cur = (*leaf_ptr).versions.load(Ordering::Relaxed);
     while !cur.is_null() {
         let next = (*cur).next_version.load(Ordering::Relaxed);
-        let mut node = Box::from_raw(cur);
-        if !node.value_taken.load(Ordering::Acquire) {
-            ManuallyDrop::drop(&mut node.value);
+        if !(*cur).is_inline {
+            let mut node = Box::from_raw(cur);
+            if !node.value_taken.swap(true, Ordering::AcqRel) {
+                ManuallyDrop::drop(&mut node.value);
+            }
         }
         cur = next;
     }
+
+    // Ensure slot0 and slot1 are dropped if unlinked
+    let leaf = &mut *leaf_ptr;
+    let s0 = &mut *leaf.slot0.get();
+    if !s0.value_taken.swap(true, Ordering::AcqRel) {
+        ManuallyDrop::drop(&mut s0.value);
+    }
+    if leaf.slot1_used.load(Ordering::Acquire) {
+        let s1 = &mut *(*leaf.slot1.get()).as_mut_ptr();
+        if !s1.value_taken.swap(true, Ordering::AcqRel) {
+            ManuallyDrop::drop(&mut s1.value);
+        }
+    }
+
     drop(Box::from_raw(leaf_ptr));
 }
 
@@ -1413,13 +1452,20 @@ unsafe fn drop_version_chain<V: Send + 'static>(
         let node = &*cur;
         let next = node.next_version.load(Ordering::Acquire);
         if !node.removed.swap(true, Ordering::AcqRel) {
-            let to_drop = cur as usize;
-            guard.defer(move || {
-                let mut n = Box::from_raw(to_drop as *mut VersionNode<V>);
-                if !n.value_taken.load(Ordering::Acquire) {
-                    ManuallyDrop::drop(&mut n.value);
+            if node.is_inline {
+                if !node.value_taken.swap(true, Ordering::AcqRel) {
+                    let val = ManuallyDrop::take(&mut (*cur).value);
+                    guard.defer(move || drop(val));
                 }
-            });
+            } else {
+                let to_drop = cur as usize;
+                guard.defer(move || {
+                    let mut n = Box::from_raw(to_drop as *mut VersionNode<V>);
+                    if !n.value_taken.swap(true, Ordering::AcqRel) {
+                        ManuallyDrop::drop(&mut n.value);
+                    }
+                });
+            }
             count += 1;
         }
         cur = next;

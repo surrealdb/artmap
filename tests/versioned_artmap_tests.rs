@@ -232,3 +232,33 @@ fn test_versioned_artmap_concurrent_updates() {
         }
     }
 }
+
+#[test]
+fn test_versioned_artmap_inline_slots_lifecycle() {
+    let map = VersionedArtMap::<String, String>::new();
+
+    // Create: version 10 (stored in slot0 inline)
+    assert!(map.insert("k".to_string(), 10, "val10".to_string()));
+    assert_eq!(map.get_version_le("k", 10), Some((10, "val10".to_string())));
+    assert_eq!(map.version_count("k"), 1);
+
+    // Update 1: version 20 (stored in slot1 inline, 0 heap allocations)
+    assert!(map.insert("k".to_string(), 20, "val20".to_string()));
+    assert_eq!(map.get_version_le("k", 20), Some((20, "val20".to_string())));
+    assert_eq!(map.get_version_le("k", 15), Some((10, "val10".to_string())));
+    assert_eq!(map.version_count("k"), 2);
+
+    // Update 2: version 30 (spills to heap overflow)
+    assert!(map.insert("k".to_string(), 30, "val30".to_string()));
+    assert_eq!(map.get_version_le("k", 30), Some((30, "val30".to_string())));
+    assert_eq!(map.get_version_le("k", 25), Some((20, "val20".to_string())));
+    assert_eq!(map.get_version_le("k", 15), Some((10, "val10".to_string())));
+    assert_eq!(map.version_count("k"), 3);
+
+    // Prune versions older than 25 -> version 10 pruned
+    let pruned = map.prune_key("k", 25, |_| false);
+    assert_eq!(pruned, 1);
+    assert_eq!(map.get_version_le("k", 15), None);
+    assert_eq!(map.get_version_le("k", 25), Some((20, "val20".to_string())));
+    assert_eq!(map.get_version_le("k", 35), Some((30, "val30".to_string())));
+}

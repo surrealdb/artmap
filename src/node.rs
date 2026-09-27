@@ -16,7 +16,8 @@
 //!
 //! Implements `Node4`, `Node16`, `Node48`, and `Node256` layouts with prefix compression.
 
-use std::mem::ManuallyDrop;
+use std::cell::UnsafeCell;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
@@ -63,6 +64,8 @@ impl<K, V> Leaf<K, V> {
 pub struct VersionNode<V> {
     pub(crate) removed: AtomicBool,
     pub(crate) value_taken: AtomicBool,
+    pub(crate) is_inline: bool,
+    pub(crate) _pad: [u8; 5],
     pub version: u64,
     pub next_version: AtomicPtr<VersionNode<V>>,
     pub value: ManuallyDrop<V>,
@@ -74,28 +77,67 @@ impl<V> VersionNode<V> {
         Box::new(Self {
             removed: AtomicBool::new(false),
             value_taken: AtomicBool::new(false),
+            is_inline: false,
+            _pad: [0; 5],
             version,
             next_version: AtomicPtr::new(ptr::null_mut()),
             value: ManuallyDrop::new(value),
         })
     }
+
+    #[inline]
+    pub fn new_inline(version: u64, value: V) -> Self {
+        Self {
+            removed: AtomicBool::new(false),
+            value_taken: AtomicBool::new(false),
+            is_inline: true,
+            _pad: [0; 5],
+            version,
+            next_version: AtomicPtr::new(ptr::null_mut()),
+            value: ManuallyDrop::new(value),
+        }
+    }
 }
 
-/// A multi-version (MVCC) leaf anchor holding the key and a version chain.
+/// A multi-version (MVCC) leaf anchor holding the key, up to two inline versions, and overflow version chain.
 #[repr(C, align(8))]
 pub struct VersionedLeaf<K, V> {
     pub key: K,
+    pub slot0: UnsafeCell<VersionNode<V>>,
+    pub slot1: UnsafeCell<MaybeUninit<VersionNode<V>>>,
+    pub slot1_used: AtomicBool,
     pub versions: AtomicPtr<VersionNode<V>>,
 }
+
+unsafe impl<K: Send, V: Send> Send for VersionedLeaf<K, V> {}
+unsafe impl<K: Sync, V: Sync> Sync for VersionedLeaf<K, V> {}
 
 impl<K, V> VersionedLeaf<K, V> {
     #[inline]
     pub fn new(key: K, version: u64, value: V) -> Box<Self> {
-        let node = Box::into_raw(VersionNode::new(version, value));
-        Box::new(Self {
+        let leaf = Box::new(Self {
             key,
-            versions: AtomicPtr::new(node),
-        })
+            slot0: UnsafeCell::new(VersionNode::new_inline(version, value)),
+            slot1: UnsafeCell::new(MaybeUninit::uninit()),
+            slot1_used: AtomicBool::new(false),
+            versions: AtomicPtr::new(ptr::null_mut()),
+        });
+        let slot0_ptr = leaf.slot0.get();
+        leaf.versions.store(slot0_ptr, Ordering::Relaxed);
+        leaf
+    }
+
+    #[inline]
+    pub fn alloc_version_node(&self, version: u64, value: V) -> *mut VersionNode<V> {
+        if !self.slot1_used.swap(true, Ordering::AcqRel) {
+            let slot1_ptr = self.slot1.get();
+            unsafe {
+                (*slot1_ptr).write(VersionNode::new_inline(version, value));
+                slot1_ptr as *mut VersionNode<V>
+            }
+        } else {
+            Box::into_raw(VersionNode::new(version, value))
+        }
     }
 
     #[inline]
