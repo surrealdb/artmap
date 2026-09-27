@@ -126,20 +126,8 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
         }
     }
 
-    pub fn with_capacity(capacity: usize) -> Self {
-        if capacity >= 1024 {
-            let n256 = Node256::new(&[]);
-            let ptr = Box::into_raw(n256);
-            let tagged = TaggedPtr::from_inner(unsafe { &mut (*ptr).header });
-            Self {
-                root: AtomicPtr::new(tagged.as_raw()),
-                root_latch: HybridLatch::new(),
-                len: CachePadded(AtomicUsize::new(0)),
-                _marker: PhantomData,
-            }
-        } else {
-            Self::new()
-        }
+    pub fn with_capacity(_capacity: usize) -> Self {
+        Self::new()
     }
 
     #[inline]

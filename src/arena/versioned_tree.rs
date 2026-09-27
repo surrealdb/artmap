@@ -50,14 +50,8 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
     }
 
     /// Creates a new `ArenaVersionedTree` pre-sized for high-capacity ingestion.
-    pub fn with_capacity(arena: Arc<Arena>, capacity: usize) -> Self {
-        let tree = Self::new(arena);
-        if capacity >= 1024 {
-            if let Some(n256_off) = tree.alloc_node256(&[]) {
-                tree.root.store(TaggedOffset::from_inner(n256_off).raw(), Ordering::Release);
-            }
-        }
-        tree
+    pub fn with_capacity(arena: Arc<Arena>, _capacity: usize) -> Self {
+        Self::new(arena)
     }
 
     #[inline(always)]
