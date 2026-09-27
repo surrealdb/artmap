@@ -107,8 +107,24 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedArtMap<K, 
         V: Clone,
     {
         let guard = crossbeam_epoch::pin();
+        self.get_version_le_with_guard(key, max_version, &guard)
+    }
+
+    /// Looks up the newest version of `key` whose version is less than or equal to `max_version` using a pre-pinned [`Guard`](crossbeam_epoch::Guard).
+    #[inline]
+    pub fn get_version_le_with_guard<Q>(
+        &self,
+        key: &Q,
+        max_version: u64,
+        guard: &crossbeam_epoch::Guard,
+    ) -> Option<(u64, V)>
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+        V: Clone,
+    {
         self.tree
-            .get_version_le(key, max_version, &guard)
+            .get_version_le(key, max_version, guard)
             .map(|(ver, v)| (ver, v.clone()))
     }
 
@@ -127,7 +143,19 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedArtMap<K, 
     #[inline]
     pub fn insert(&self, key: K, version: u64, value: V) -> bool {
         let guard = crossbeam_epoch::pin();
-        self.tree.insert(key, version, value, &guard)
+        self.insert_with_guard(key, version, value, &guard)
+    }
+
+    /// Inserts a versioned key-value pair using a pre-pinned epoch [`Guard`](crossbeam_epoch::Guard).
+    #[inline]
+    pub fn insert_with_guard(
+        &self,
+        key: K,
+        version: u64,
+        value: V,
+        guard: &crossbeam_epoch::Guard,
+    ) -> bool {
+        self.tree.insert(key, version, value, guard)
     }
 
     /// Inserts a versioned key-value pair into the map (alias for `insert`).

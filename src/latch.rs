@@ -197,15 +197,15 @@ impl SpinBackoff {
 
     #[inline]
     pub fn spin(&mut self) {
-        if self.step <= 10 {
-            let spins = 1 << self.step.min(8);
+        if self.step <= 16 {
+            let spins = 1 << self.step.min(10);
             for _ in 0..spins {
                 std::hint::spin_loop();
             }
         } else {
             std::thread::yield_now();
         }
-        if self.step < 16 {
+        if self.step < 24 {
             self.step += 1;
         }
     }
