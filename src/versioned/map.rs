@@ -78,6 +78,12 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedArtMap<K, 
         self.get_latest(key).map(|(_, v)| v)
     }
 
+    /// Looks up a value by raw byte slice without converting to the owned key type.
+    #[inline]
+    pub fn get_by_slice(&self, key_bytes: &[u8]) -> Option<V> {
+        self.get_slice(key_bytes)
+    }
+
     /// Point lookup on raw byte slice returning the newest committed value, if present and not deleted.
     #[inline]
     pub fn get_slice(&self, key_bytes: &[u8]) -> Option<V>

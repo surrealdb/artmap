@@ -85,6 +85,12 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
         self.tree.get_latest(key_bytes).map(|(_, v)| v)
     }
 
+    /// Looks up a value by raw byte slice without converting to the owned key type.
+    #[inline]
+    pub fn get_by_slice(&self, key_bytes: &[u8]) -> Option<V> {
+        self.get_slice(key_bytes)
+    }
+
     /// Looks up the newest committed version and value for `key`.
     #[inline]
     pub fn get_latest<Q>(&self, key: &Q) -> Option<(u64, V)>
