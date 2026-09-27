@@ -117,7 +117,7 @@ fn bench_insert(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
+                let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
                 let start = Instant::now();
                 for key in 0..BATCH {
                     let k = key.to_be_bytes();
@@ -134,7 +134,7 @@ fn bench_insert(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
+                let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
                 let mut ins = artmap::arena::ArenaInserter::new();
                 let start = Instant::now();
                 for key in 0..BATCH {
@@ -152,7 +152,7 @@ fn bench_insert(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
+                let map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
                 let start = Instant::now();
                 for key in 0..BATCH {
                     let k = key.to_be_bytes();
@@ -169,7 +169,7 @@ fn bench_insert(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
+                let map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
                 let mut ins = ArenaInserter::new();
                 let start = Instant::now();
                 for key in 0..BATCH {
@@ -652,9 +652,9 @@ fn bench_get(c: &mut Criterion) {
 
     let art_map = ArtMap::<[u8; 8], u64>::new();
     let versioned_map = VersionedArtMap::<[u8; 8], u64>::new();
-    let arena_map = ArenaArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
-    let arena_versioned_map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
-    let sl_arena = SkiplistArena::with_capacity(32 * 1024 * 1024);
+    let arena_map = ArenaArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
+    let arena_versioned_map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
+    let sl_arena = SkiplistArena::with_capacity(64 * 1024 * 1024);
     let skiplist = SkipList::new(sl_arena);
     let skip_map = SkipMap::<[u8; 8], u64>::new();
     let mut btree = BTreeMap::new();
@@ -875,9 +875,9 @@ fn bench_scan(c: &mut Criterion) {
 
     let art_map = ArtMap::<[u8; 8], u64>::new();
     let versioned_map = VersionedArtMap::<[u8; 8], u64>::new();
-    let arena_map = ArenaArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
-    let arena_versioned_map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
-    let sl_arena = SkiplistArena::with_capacity(32 * 1024 * 1024);
+    let arena_map = ArenaArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
+    let arena_versioned_map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
+    let sl_arena = SkiplistArena::with_capacity(64 * 1024 * 1024);
     let skiplist = SkipList::new(sl_arena);
     let skip_map = SkipMap::<[u8; 8], u64>::new();
     let mut btree = BTreeMap::new();
