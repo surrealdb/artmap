@@ -17,10 +17,9 @@
 //! Provides bidirectional range scanning over MVCC versioned entries in a [`VersionedArtMap`](crate::versioned::VersionedArtMap).
 
 use crossbeam_epoch::Guard;
-use std::ops::Bound;
 use std::sync::atomic::Ordering;
 
-use crate::iter::{child_pos_for_byte, next_child_in_node};
+use crate::iter::{child_pos_for_byte, next_child_in_node, BoundKey};
 use crate::key::AsBytes;
 use crate::node::{
     next_present_byte, prev_present_byte, Node16, Node256, Node4, Node48, NodeHeader, NodeType,
@@ -48,8 +47,8 @@ impl CursorFrame {
 pub struct Range<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> {
     tree: &'a VersionedTree<K, V>,
     _guard: Guard,
-    start_bound: Bound<Vec<u8>>,
-    end_bound: Bound<Vec<u8>>,
+    start_bound: BoundKey,
+    end_bound: BoundKey,
     stack: [CursorFrame; MAX_STACK_DEPTH],
     stack_len: usize,
     stack_overflow: Vec<CursorFrame>,
@@ -61,8 +60,8 @@ pub struct Range<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> {
 impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Range<'a, K, V> {
     pub(crate) fn new(
         tree: &'a VersionedTree<K, V>,
-        start_bound: Bound<Vec<u8>>,
-        end_bound: Bound<Vec<u8>>,
+        start_bound: BoundKey,
+        end_bound: BoundKey,
     ) -> Self {
         let guard = crossbeam_epoch::pin();
         Self {
@@ -138,6 +137,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Range<'a, K, V>
         self.last_leaf_back.map(|p| unsafe { (*p).key.as_bytes() })
     }
 
+    #[inline]
     fn push_and_descend_left(&mut self, mut ptr: TaggedPtr) -> Option<*mut VersionedLeaf<K, V>> {
         while !ptr.is_null() {
             if ptr.is_leaf() {
@@ -212,6 +212,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Range<'a, K, V>
         }
     }
 
+    #[inline]
     fn advance_forward(&mut self) -> Option<*mut VersionedLeaf<K, V>> {
         while let Some(frame) = self.stack_last_mut() {
             let header = frame.node;
@@ -232,6 +233,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Range<'a, K, V>
 impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Iterator for Range<'a, K, V> {
     type Item = VersionedEntryRef<'a, K, V>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.exhausted {
             return None;
@@ -240,9 +242,11 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Iterator for Ra
         loop {
             let mut leaf_ptr = if self.last_leaf_front.is_none() {
                 let (search_key, include_equal) = match &self.start_bound {
-                    Bound::Included(k) => (k.as_slice(), true),
-                    Bound::Excluded(k) => (k.as_slice(), false),
-                    Bound::Unbounded => (&[][..], true),
+                    BoundKey::IncludedSmall(b, len) => (&b[..*len as usize], true),
+                    BoundKey::ExcludedSmall(b, len) => (&b[..*len as usize], false),
+                    BoundKey::IncludedHeap(b) => (b.as_ref(), true),
+                    BoundKey::ExcludedHeap(b) => (b.as_ref(), false),
+                    BoundKey::Unbounded => (&[][..], true),
                 };
 
                 let root_ptr = TaggedPtr::from_raw(self.tree.raw_root().as_raw());
@@ -326,19 +330,31 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Iterator for Ra
 
             // Check upper range bound
             match &self.end_bound {
-                Bound::Included(end_key) => {
-                    if k_bytes > end_key.as_slice() {
+                BoundKey::IncludedSmall(b, len) => {
+                    if k_bytes > &b[..*len as usize] {
                         self.exhausted = true;
                         return None;
                     }
                 }
-                Bound::Excluded(end_key) => {
-                    if k_bytes >= end_key.as_slice() {
+                BoundKey::ExcludedSmall(b, len) => {
+                    if k_bytes >= &b[..*len as usize] {
                         self.exhausted = true;
                         return None;
                     }
                 }
-                Bound::Unbounded => {}
+                BoundKey::IncludedHeap(b) => {
+                    if k_bytes > b.as_ref() {
+                        self.exhausted = true;
+                        return None;
+                    }
+                }
+                BoundKey::ExcludedHeap(b) => {
+                    if k_bytes >= b.as_ref() {
+                        self.exhausted = true;
+                        return None;
+                    }
+                }
+                BoundKey::Unbounded => {}
             }
 
             // Check overlap with backward cursor
@@ -364,6 +380,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Iterator for Ra
 impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> DoubleEndedIterator
     for Range<'a, K, V>
 {
+    #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.exhausted {
             return None;
@@ -374,9 +391,11 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> DoubleEndedIter
                 (back_k, false)
             } else {
                 match &self.end_bound {
-                    Bound::Included(k) => (k.as_slice(), true),
-                    Bound::Excluded(k) => (k.as_slice(), false),
-                    Bound::Unbounded => (&[0xFF; 64][..], true),
+                    BoundKey::IncludedSmall(b, len) => (&b[..*len as usize], true),
+                    BoundKey::ExcludedSmall(b, len) => (&b[..*len as usize], false),
+                    BoundKey::IncludedHeap(b) => (b.as_ref(), true),
+                    BoundKey::ExcludedHeap(b) => (b.as_ref(), false),
+                    BoundKey::Unbounded => (&[0xFF; 64][..], true),
                 }
             };
 
@@ -386,15 +405,31 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> DoubleEndedIter
 
             // Check lower range bound
             match &self.start_bound {
-                Bound::Included(start) if k_bytes < start.as_slice() => {
-                    self.exhausted = true;
-                    return None;
+                BoundKey::IncludedSmall(b, len) => {
+                    if k_bytes < &b[..*len as usize] {
+                        self.exhausted = true;
+                        return None;
+                    }
                 }
-                Bound::Excluded(start) if k_bytes <= start.as_slice() => {
-                    self.exhausted = true;
-                    return None;
+                BoundKey::ExcludedSmall(b, len) => {
+                    if k_bytes <= &b[..*len as usize] {
+                        self.exhausted = true;
+                        return None;
+                    }
                 }
-                _ => {}
+                BoundKey::IncludedHeap(b) => {
+                    if k_bytes < b.as_ref() {
+                        self.exhausted = true;
+                        return None;
+                    }
+                }
+                BoundKey::ExcludedHeap(b) => {
+                    if k_bytes <= b.as_ref() {
+                        self.exhausted = true;
+                        return None;
+                    }
+                }
+                BoundKey::Unbounded => {}
             }
 
             // Check overlap with forward cursor
