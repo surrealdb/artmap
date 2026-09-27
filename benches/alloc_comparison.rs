@@ -14,8 +14,14 @@
 
 use artmap::arena::ArenaArtMap;
 use artmap::ArtMap;
+use concread::bptree::BptreeMap;
 use crossbeam_skiplist::SkipMap;
+use dashmap::DashMap;
+use papaya::HashMap as PapayaMap;
+use scc::{HashIndex, TreeIndex};
 use std::collections::{BTreeMap, HashMap};
+use vart::art::Tree as VartTree;
+use vart::FixedSizeKey;
 
 #[global_allocator]
 static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
@@ -118,6 +124,81 @@ fn alloc_imbl_ordmap_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
 
     bencher.counter(count).bench_local(|| {
         map.insert(key, key);
+        key += 1;
+    });
+}
+
+#[divan::bench(args = COUNTS)]
+fn alloc_dashmap_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
+    let map = DashMap::<[u8; 8], usize>::new();
+    let mut key = 0usize;
+
+    bencher.counter(count).bench_local(|| {
+        let k = (key as u64).to_be_bytes();
+        map.insert(k, key);
+        key += 1;
+    });
+}
+
+#[divan::bench(args = COUNTS)]
+fn alloc_papaya_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
+    let map = PapayaMap::<[u8; 8], usize>::new();
+    let pin = map.pin();
+    let mut key = 0usize;
+
+    bencher.counter(count).bench_local(|| {
+        let k = (key as u64).to_be_bytes();
+        pin.insert(k, key);
+        key += 1;
+    });
+}
+
+#[divan::bench(args = COUNTS)]
+fn alloc_scc_tree_index_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
+    let map = TreeIndex::<[u8; 8], usize>::new();
+    let mut key = 0usize;
+
+    bencher.counter(count).bench_local(|| {
+        let k = (key as u64).to_be_bytes();
+        let _ = map.insert_sync(k, key);
+        key += 1;
+    });
+}
+
+#[divan::bench(args = COUNTS)]
+fn alloc_scc_hash_index_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
+    let map = HashIndex::<[u8; 8], usize>::new();
+    let mut key = 0usize;
+
+    bencher.counter(count).bench_local(|| {
+        let k = (key as u64).to_be_bytes();
+        let _ = map.insert_sync(k, key);
+        key += 1;
+    });
+}
+
+#[divan::bench(args = COUNTS)]
+fn alloc_concread_bptree_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
+    let map = BptreeMap::<[u8; 8], usize>::new();
+    let mut key = 0usize;
+
+    bencher.counter(count).bench_local(|| {
+        let mut w = map.write();
+        let k = (key as u64).to_be_bytes();
+        w.insert(k, key);
+        w.commit();
+        key += 1;
+    });
+}
+
+#[divan::bench(args = COUNTS)]
+fn alloc_vart_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
+    let mut map = VartTree::<FixedSizeKey<16>, usize>::new();
+    let mut key = 0usize;
+
+    bencher.counter(count).bench_local(|| {
+        let k: FixedSizeKey<16> = (key as u64).into();
+        let _ = map.insert_unchecked(&k, key, 1, 0);
         key += 1;
     });
 }
