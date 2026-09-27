@@ -619,6 +619,17 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                         continue 'retry;
                     }
 
+                    let parent_valid = match parent {
+                        Some(p) => unsafe {
+                            !(*p).latch.is_obsolete() && find_child(&*p, parent_byte) == Some(current)
+                        },
+                        None => self.root.load(Ordering::Acquire) == current.as_raw(),
+                    };
+                    if !parent_valid {
+                        header.latch.unlock();
+                        continue 'retry;
+                    }
+
                     if let Some(leaf_ptr) = header.load_exact_leaf::<K, V>(Ordering::Acquire) {
                         let existing_leaf = unsafe { &mut *leaf_ptr };
                         let mut new_leaf = unsafe { Box::from_raw(new_leaf_ptr) };
@@ -661,7 +672,14 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 )
                                 .is_ok()
                             {
-                                if header.latch.validate(v_header) {
+                                let parent_valid = match parent {
+                                    Some(p) => unsafe {
+                                        !(*p).latch.is_obsolete()
+                                            && find_child(&*p, parent_byte) == Some(current)
+                                    },
+                                    None => self.root.load(Ordering::Acquire) == current.as_raw(),
+                                };
+                                if header.latch.validate(v_header) && parent_valid {
                                     n256.header.num_children += 1;
                                     self.len.fetch_add(1, Ordering::Relaxed);
                                     if let Some(ref mut ins) = inserter {
@@ -759,6 +777,18 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 continue 'retry;
                             }
 
+                            let parent_valid = match parent {
+                                Some(p) => unsafe {
+                                    !(*p).latch.is_obsolete()
+                                        && find_child(&*p, parent_byte) == Some(current)
+                                },
+                                None => self.root.load(Ordering::Acquire) == current.as_raw(),
+                            };
+                            if !parent_valid {
+                                header.latch.unlock();
+                                continue 'retry;
+                            }
+
                             if is_node_full(header)
                                 || unsafe { find_child(header, next_byte) }.is_some()
                             {
@@ -788,6 +818,19 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             if header.latch.lock_version(v_header).is_err() {
                                 continue 'retry;
                             }
+
+                            let parent_valid = match parent {
+                                Some(p) => unsafe {
+                                    !(*p).latch.is_obsolete()
+                                        && find_child(&*p, parent_byte) == Some(current)
+                                },
+                                None => self.root.load(Ordering::Acquire) == current.as_raw(),
+                            };
+                            if !parent_valid {
+                                header.latch.unlock();
+                                continue 'retry;
+                            }
+
                             if unsafe { find_child(header, next_byte) } != Some(child) {
                                 header.latch.unlock();
                                 continue 'retry;
@@ -844,6 +887,9 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             }
                             return Ok((None, new_leaf_ptr));
                         } else {
+                            if !header.latch.validate(v_header) {
+                                continue 'retry;
+                            }
                             parent = Some(header);
                             parent_byte = next_byte;
                             current = child;

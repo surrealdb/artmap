@@ -555,6 +555,17 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                         continue 'retry;
                     }
 
+                    let parent_valid = match parent {
+                        Some(p) => unsafe {
+                            !(*p).latch.is_obsolete() && find_child(&*p, parent_byte) == Some(current)
+                        },
+                        None => self.root.load(Ordering::Acquire) == current.as_raw(),
+                    };
+                    if !parent_valid {
+                        header.latch.unlock();
+                        continue 'retry;
+                    }
+
                     if let Some(leaf_ptr) =
                         header.load_exact_versioned_leaf::<K, V>(Ordering::Acquire)
                     {
@@ -602,7 +613,14 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                                     )
                                     .is_ok()
                             {
-                                if header.latch.validate(v_header) {
+                                let parent_valid = match parent {
+                                    Some(p) => unsafe {
+                                        !(*p).latch.is_obsolete()
+                                            && find_child(&*p, parent_byte) == Some(current)
+                                    },
+                                    None => self.root.load(Ordering::Acquire) == current.as_raw(),
+                                };
+                                if header.latch.validate(v_header) && parent_valid {
                                     unsafe { (*(header as *mut NodeHeader)).num_children += 1 };
                                     self.len.fetch_add(1, Ordering::Relaxed);
                                     if let Some(ref mut ins) = inserter {
@@ -686,6 +704,18 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                                 continue 'retry;
                             }
 
+                            let parent_valid = match parent {
+                                Some(p) => unsafe {
+                                    !(*p).latch.is_obsolete()
+                                        && find_child(&*p, parent_byte) == Some(current)
+                                },
+                                None => self.root.load(Ordering::Acquire) == current.as_raw(),
+                            };
+                            if !parent_valid {
+                                header.latch.unlock();
+                                continue 'retry;
+                            }
+
                             if is_node_full(header)
                                 || unsafe { find_child(header, next_byte) }.is_some()
                             {
@@ -718,6 +748,19 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                             if header.latch.lock_version(v_header).is_err() {
                                 continue 'retry;
                             }
+
+                            let parent_valid = match parent {
+                                Some(p) => unsafe {
+                                    !(*p).latch.is_obsolete()
+                                        && find_child(&*p, parent_byte) == Some(current)
+                                },
+                                None => self.root.load(Ordering::Acquire) == current.as_raw(),
+                            };
+                            if !parent_valid {
+                                header.latch.unlock();
+                                continue 'retry;
+                            }
+
                             if unsafe { find_child(header, next_byte) } != Some(child) {
                                 header.latch.unlock();
                                 continue 'retry;
