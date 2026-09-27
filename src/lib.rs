@@ -46,7 +46,7 @@ pub use arena::{Arena, ArenaArtMap, ArenaInserter, ArenaVersionedArtMap};
 pub use entry::EntryRef;
 pub use iter::{Iter, Keys, Range, Values};
 pub use key::AsBytes;
-pub use tree::{Inserter, Tree};
+pub use tree::Tree;
 pub use versioned::{VersionedArtMap, VersionedEntryRef};
 
 /// A concurrent associative map backed by an Adaptive Radix Tree.
@@ -173,29 +173,10 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
         self.tree.insert(key, value, guard)
     }
 
-    /// Inserts a key-value pair using an [`Inserter`] cache to accelerate sequential or localized writes.
-    #[inline]
-    pub fn insert_with_inserter(&self, key: K, value: V, inserter: &mut Inserter) -> Option<V> {
-        let guard = &crossbeam_epoch::pin();
-        self.tree.insert_with_inserter(key, value, inserter, guard)
-    }
-
     /// Inserts a key-value pair using a pre-pinned epoch [`Guard`], avoiding per-operation pinning overhead.
     #[inline]
     pub fn insert_with_guard(&self, key: K, value: V, guard: &crossbeam_epoch::Guard) -> Option<V> {
         self.tree.insert(key, value, guard)
-    }
-
-    /// Inserts a key-value pair with both an [`Inserter`] and a pre-pinned epoch [`Guard`].
-    #[inline]
-    pub fn insert_with_inserter_and_guard(
-        &self,
-        key: K,
-        value: V,
-        inserter: &mut Inserter,
-        guard: &crossbeam_epoch::Guard,
-    ) -> Option<V> {
-        self.tree.insert_with_inserter(key, value, inserter, guard)
     }
 
     /// Inserts a key-value pair if the key is not present, returning an [`EntryRef`].

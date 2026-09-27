@@ -15,7 +15,7 @@
 use arenaskiplist::{Arena as SkiplistArena, SkipList};
 use artmap::arena::{ArenaArtMap, ArenaInserter, ArenaVersionedArtMap};
 use artmap::versioned::VersionedArtMap;
-use artmap::{ArtMap, Inserter};
+use artmap::ArtMap;
 use concread::bptree::BptreeMap;
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use crossbeam_skiplist::SkipMap;
@@ -59,24 +59,6 @@ fn bench_insert(c: &mut Criterion) {
         })
     });
 
-    // ArtMap with Inserter
-    group.bench_function("artmap_with_inserter", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                let map = ArtMap::<[u8; 8], u64>::new();
-                let mut ins = Inserter::new();
-                let start = Instant::now();
-                for key in 0..BATCH {
-                    let k = key.to_be_bytes();
-                    let _ = map.insert_with_inserter(k, key, &mut ins);
-                }
-                total += start.elapsed();
-            }
-            total
-        })
-    });
-
     // VersionedArtMap
     group.bench_function("versioned_artmap", |b| {
         b.iter_custom(|iters| {
@@ -87,24 +69,6 @@ fn bench_insert(c: &mut Criterion) {
                 for key in 0..BATCH {
                     let k = key.to_be_bytes();
                     let _ = map.insert(k, 1, key);
-                }
-                total += start.elapsed();
-            }
-            total
-        })
-    });
-
-    // VersionedArtMap with Inserter
-    group.bench_function("versioned_artmap_with_inserter", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                let map = VersionedArtMap::<[u8; 8], u64>::new();
-                let mut ins = Inserter::new();
-                let start = Instant::now();
-                for key in 0..BATCH {
-                    let k = key.to_be_bytes();
-                    let _ = map.insert_with_inserter(k, 1, key, &mut ins);
                 }
                 total += start.elapsed();
             }

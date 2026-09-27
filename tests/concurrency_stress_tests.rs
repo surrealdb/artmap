@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use artmap::arena::{Arena, ArenaArtMap, ArenaInserter, ArenaVersionedArtMap};
 use artmap::versioned::VersionedArtMap;
-use artmap::{ArtMap, Inserter};
+use artmap::ArtMap;
 
 // ============================================================================
 // 1. Concurrent Root Growth & Prefix Splits Stress Test
@@ -432,60 +432,6 @@ fn test_stress_arena_versioned_hot_key_updates() {
 // ============================================================================
 // 7. Inserter Cache Concurrency & Cache Invalidation Resilience
 // ============================================================================
-
-#[test]
-fn test_stress_inserter_concurrent_cache_resilience() {
-    let map = Arc::new(ArtMap::<[u8; 8], u64>::new());
-    const NUM_INSERTERS: usize = 8;
-    const NUM_MUTATORS: usize = 4;
-    const KEYS_PER_INSERTER: usize = 2_000;
-    let barrier = Arc::new(Barrier::new(NUM_INSERTERS + NUM_MUTATORS));
-
-    let mut handles = Vec::new();
-
-    // Sequential inserters using Inserter cache
-    for t in 0..NUM_INSERTERS {
-        let map = Arc::clone(&map);
-        let barrier = Arc::clone(&barrier);
-        handles.push(thread::spawn(move || {
-            barrier.wait();
-            let mut ins = Inserter::new();
-            let start = (t * KEYS_PER_INSERTER) as u64;
-            for i in 0..KEYS_PER_INSERTER as u64 {
-                let k = (start + i).to_be_bytes();
-                map.insert_with_inserter(k, start + i, &mut ins);
-            }
-        }));
-    }
-
-    // Concurrent mutators inserting across disjoint range to perturb parent nodes
-    for m in 0..NUM_MUTATORS {
-        let map = Arc::clone(&map);
-        let barrier = Arc::clone(&barrier);
-        handles.push(thread::spawn(move || {
-            barrier.wait();
-            for i in 0..1_000 {
-                let k = (0x8000_0000_0000_0000u64 | (m as u64) << 32 | (i as u64)).to_be_bytes();
-                map.insert(k, 0xDEAD);
-            }
-        }));
-    }
-
-    for h in handles {
-        h.join().unwrap();
-    }
-
-    // Verify all inserter keys are present
-    for t in 0..NUM_INSERTERS {
-        let start = (t * KEYS_PER_INSERTER) as u64;
-        for i in 0..KEYS_PER_INSERTER as u64 {
-            let k = (start + i).to_be_bytes();
-            assert_eq!(map.get(&k).as_deref(), Some(&(start + i)));
-        }
-    }
-
-    map.validate_invariants();
-}
 
 #[test]
 fn test_stress_arena_inserter_concurrent_cache_resilience() {

@@ -32,77 +32,6 @@ use crate::node::{
 /// An inserter cache optimizing sequential and localized inserts in [`ArtMap`](crate::ArtMap).
 ///
 /// By caching the parent inner node and depth from the previous insertion, subsequent
-/// keys that share the same parent node skip top-down tree traversal and insert directly
-/// in $O(1)$.
-#[derive(Clone, Copy, Debug)]
-pub struct Inserter {
-    pub(crate) last_parent: *mut NodeHeader,
-    pub(crate) last_parent_version: u64,
-    pub(crate) last_depth: usize,
-    pub(crate) last_prefix: [u8; 16],
-    pub(crate) last_prefix_len: usize,
-}
-
-impl Default for Inserter {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Inserter {
-    /// Creates a new `Inserter`.
-    pub const fn new() -> Self {
-        Self {
-            last_parent: ptr::null_mut(),
-            last_parent_version: 0,
-            last_depth: 0,
-            last_prefix: [0; 16],
-            last_prefix_len: 0,
-        }
-    }
-
-    /// Resets the cached insertion location.
-    pub fn reset(&mut self) {
-        self.last_parent = ptr::null_mut();
-        self.last_parent_version = 0;
-        self.last_depth = 0;
-        self.last_prefix_len = 0;
-    }
-
-    #[inline]
-    pub fn matches(&self, key_bytes: &[u8]) -> bool {
-        if self.last_parent.is_null() || self.last_depth == 0 || key_bytes.len() <= self.last_depth
-        {
-            return false;
-        }
-        if self.last_depth <= 16 {
-            key_bytes[..self.last_depth] == self.last_prefix[..self.last_depth]
-        } else {
-            false
-        }
-    }
-
-    #[inline]
-    pub fn update(
-        &mut self,
-        parent: *mut NodeHeader,
-        version: u64,
-        depth: usize,
-        key_bytes: &[u8],
-    ) {
-        self.last_parent = parent;
-        self.last_parent_version = version;
-        self.last_depth = depth;
-        if depth <= 16 {
-            self.last_prefix[..depth].copy_from_slice(&key_bytes[..depth]);
-            self.last_prefix_len = depth;
-        } else {
-            self.last_prefix_len = 0;
-        }
-    }
-}
-
 /// Internal concurrent tree structure.
 pub struct Tree<K, V> {
     root: AtomicPtr<u8>,
@@ -322,82 +251,9 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
         let new_leaf_ptr = Box::into_raw(new_leaf_box);
         let tagged_new_leaf = TaggedPtr::from_leaf(new_leaf_ptr);
         let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
-        self.insert_or_modify_with_leaf(new_leaf_ptr, tagged_new_leaf, key_bytes, true, None, guard)
+        self.insert_or_modify_with_leaf(new_leaf_ptr, tagged_new_leaf, key_bytes, true, guard)
             .map(|(old, _)| old)
             .unwrap_or(None)
-    }
-
-    /// Inserts a key-value pair using an [`Inserter`] cache to accelerate sequential or localized writes.
-    pub fn insert_with_inserter(
-        &self,
-        key: K,
-        value: V,
-        inserter: &mut Inserter,
-        guard: &Guard,
-    ) -> Option<V> {
-        let new_leaf_box = Leaf::new(key, value);
-        let new_leaf_ptr = Box::into_raw(new_leaf_box);
-        let tagged_new_leaf = TaggedPtr::from_leaf(new_leaf_ptr);
-        let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
-
-        // Fast path: check if cached parent node can absorb this key directly
-        if inserter.matches(key_bytes) {
-            let header = unsafe { &*inserter.last_parent };
-            let next_byte = key_bytes[inserter.last_depth];
-
-            if header.node_type == NodeType::Node256 {
-                let n256 = unsafe { &*(inserter.last_parent as *const Node256) };
-                if n256.children[next_byte as usize]
-                    .load(Ordering::Acquire)
-                    .is_null()
-                    && n256.children[next_byte as usize]
-                        .compare_exchange(
-                            ptr::null_mut(),
-                            tagged_new_leaf.as_raw(),
-                            Ordering::Release,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                {
-                    if header.latch.validate(inserter.last_parent_version) {
-                        unsafe { (*inserter.last_parent).num_children += 1 };
-                        self.len.fetch_add(1, Ordering::Relaxed);
-                        return None;
-                    } else {
-                        n256.children[next_byte as usize].store(ptr::null_mut(), Ordering::Release);
-                    }
-                }
-            } else if header
-                .latch
-                .lock_version(inserter.last_parent_version)
-                .is_ok()
-            {
-                let is_full = is_node_full(header);
-                let child = unsafe { find_child(header, next_byte) };
-                if !is_full && child.is_none() {
-                    unsafe {
-                        insert_child_into_node(inserter.last_parent, next_byte, tagged_new_leaf)
-                    };
-                    header.latch.unlock();
-                    self.len.fetch_add(1, Ordering::Relaxed);
-                    inserter.last_parent_version = header.latch.read_version().unwrap_or(0);
-                    return None;
-                }
-                header.latch.unlock();
-            }
-            inserter.reset();
-        }
-
-        self.insert_or_modify_with_leaf(
-            new_leaf_ptr,
-            tagged_new_leaf,
-            key_bytes,
-            true,
-            Some(inserter),
-            guard,
-        )
-        .map(|(old, _)| old)
-        .unwrap_or(None)
     }
 
     /// Inserts a key-value pair if absent, or returns a pointer to the existing leaf.
@@ -418,14 +274,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
         let tagged_new_leaf = TaggedPtr::from_leaf(new_leaf_ptr);
         let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
         let (_, leaf_ptr) = self
-            .insert_or_modify_with_leaf(
-                new_leaf_ptr,
-                tagged_new_leaf,
-                key_bytes,
-                false,
-                None,
-                guard,
-            )
+            .insert_or_modify_with_leaf(new_leaf_ptr, tagged_new_leaf, key_bytes, false, guard)
             .expect("insert_or_modify must return leaf pointer");
 
         leaf_ptr
@@ -437,7 +286,6 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
         tagged_new_leaf: TaggedPtr,
         key_bytes: &[u8],
         replace_if_present: bool,
-        mut inserter: Option<&mut Inserter>,
         guard: &Guard,
     ) -> Result<(Option<V>, *mut Leaf<K, V>), ()> {
         'retry: loop {
@@ -605,9 +453,6 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             self.root_latch.unlock();
                         }
                     }
-                    if let Some(ref mut ins) = inserter {
-                        ins.reset();
-                    }
                     return Ok((None, new_leaf_ptr));
                 }
 
@@ -683,14 +528,6 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 if header.latch.validate(v_header) && parent_valid {
                                     n256.header.num_children += 1;
                                     self.len.fetch_add(1, Ordering::Relaxed);
-                                    if let Some(ref mut ins) = inserter {
-                                        ins.update(
-                                            current.as_inner_ptr(),
-                                            v_header,
-                                            node_depth,
-                                            key_bytes,
-                                        );
-                                    }
                                     return Ok((None, new_leaf_ptr));
                                 } else {
                                     n256.children[next_byte as usize]
@@ -760,14 +597,6 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 }
                             }
                             self.len.fetch_add(1, Ordering::Relaxed);
-                            if let Some(ref mut ins) = inserter {
-                                ins.update(
-                                    new_node,
-                                    unsafe { (*new_node).latch.read_version().unwrap_or(0) },
-                                    node_depth,
-                                    key_bytes,
-                                );
-                            }
                             return Ok((None, new_leaf_ptr));
                         } else {
                             // Fast path: node has room. Lock header only (no parent or root latch)
@@ -798,14 +627,6 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 insert_child_into_node(header, next_byte, tagged_new_leaf);
                             }
                             header.latch.unlock();
-                            if let Some(ref mut ins) = inserter {
-                                ins.update(
-                                    current.as_inner_ptr(),
-                                    header.latch.read_version().unwrap_or(0),
-                                    node_depth,
-                                    key_bytes,
-                                );
-                            }
                         }
 
                         self.len.fetch_add(1, Ordering::Relaxed);
@@ -880,9 +701,6 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             unsafe { replace_child(header, next_byte, new_inner) };
                             self.len.fetch_add(1, Ordering::Relaxed);
                             header.latch.unlock();
-                            if let Some(ref mut ins) = inserter {
-                                ins.reset();
-                            }
                             return Ok((None, new_leaf_ptr));
                         } else {
                             if !header.latch.validate(v_header) {

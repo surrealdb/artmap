@@ -21,7 +21,6 @@ use std::borrow::Borrow;
 use std::ops::{Bound, RangeBounds};
 
 use crate::key::AsBytes;
-use crate::tree::Inserter;
 use crate::versioned::entry::VersionedEntryRef;
 use crate::versioned::iter::Range;
 use crate::versioned::tree::VersionedTree;
@@ -176,34 +175,6 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedArtMap<K, 
     #[inline]
     pub fn insert_versioned(&self, key: K, version: u64, value: V) -> bool {
         self.insert(key, version, value)
-    }
-
-    /// Inserts a versioned key-value pair using an [`Inserter`] cache to accelerate sequential or localized writes.
-    #[inline]
-    pub fn insert_with_inserter(
-        &self,
-        key: K,
-        version: u64,
-        value: V,
-        inserter: &mut Inserter,
-    ) -> bool {
-        let guard = crossbeam_epoch::pin();
-        self.tree
-            .insert_with_inserter(key, version, value, inserter, &guard)
-    }
-
-    /// Inserts a versioned key-value pair with both an [`Inserter`] and a pre-pinned epoch [`Guard`](crossbeam_epoch::Guard).
-    #[inline]
-    pub fn insert_with_inserter_and_guard(
-        &self,
-        key: K,
-        version: u64,
-        value: V,
-        inserter: &mut Inserter,
-        guard: &crossbeam_epoch::Guard,
-    ) -> bool {
-        self.tree
-            .insert_with_inserter(key, version, value, inserter, guard)
     }
 
     /// Marks the latest version of a key as removed, returning the removed value if present.
