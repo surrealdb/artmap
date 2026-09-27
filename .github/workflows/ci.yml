@@ -153,6 +153,7 @@ jobs:
           for seed in 1001 2002 3003 4004 5005; do
             echo "==> Running DST with seed ${seed}..."
             ARTMAP_SIM_SEED=${seed} cargo test --test sim -- --nocapture
+            ARTMAP_SIM_SEED=${seed} cargo test --test versioned_simulation_tests -- --nocapture
           done
 
   wasm-check:
@@ -225,3 +226,41 @@ jobs:
 
       - name: Check benchmarks compile
         run: cargo bench --no-run
+
+  loom:
+    name: Loom Concurrency Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next' }}
+
+      - name: Run Loom model checks
+        run: RUSTFLAGS="--cfg loom" cargo test --test loom_tests --release -- --nocapture
+
+  miri:
+    name: Miri Undefined Behavior Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Nightly Rust with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next' }}
+
+      - name: Run Miri on unsafe primitives
+        run: MIRIFLAGS="-Zmiri-permissive-provenance" cargo miri test --test unsafe_primitives_tests -- --skip concurrent
