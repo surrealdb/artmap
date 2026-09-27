@@ -7,7 +7,6 @@ license = "Apache-2.0"
 readme = "README.md"
 description = "A concurrent in-memory Adaptive Radix Tree (ART) featuring optimistic lock coupling."
 repository = "https://github.com/surrealdb/artmap"
-homepage = "https://github.com/surrealdb/artmap"
 documentation = "https://docs.rs/artmap"
 keywords = [
     "art",
