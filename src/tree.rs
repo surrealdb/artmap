@@ -282,14 +282,19 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
 
             // Case 0: Empty tree
             if root_ptr.is_null() {
-                let _ = self.root_latch.lock();
-                if self.root.load(Ordering::Relaxed).is_null() {
-                    self.root.store(tagged_new_leaf.as_raw(), Ordering::Release);
+                if self
+                    .root
+                    .compare_exchange(
+                        ptr::null_mut(),
+                        tagged_new_leaf.as_raw(),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
                     self.len.fetch_add(1, Ordering::Relaxed);
-                    self.root_latch.unlock();
                     return Ok((None, new_leaf_ptr));
                 }
-                self.root_latch.unlock();
                 continue 'retry;
             }
 
@@ -362,18 +367,15 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
 
                 // Prefix mismatch -> prefix split
                 if !is_full {
-                    let parent_ok = match parent {
-                        Some(p) => unsafe { (*p).latch.lock().is_ok() },
-                        None => self.root_latch.lock().is_ok(),
-                    };
-                    if !parent_ok {
-                        continue 'retry;
+                    if let Some(p) = parent {
+                        if unsafe { (*p).latch.lock().is_err() } {
+                            continue 'retry;
+                        }
                     }
 
                     if header.latch.lock_version(v_header).is_err() {
-                        match parent {
-                            Some(p) => unsafe { (*p).latch.unlock() },
-                            None => self.root_latch.unlock(),
+                        if let Some(p) = parent {
+                            unsafe { (*p).latch.unlock() };
                         }
                         continue 'retry;
                     }
@@ -384,9 +386,8 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                     };
                     if !parent_valid {
                         header.latch.unlock();
-                        match parent {
-                            Some(p) => unsafe { (*p).latch.unlock() },
-                            None => self.root_latch.unlock(),
+                        if let Some(p) = parent {
+                            unsafe { (*p).latch.unlock() };
                         }
                         continue 'retry;
                     }
@@ -424,15 +425,17 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                         TaggedPtr::from_inner(&mut unsafe { &mut *split_ptr }.header);
 
                     match parent {
-                        Some(p) => unsafe { replace_child(p, parent_byte, tagged_split) },
-                        None => self.root.store(tagged_split.as_raw(), Ordering::Release),
-                    }
-
-                    self.len.fetch_add(1, Ordering::Relaxed);
-                    header.latch.unlock();
-                    match parent {
-                        Some(p) => unsafe { (*p).latch.unlock() },
-                        None => self.root_latch.unlock(),
+                        Some(p) => {
+                            unsafe { replace_child(p, parent_byte, tagged_split) };
+                            self.len.fetch_add(1, Ordering::Relaxed);
+                            header.latch.unlock();
+                            unsafe { (*p).latch.unlock() };
+                        }
+                        None => {
+                            self.root.store(tagged_split.as_raw(), Ordering::Release);
+                            self.len.fetch_add(1, Ordering::Relaxed);
+                            header.latch.unlock();
+                        }
                     }
                     return Ok((None, new_leaf_ptr));
                 }
@@ -501,19 +504,16 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                         }
 
                         if is_node_full(header) {
-                            // Node needs to grow: lock parent and header
-                            let parent_ok = match parent {
-                                Some(p) => unsafe { (*p).latch.lock().is_ok() },
-                                None => self.root_latch.lock().is_ok(),
-                            };
-                            if !parent_ok {
-                                continue 'retry;
+                            // Node needs to grow
+                            if let Some(p) = parent {
+                                if unsafe { (*p).latch.lock().is_err() } {
+                                    continue 'retry;
+                                }
                             }
 
                             if header.latch.lock_version(v_header).is_err() {
-                                match parent {
-                                    Some(p) => unsafe { (*p).latch.unlock() },
-                                    None => self.root_latch.unlock(),
+                                if let Some(p) = parent {
+                                    unsafe { (*p).latch.unlock() };
                                 }
                                 continue 'retry;
                             }
@@ -524,18 +524,16 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             };
                             if !parent_valid {
                                 header.latch.unlock();
-                                match parent {
-                                    Some(p) => unsafe { (*p).latch.unlock() },
-                                    None => self.root_latch.unlock(),
+                                if let Some(p) = parent {
+                                    unsafe { (*p).latch.unlock() };
                                 }
                                 continue 'retry;
                             }
 
                             if unsafe { find_child(header, next_byte) }.is_some() {
                                 header.latch.unlock();
-                                match parent {
-                                    Some(p) => unsafe { (*p).latch.unlock() },
-                                    None => self.root_latch.unlock(),
+                                if let Some(p) = parent {
+                                    unsafe { (*p).latch.unlock() };
                                 }
                                 continue 'retry;
                             }
@@ -547,19 +545,18 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             let tagged_new_node = TaggedPtr::from_inner(new_node);
 
                             match parent {
-                                Some(p) => unsafe {
-                                    replace_child(p, parent_byte, tagged_new_node)
-                                },
+                                Some(p) => {
+                                    unsafe { replace_child(p, parent_byte, tagged_new_node) };
+                                    header.latch.mark_obsolete_and_unlock();
+                                    unsafe { (*p).latch.unlock() };
+                                }
                                 None => {
-                                    self.root.store(tagged_new_node.as_raw(), Ordering::Release)
+                                    self.root.store(tagged_new_node.as_raw(), Ordering::Release);
+                                    header.latch.mark_obsolete_and_unlock();
                                 }
                             }
-
-                            header.latch.mark_obsolete_and_unlock();
-                            match parent {
-                                Some(p) => unsafe { (*p).latch.unlock() },
-                                None => self.root_latch.unlock(),
-                            }
+                            self.len.fetch_add(1, Ordering::Relaxed);
+                            return Ok((None, new_leaf_ptr));
                         } else {
                             // Fast path: node has room. Lock header only (no parent or root latch)
                             if header.latch.lock_version(v_header).is_err() {

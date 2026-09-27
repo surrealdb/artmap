@@ -297,14 +297,19 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
 
             // Case 0: Empty tree
             if root_raw == 0 {
-                let _ = self.root_latch.lock();
-                if self.root.load(Ordering::Relaxed) == 0 {
-                    self.root.store(tagged_new_leaf.raw(), Ordering::Release);
+                if self
+                    .root
+                    .compare_exchange(
+                        0,
+                        tagged_new_leaf.raw(),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
                     self.len.fetch_add(1, Ordering::Relaxed);
-                    self.root_latch.unlock();
                     return true;
                 }
-                self.root_latch.unlock();
                 continue 'retry;
             }
 
@@ -389,18 +394,15 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
 
                 // Prefix mismatch -> prefix split
                 if !is_full {
-                    let parent_ok = match parent {
-                        Some(p) => unsafe { (*p).latch.lock().is_ok() },
-                        None => self.root_latch.lock().is_ok(),
-                    };
-                    if !parent_ok {
-                        continue 'retry;
+                    if let Some(p) = parent {
+                        if unsafe { (*p).latch.lock().is_err() } {
+                            continue 'retry;
+                        }
                     }
 
                     if header.latch.lock_version(v_header).is_err() {
-                        match parent {
-                            Some(p) => unsafe { (*p).latch.unlock() },
-                            None => self.root_latch.unlock(),
+                        if let Some(p) = parent {
+                            unsafe { (*p).latch.unlock() };
                         }
                         continue 'retry;
                     }
@@ -411,9 +413,8 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                     };
                     if !parent_valid {
                         header.latch.unlock();
-                        match parent {
-                            Some(p) => unsafe { (*p).latch.unlock() },
-                            None => self.root_latch.unlock(),
+                        if let Some(p) = parent {
+                            unsafe { (*p).latch.unlock() };
                         }
                         continue 'retry;
                     }
@@ -427,9 +428,8 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
 
                     let Some(split_node_off) = self.alloc_node4(&cur_prefix[..matched]) else {
                         header.latch.unlock();
-                        match parent {
-                            Some(p) => unsafe { (*p).latch.unlock() },
-                            None => self.root_latch.unlock(),
+                        if let Some(p) = parent {
+                            unsafe { (*p).latch.unlock() };
                         }
                         return false;
                     };
@@ -461,16 +461,18 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                         let tagged_split = TaggedOffset::from_inner(split_node_off);
 
                         match parent {
-                            Some(p) => self.replace_child(p, parent_byte, tagged_split),
-                            None => self.root.store(tagged_split.raw(), Ordering::Release),
+                            Some(p) => {
+                                self.replace_child(p, parent_byte, tagged_split);
+                                header.latch.unlock();
+                                (*p).latch.unlock();
+                            }
+                            None => {
+                                self.root.store(tagged_split.raw(), Ordering::Release);
+                                header.latch.unlock();
+                            }
                         }
 
                         self.len.fetch_add(1, Ordering::Relaxed);
-                        header.latch.unlock();
-                        match parent {
-                            Some(p) => (*p).latch.unlock(),
-                            None => self.root_latch.unlock(),
-                        }
                     }
                     if let Some(ref mut ins) = inserter {
                         ins.reset();
@@ -569,19 +571,15 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                         }
 
                         if is_node_full(header) {
-                            // Node needs to grow: lock parent and header
-                            let parent_ok = match parent {
-                                Some(p) => unsafe { (*p).latch.lock().is_ok() },
-                                None => self.root_latch.lock().is_ok(),
-                            };
-                            if !parent_ok {
-                                continue 'retry;
+                            if let Some(p) = parent {
+                                if unsafe { (*p).latch.lock().is_err() } {
+                                    continue 'retry;
+                                }
                             }
 
                             if header.latch.lock_version(v_header).is_err() {
-                                match parent {
-                                    Some(p) => unsafe { (*p).latch.unlock() },
-                                    None => self.root_latch.unlock(),
+                                if let Some(p) = parent {
+                                    unsafe { (*p).latch.unlock() };
                                 }
                                 continue 'retry;
                             }
@@ -592,27 +590,24 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                             };
                             if !parent_valid {
                                 header.latch.unlock();
-                                match parent {
-                                    Some(p) => unsafe { (*p).latch.unlock() },
-                                    None => self.root_latch.unlock(),
+                                if let Some(p) = parent {
+                                    unsafe { (*p).latch.unlock() };
                                 }
                                 continue 'retry;
                             }
 
                             if unsafe { find_child(header_ptr, next_byte) }.is_some() {
                                 header.latch.unlock();
-                                match parent {
-                                    Some(p) => unsafe { (*p).latch.unlock() },
-                                    None => self.root_latch.unlock(),
+                                if let Some(p) = parent {
+                                    unsafe { (*p).latch.unlock() };
                                 }
                                 continue 'retry;
                             }
 
                             let Some(new_node_off) = (unsafe { self.grow_node(header_ptr) }) else {
                                 header.latch.unlock();
-                                match parent {
-                                    Some(p) => unsafe { (*p).latch.unlock() },
-                                    None => self.root_latch.unlock(),
+                                if let Some(p) = parent {
+                                    unsafe { (*p).latch.unlock() };
                                 }
                                 return false;
                             };
@@ -629,15 +624,14 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
 
                             match parent {
                                 Some(p) => unsafe {
-                                    self.replace_child(p, parent_byte, tagged_new_node)
+                                    self.replace_child(p, parent_byte, tagged_new_node);
+                                    header.latch.mark_obsolete_and_unlock();
+                                    (*p).latch.unlock();
                                 },
-                                None => self.root.store(tagged_new_node.raw(), Ordering::Release),
-                            }
-
-                            header.latch.mark_obsolete_and_unlock();
-                            match parent {
-                                Some(p) => unsafe { (*p).latch.unlock() },
-                                None => self.root_latch.unlock(),
+                                None => {
+                                    self.root.store(tagged_new_node.raw(), Ordering::Release);
+                                    header.latch.mark_obsolete_and_unlock();
+                                }
                             }
                             self.len.fetch_add(1, Ordering::Relaxed);
                             if let Some(ref mut ins) = inserter {
