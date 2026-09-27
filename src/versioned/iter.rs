@@ -339,7 +339,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Iterator for Ra
 
             self.set_cursor_front(k_bytes);
 
-            if !leaf.removed.load(Ordering::Acquire) {
+            if !leaf.is_removed() {
                 return Some(VersionedEntryRef {
                     leaf_ptr,
                     _marker: std::marker::PhantomData,
@@ -393,7 +393,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> DoubleEndedIter
 
             self.set_cursor_back(k_bytes);
 
-            if !leaf.removed.load(Ordering::Acquire) {
+            if !leaf.is_removed() {
                 return Some(VersionedEntryRef {
                     leaf_ptr,
                     _marker: std::marker::PhantomData,

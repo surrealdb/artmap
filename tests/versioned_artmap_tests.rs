@@ -183,3 +183,52 @@ fn test_versioned_artmap_pruning() {
     assert_eq!(map.len(), 0);
     assert_eq!(map.get("account:1"), None);
 }
+
+#[test]
+fn test_versioned_artmap_concurrent_updates() {
+    let map = Arc::new(VersionedArtMap::<String, usize>::new());
+    const NUM_KEYS: usize = 50;
+    const UPDATES_PER_KEY: usize = 200;
+    const NUM_THREADS: usize = 8;
+
+    // Pre-populate keys with version 0
+    for k in 0..NUM_KEYS {
+        map.insert(format!("key:{k:03}"), 0, 0);
+    }
+    assert_eq!(map.len(), NUM_KEYS);
+
+    let barrier = Arc::new(Barrier::new(NUM_THREADS));
+    let mut handles = Vec::new();
+
+    for t in 0..NUM_THREADS {
+        let map = Arc::clone(&map);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for u in 1..=UPDATES_PER_KEY {
+                let ver = (u * NUM_THREADS + t) as u64;
+                let k = u % NUM_KEYS;
+                map.insert(format!("key:{k:03}"), ver, t * 1000 + u);
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert_eq!(map.len(), NUM_KEYS);
+
+    // Verify all keys have versions in strictly descending order
+    for k in 0..NUM_KEYS {
+        let key_str = format!("key:{k:03}");
+        let versions = map.get_all_versions(&key_str);
+        assert!(!versions.is_empty());
+        for i in 1..versions.len() {
+            assert!(
+                versions[i - 1].0 > versions[i].0,
+                "versions must be strictly descending"
+            );
+        }
+    }
+}

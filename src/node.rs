@@ -58,28 +58,54 @@ impl<K, V> Leaf<K, V> {
     }
 }
 
-/// A multi-version (MVCC) leaf node holding a version chain.
+/// A version entry in an MVCC version chain.
 #[repr(C, align(8))]
-pub struct VersionedLeaf<K, V> {
+pub struct VersionNode<V> {
     pub(crate) removed: AtomicBool,
     pub(crate) value_taken: AtomicBool,
     pub version: u64,
-    pub next_version: AtomicPtr<VersionedLeaf<K, V>>,
-    pub key: K,
+    pub next_version: AtomicPtr<VersionNode<V>>,
     pub value: ManuallyDrop<V>,
 }
 
-impl<K, V> VersionedLeaf<K, V> {
+impl<V> VersionNode<V> {
     #[inline]
-    pub fn new(key: K, version: u64, value: V) -> Box<Self> {
+    pub fn new(version: u64, value: V) -> Box<Self> {
         Box::new(Self {
             removed: AtomicBool::new(false),
             value_taken: AtomicBool::new(false),
             version,
             next_version: AtomicPtr::new(ptr::null_mut()),
-            key,
             value: ManuallyDrop::new(value),
         })
+    }
+}
+
+/// A multi-version (MVCC) leaf anchor holding the key and a version chain.
+#[repr(C, align(8))]
+pub struct VersionedLeaf<K, V> {
+    pub key: K,
+    pub versions: AtomicPtr<VersionNode<V>>,
+}
+
+impl<K, V> VersionedLeaf<K, V> {
+    #[inline]
+    pub fn new(key: K, version: u64, value: V) -> Box<Self> {
+        let node = Box::into_raw(VersionNode::new(version, value));
+        Box::new(Self {
+            key,
+            versions: AtomicPtr::new(node),
+        })
+    }
+
+    #[inline]
+    pub fn is_removed(&self) -> bool {
+        let head = self.versions.load(Ordering::Acquire);
+        if head.is_null() {
+            true
+        } else {
+            unsafe { (*head).removed.load(Ordering::Acquire) }
+        }
     }
 }
 
