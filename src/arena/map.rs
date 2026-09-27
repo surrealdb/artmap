@@ -27,11 +27,20 @@ use crate::key::AsBytes;
 /// By caching the parent inner node and depth from the previous insertion, subsequent
 /// keys that share the same parent node skip top-down tree traversal and insert directly
 /// in $O(1)$.
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct ArenaInserter {
     pub(crate) last_parent_offset: u32,
     pub(crate) last_parent_version: u64,
     pub(crate) last_depth: usize,
+    pub(crate) last_prefix: [u8; 16],
+    pub(crate) last_prefix_len: usize,
+}
+
+impl Default for ArenaInserter {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ArenaInserter {
@@ -41,6 +50,8 @@ impl ArenaInserter {
             last_parent_offset: 0,
             last_parent_version: 0,
             last_depth: 0,
+            last_prefix: [0; 16],
+            last_prefix_len: 0,
         }
     }
 
@@ -49,6 +60,32 @@ impl ArenaInserter {
         self.last_parent_offset = 0;
         self.last_parent_version = 0;
         self.last_depth = 0;
+        self.last_prefix_len = 0;
+    }
+
+    #[inline]
+    pub fn matches(&self, key_bytes: &[u8]) -> bool {
+        if self.last_parent_offset == 0 || self.last_depth == 0 || key_bytes.len() <= self.last_depth {
+            return false;
+        }
+        if self.last_depth <= 16 {
+            key_bytes[..self.last_depth] == self.last_prefix[..self.last_depth]
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    pub fn update(&mut self, offset: u32, version: u64, depth: usize, key_bytes: &[u8]) {
+        self.last_parent_offset = offset;
+        self.last_parent_version = version;
+        self.last_depth = depth;
+        if depth <= 16 {
+            self.last_prefix[..depth].copy_from_slice(&key_bytes[..depth]);
+            self.last_prefix_len = depth;
+        } else {
+            self.last_prefix_len = 0;
+        }
     }
 }
 

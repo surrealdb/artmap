@@ -185,6 +185,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         depth: usize,
         include_equal: bool,
     ) -> Result<Option<*const Leaf<K, V>>, ()> {
+        if offset.is_null() {
+            return Ok(None);
+        }
         if offset.is_leaf() {
             let leaf_ptr = self.arena.get_pointer(offset.leaf_offset()) as *const Leaf<K, V>;
             let leaf = &*leaf_ptr;
@@ -399,6 +402,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         depth: usize,
         include_equal: bool,
     ) -> Result<Option<*const Leaf<K, V>>, ()> {
+        if offset.is_null() {
+            return Ok(None);
+        }
         if offset.is_leaf() {
             let leaf_ptr = self.arena.get_pointer(offset.leaf_offset()) as *const Leaf<K, V>;
             let leaf = &*leaf_ptr;
@@ -686,7 +692,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         let key_bytes = key.as_bytes();
 
         // Fast path: check if cached parent node can absorb this key directly
-        if inserter.last_parent_offset != 0 && key_bytes.len() > inserter.last_depth {
+        if inserter.matches(key_bytes) {
             let header_ptr =
                 self.arena.get_pointer_mut(inserter.last_parent_offset) as *mut NodeHeader;
             let header = unsafe { &mut *header_ptr };
@@ -1066,10 +1072,12 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                                     n256.header.inc_num_children();
                                     self.len.fetch_add(1, Ordering::Relaxed);
                                     if let Some(ref mut ins) = inserter {
-                                        ins.last_parent_offset = current.inner_offset();
-                                        ins.last_parent_version =
-                                            header.latch.read_version().unwrap_or(0);
-                                        ins.last_depth = depth;
+                                        ins.update(
+                                            current.inner_offset(),
+                                            header.latch.read_version().unwrap_or(0),
+                                            node_depth,
+                                            key_bytes,
+                                        );
                                     }
                                     return None;
                                 } else {
@@ -1149,10 +1157,12 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             }
                             self.len.fetch_add(1, Ordering::Relaxed);
                             if let Some(ref mut ins) = inserter {
-                                ins.last_parent_offset = new_node_off;
-                                ins.last_parent_version =
-                                    unsafe { (*new_node_ptr).latch.read_version().unwrap_or(0) };
-                                ins.last_depth = node_depth;
+                                ins.update(
+                                    new_node_off,
+                                    unsafe { (*new_node_ptr).latch.read_version().unwrap_or(0) },
+                                    node_depth,
+                                    key_bytes,
+                                );
                             }
                             return None;
                         } else {
@@ -1186,9 +1196,12 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             header.latch.unlock();
                             self.len.fetch_add(1, Ordering::Relaxed);
                             if let Some(ref mut ins) = inserter {
-                                ins.last_parent_offset = current.inner_offset();
-                                ins.last_parent_version = header.latch.read_version().unwrap_or(0);
-                                ins.last_depth = node_depth;
+                                ins.update(
+                                    current.inner_offset(),
+                                    v_header,
+                                    node_depth,
+                                    key_bytes,
+                                );
                             }
                             return None;
                         }

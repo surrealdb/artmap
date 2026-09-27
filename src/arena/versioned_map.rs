@@ -107,6 +107,26 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
         self.tree.get_version_le(key.as_bytes(), max_version)
     }
 
+    /// Returns all versions stored for `key`, ordered from newest to oldest.
+    #[inline]
+    pub fn get_all_versions<Q>(&self, key: &Q) -> Vec<(u64, V)>
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        self.tree.get_all_versions(key.as_bytes())
+    }
+
+    /// Returns the number of versions stored for `key`.
+    #[inline]
+    pub fn version_count<Q>(&self, key: &Q) -> usize
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        self.tree.version_count(key.as_bytes())
+    }
+
     /// Checks if the key is present in the map with a non-deleted head version.
     #[inline]
     pub fn contains_key<Q>(&self, key: &Q) -> bool

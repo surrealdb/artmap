@@ -62,10 +62,10 @@ impl<K, V> Leaf<K, V> {
 /// A version entry in an MVCC version chain.
 #[repr(C, align(8))]
 pub struct VersionNode<V> {
-    pub(crate) removed: AtomicBool,
-    pub(crate) value_taken: AtomicBool,
-    pub(crate) is_inline: bool,
-    pub(crate) _pad: [u8; 5],
+    pub removed: AtomicBool,
+    pub value_taken: AtomicBool,
+    pub is_inline: bool,
+    pub _pad: [u8; 5],
     pub version: u64,
     pub next_version: AtomicPtr<VersionNode<V>>,
     pub value: ManuallyDrop<V>,
@@ -374,6 +374,16 @@ impl Node4 {
         self.children[count - 1].store(ptr::null_mut(), Ordering::Relaxed);
         self.header.num_children -= 1;
         Some(old)
+    }
+
+    pub fn replace_child(&mut self, key: u8, child: TaggedPtr) {
+        let count = self.header.num_children as usize;
+        for i in 0..count {
+            if self.keys[i] == key {
+                self.children[i].store(child.as_raw(), Ordering::Release);
+                return;
+            }
+        }
     }
 }
 

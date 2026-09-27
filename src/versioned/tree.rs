@@ -920,6 +920,9 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
         depth: usize,
         include_equal: bool,
     ) -> Result<Option<*mut VersionedLeaf<K, V>>, ()> {
+        if ptr.is_null() {
+            return Ok(None);
+        }
         if ptr.is_leaf() {
             let leaf = &*ptr.as_versioned_leaf_ptr::<K, V>();
             let k = leaf.key.as_bytes();
@@ -1019,6 +1022,9 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
         depth: usize,
         include_equal: bool,
     ) -> Result<Option<*mut VersionedLeaf<K, V>>, ()> {
+        if ptr.is_null() {
+            return Ok(None);
+        }
         if ptr.is_leaf() {
             let leaf = &*ptr.as_versioned_leaf_ptr::<K, V>();
             let k = leaf.key.as_bytes();
