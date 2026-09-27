@@ -695,9 +695,6 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 } else {
                                     n256.children[next_byte as usize]
                                         .store(ptr::null_mut(), Ordering::Release);
-                                    if !header.latch.is_obsolete() {
-                                        continue 'traverse;
-                                    }
                                     continue 'retry;
                                 }
                             }
