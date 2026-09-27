@@ -72,7 +72,8 @@ impl Inserter {
 
     #[inline]
     pub fn matches(&self, key_bytes: &[u8]) -> bool {
-        if self.last_parent.is_null() || self.last_depth == 0 || key_bytes.len() <= self.last_depth {
+        if self.last_parent.is_null() || self.last_depth == 0 || key_bytes.len() <= self.last_depth
+        {
             return false;
         }
         if self.last_depth <= 16 {
@@ -83,7 +84,13 @@ impl Inserter {
     }
 
     #[inline]
-    pub fn update(&mut self, parent: *mut NodeHeader, version: u64, depth: usize, key_bytes: &[u8]) {
+    pub fn update(
+        &mut self,
+        parent: *mut NodeHeader,
+        version: u64,
+        depth: usize,
+        key_bytes: &[u8],
+    ) {
         self.last_parent = parent;
         self.last_parent_version = version;
         self.last_depth = depth;
@@ -315,16 +322,9 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
         let new_leaf_ptr = Box::into_raw(new_leaf_box);
         let tagged_new_leaf = TaggedPtr::from_leaf(new_leaf_ptr);
         let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
-        self.insert_or_modify_with_leaf(
-            new_leaf_ptr,
-            tagged_new_leaf,
-            key_bytes,
-            true,
-            None,
-            guard,
-        )
-        .map(|(old, _)| old)
-        .unwrap_or(None)
+        self.insert_or_modify_with_leaf(new_leaf_ptr, tagged_new_leaf, key_bytes, true, None, guard)
+            .map(|(old, _)| old)
+            .unwrap_or(None)
     }
 
     /// Inserts a key-value pair using an [`Inserter`] cache to accelerate sequential or localized writes.
@@ -347,8 +347,10 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
 
             if header.node_type == NodeType::Node256 {
                 let n256 = unsafe { &*(inserter.last_parent as *const Node256) };
-                if n256.children[next_byte as usize].load(Ordering::Acquire).is_null() {
-                    if n256.children[next_byte as usize]
+                if n256.children[next_byte as usize]
+                    .load(Ordering::Acquire)
+                    .is_null()
+                    && n256.children[next_byte as usize]
                         .compare_exchange(
                             ptr::null_mut(),
                             tagged_new_leaf.as_raw(),
@@ -356,18 +358,20 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             Ordering::Acquire,
                         )
                         .is_ok()
-                    {
-                        if header.latch.validate(inserter.last_parent_version) {
-                            unsafe { (*inserter.last_parent).num_children += 1 };
-                            self.len.fetch_add(1, Ordering::Relaxed);
-                            return None;
-                        } else {
-                            n256.children[next_byte as usize]
-                                .store(ptr::null_mut(), Ordering::Release);
-                        }
+                {
+                    if header.latch.validate(inserter.last_parent_version) {
+                        unsafe { (*inserter.last_parent).num_children += 1 };
+                        self.len.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    } else {
+                        n256.children[next_byte as usize].store(ptr::null_mut(), Ordering::Release);
                     }
                 }
-            } else if header.latch.lock_version(inserter.last_parent_version).is_ok() {
+            } else if header
+                .latch
+                .lock_version(inserter.last_parent_version)
+                .is_ok()
+            {
                 let is_full = is_node_full(header);
                 let child = unsafe { find_child(header, next_byte) };
                 if !is_full && child.is_none() {
@@ -436,7 +440,6 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
         mut inserter: Option<&mut Inserter>,
         guard: &Guard,
     ) -> Result<(Option<V>, *mut Leaf<K, V>), ()> {
-
         'retry: loop {
             let root_ptr = TaggedPtr::from_raw(self.root.load(Ordering::Acquire));
 
@@ -946,10 +949,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                     continue 'retry;
                 }
 
-                let child = match next_child {
-                    Some(c) => c,
-                    None => return None,
-                };
+                let child = next_child?;
 
                 if child.is_leaf() {
                     if header.latch.lock_version(v_header).is_err() {

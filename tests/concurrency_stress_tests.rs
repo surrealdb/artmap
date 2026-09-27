@@ -152,7 +152,11 @@ fn test_stress_concurrent_writes_reads_and_pruning() {
             let mut v = 10u64 + w_id as u64;
             while running.load(Ordering::Relaxed) {
                 let k = (v as usize) % NUM_KEYS;
-                let val = if v % 10 == 0 { None } else { Some(v as usize) };
+                let val = if v.is_multiple_of(10) {
+                    None
+                } else {
+                    Some(v as usize)
+                };
                 map.insert(format!("account:{k:03}"), v, val);
                 v += NUM_WRITERS as u64;
                 if v > 100_000 {
@@ -231,8 +235,8 @@ fn test_stress_deep_prefix_compression_branches() {
                 for &plen in &prefix_lengths {
                     for i in 0..KEYS_PER_PREFIX {
                         let mut key = vec![b'P'; plen];
-                        key.push((t * KEYS_PER_PREFIX + i) as u8);
-                        key.extend_from_slice(&(i as u32).to_be_bytes());
+                        let id = ((t * KEYS_PER_PREFIX + i) as u32).to_be_bytes();
+                        key.extend_from_slice(&id);
                         map.insert(key, t * KEYS_PER_PREFIX + i);
                     }
                 }
@@ -244,7 +248,10 @@ fn test_stress_deep_prefix_compression_branches() {
         h.join().unwrap();
     }
 
-    assert_eq!(map.len(), prefix_lengths.len() * KEYS_PER_PREFIX * NUM_THREADS);
+    assert_eq!(
+        map.len(),
+        prefix_lengths.len() * KEYS_PER_PREFIX * NUM_THREADS
+    );
     map.validate_invariants();
 }
 
@@ -302,7 +309,11 @@ fn test_stress_concurrent_range_scans_during_mutations() {
                 for entry in map.range("key:0100".."key:0900") {
                     if let Some(ref p) = prev_key {
                         if entry.key() <= p {
-                            panic!("range scan not ascending: current={:?} <= prev={:?}", entry.key(), p);
+                            panic!(
+                                "range scan not ascending: current={:?} <= prev={:?}",
+                                entry.key(),
+                                p
+                            );
                         }
                     }
                     prev_key = Some(entry.key().clone());

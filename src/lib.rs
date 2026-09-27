@@ -175,12 +175,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
 
     /// Inserts a key-value pair using an [`Inserter`] cache to accelerate sequential or localized writes.
     #[inline]
-    pub fn insert_with_inserter(
-        &self,
-        key: K,
-        value: V,
-        inserter: &mut Inserter,
-    ) -> Option<V> {
+    pub fn insert_with_inserter(&self, key: K, value: V, inserter: &mut Inserter) -> Option<V> {
         let guard = &crossbeam_epoch::pin();
         self.tree.insert_with_inserter(key, value, inserter, guard)
     }

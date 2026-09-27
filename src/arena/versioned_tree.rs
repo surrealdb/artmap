@@ -240,9 +240,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                 let Some(node_off) = self.alloc_version_node(version, value) else {
                     return false;
                 };
-                let was_removed = unsafe {
-                    self.insert_version_into_leaf(leaf_ptr, node_off)
-                };
+                let was_removed = unsafe { self.insert_version_into_leaf(leaf_ptr, node_off) };
                 if was_removed {
                     self.len.fetch_add(1, Ordering::Relaxed);
                 }
@@ -278,9 +276,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                 let Some(node_off) = self.alloc_version_node(version, value) else {
                     return false;
                 };
-                let was_removed = unsafe {
-                    self.insert_version_into_leaf(leaf_ptr, node_off)
-                };
+                let was_removed = unsafe { self.insert_version_into_leaf(leaf_ptr, node_off) };
                 if was_removed {
                     self.len.fetch_add(1, Ordering::Relaxed);
                 }
@@ -307,8 +303,8 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
 
             if header.node_type == NodeType::Node256 {
                 let n256 = unsafe { &*(header_ptr as *const Node256) };
-                if n256.children[next_byte as usize].load(Ordering::Acquire) == 0 {
-                    if n256.children[next_byte as usize]
+                if n256.children[next_byte as usize].load(Ordering::Acquire) == 0
+                    && n256.children[next_byte as usize]
                         .compare_exchange(
                             0,
                             tagged_new_leaf.raw(),
@@ -316,16 +312,15 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                             Ordering::Acquire,
                         )
                         .is_ok()
-                    {
-                        set_bitmap_bit(&n256.child_bitmap, next_byte);
-                        if header.latch.validate(inserter.last_parent_version) {
-                            n256.header.inc_num_children();
-                            self.len.fetch_add(1, Ordering::Relaxed);
-                            return true;
-                        } else {
-                            clear_bitmap_bit(&n256.child_bitmap, next_byte);
-                            n256.children[next_byte as usize].store(0, Ordering::Release);
-                        }
+                {
+                    set_bitmap_bit(&n256.child_bitmap, next_byte);
+                    if header.latch.validate(inserter.last_parent_version) {
+                        n256.header.inc_num_children();
+                        self.len.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    } else {
+                        clear_bitmap_bit(&n256.child_bitmap, next_byte);
+                        n256.children[next_byte as usize].store(0, Ordering::Release);
                     }
                 }
             } else if header
@@ -444,12 +439,8 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                 if existing_leaf.key.as_bytes() == key_bytes {
                     let new_node_off =
                         unsafe { (*new_leaf_ptr).versions_offset.load(Ordering::Relaxed) };
-                    let was_removed = unsafe {
-                        self.insert_version_into_leaf(
-                            existing_leaf_ptr,
-                            new_node_off,
-                        )
-                    };
+                    let was_removed =
+                        unsafe { self.insert_version_into_leaf(existing_leaf_ptr, new_node_off) };
                     if was_removed {
                         self.len.fetch_add(1, Ordering::Relaxed);
                     }
@@ -581,7 +572,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                                 self.replace_child(p, parent_byte, tagged_split);
                                 header.latch.unlock();
                                 (*p).latch.unlock();
-                            },
+                            }
                             None => {
                                 self.root.store(tagged_split.raw(), Ordering::Release);
                                 header.latch.unlock();
@@ -624,14 +615,10 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                             as *const VersionedLeaf<K, V>;
                         let existing_leaf = unsafe { &*exact_leaf_ptr };
                         if existing_leaf.key.as_bytes() == key_bytes {
-                            let new_node_off = unsafe {
-                                (*new_leaf_ptr).versions_offset.load(Ordering::Relaxed)
-                            };
+                            let new_node_off =
+                                unsafe { (*new_leaf_ptr).versions_offset.load(Ordering::Relaxed) };
                             let was_removed = unsafe {
-                                self.insert_version_into_leaf(
-                                    exact_leaf_ptr,
-                                    new_node_off,
-                                )
+                                self.insert_version_into_leaf(exact_leaf_ptr, new_node_off)
                             };
                             if was_removed {
                                 self.len.fetch_add(1, Ordering::Relaxed);
@@ -842,10 +829,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                                     (*new_leaf_ptr).versions_offset.load(Ordering::Relaxed)
                                 };
                                 let was_removed = unsafe {
-                                    self.insert_version_into_leaf(
-                                        existing_leaf_ptr,
-                                        new_node_off,
-                                    )
+                                    self.insert_version_into_leaf(existing_leaf_ptr, new_node_off)
                                 };
                                 if was_removed {
                                     self.len.fetch_add(1, Ordering::Relaxed);
@@ -1553,7 +1537,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                     if head_node.removed.load(Ordering::Acquire) {
                         was_removed = true;
                     }
-                    new_node.next_version_offset.store(cur_head & !1, Ordering::Relaxed);
+                    new_node
+                        .next_version_offset
+                        .store(cur_head & !1, Ordering::Relaxed);
                     match versions_atomic.compare_exchange_weak(
                         cur_head,
                         clean_new,
@@ -1566,7 +1552,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                 } else if new_ver == head_node.version {
                     // Replace head with updated value for same version
                     let next = head_node.next_version_offset.load(Ordering::Acquire);
-                    new_node.next_version_offset.store(next & !1, Ordering::Relaxed);
+                    new_node
+                        .next_version_offset
+                        .store(next & !1, Ordering::Relaxed);
                     match versions_atomic.compare_exchange_weak(
                         cur_head,
                         clean_new,
@@ -1592,10 +1580,12 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                                 Err(_) => continue,
                             }
                         }
-                        let next_node = &*(self.arena.get_pointer(next_off & !1)
-                            as *const ArenaVersionNode<V>);
+                        let next_node =
+                            &*(self.arena.get_pointer(next_off & !1) as *const ArenaVersionNode<V>);
                         if next_node.version < new_ver {
-                            new_node.next_version_offset.store(next_off & !1, Ordering::Relaxed);
+                            new_node
+                                .next_version_offset
+                                .store(next_off & !1, Ordering::Relaxed);
                             match (*prev).next_version_offset.compare_exchange_weak(
                                 next_off,
                                 clean_new,
@@ -1608,7 +1598,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                         } else if next_node.version == new_ver {
                             // Replace duplicate middle version
                             let next_next = next_node.next_version_offset.load(Ordering::Acquire);
-                            new_node.next_version_offset.store(next_next & !1, Ordering::Relaxed);
+                            new_node
+                                .next_version_offset
+                                .store(next_next & !1, Ordering::Relaxed);
                             match (*prev).next_version_offset.compare_exchange_weak(
                                 next_off,
                                 clean_new,

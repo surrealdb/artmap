@@ -29,14 +29,12 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use artmap::arena::node::{
-    clear_bitmap_bit, next_present_byte, prev_present_byte, set_bitmap_bit,
-    TaggedOffset,
+    clear_bitmap_bit, next_present_byte, prev_present_byte, set_bitmap_bit, TaggedOffset,
 };
 use artmap::arena::Arena;
 use artmap::latch::{HybridLatch, LockError, SpinBackoff};
 use artmap::node::{
-    Leaf, Node256, Node4, Node48, NodeType, TaggedPtr, VersionNode,
-    VersionedLeaf, NODE48_EMPTY,
+    Leaf, Node256, Node4, Node48, NodeType, TaggedPtr, VersionNode, VersionedLeaf, NODE48_EMPTY,
 };
 use artmap::simd::find_child_node16;
 
@@ -124,8 +122,14 @@ fn test_latch_optimistic_validation_failure_on_concurrent_write() {
     writer_handle.join().unwrap();
 
     // Verify both successful and failed validations occurred under contention
-    assert!(successful_validations > 0, "must have observed stable reads");
-    assert!(failed_validations > 0, "must have observed invalidations during concurrent writes");
+    assert!(
+        successful_validations > 0,
+        "must have observed stable reads"
+    );
+    assert!(
+        failed_validations > 0,
+        "must have observed invalidations during concurrent writes"
+    );
 }
 
 #[test]
@@ -197,8 +201,8 @@ fn test_tagged_offset_invariants() {
 fn test_simd_find_child_node16_exhaustive() {
     // Array of 16 sorted unique keys
     let keys = [
-        0x05, 0x12, 0x24, 0x33, 0x48, 0x5a, 0x67, 0x7e,
-        0x89, 0x9f, 0xab, 0xb0, 0xcd, 0xde, 0xef, 0xfc,
+        0x05, 0x12, 0x24, 0x33, 0x48, 0x5a, 0x67, 0x7e, 0x89, 0x9f, 0xab, 0xb0, 0xcd, 0xde, 0xef,
+        0xfc,
     ];
 
     // Test every possible u8 value against varying counts of keys
@@ -363,7 +367,11 @@ fn test_version_node_value_taken_guard() {
     if !node.value_taken.swap(true, Ordering::AcqRel) {
         unsafe { ManuallyDrop::drop(&mut node.value) };
     }
-    assert_eq!(drop_counter.load(Ordering::SeqCst), 1, "must not double-drop value");
+    assert_eq!(
+        drop_counter.load(Ordering::SeqCst),
+        1,
+        "must not double-drop value"
+    );
 }
 
 #[test]
@@ -401,7 +409,9 @@ fn test_versioned_leaf_inline_slots_drop_safety() {
         // Link node3 -> node2 -> node1
         unsafe {
             (*node3).next_version.store(node2, Ordering::Relaxed);
-            (*node2).next_version.store(leaf.versions.load(Ordering::Relaxed), Ordering::Relaxed);
+            (*node2)
+                .next_version
+                .store(leaf.versions.load(Ordering::Relaxed), Ordering::Relaxed);
             leaf.versions.store(node3, Ordering::Release);
         }
 
@@ -490,6 +500,10 @@ fn test_arena_tlab_concurrent_allocations_non_overlapping() {
     // Verify written data
     for (off, expected_val) in all_allocs {
         let ptr = arena.get_pointer(off) as *const u64;
-        assert_eq!(unsafe { *ptr }, expected_val, "memory corruption detected in allocated slab");
+        assert_eq!(
+            unsafe { *ptr },
+            expected_val,
+            "memory corruption detected in allocated slab"
+        );
     }
 }

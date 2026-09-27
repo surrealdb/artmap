@@ -22,9 +22,7 @@ use std::sync::atomic::Ordering;
 
 use crate::entry::EntryRef;
 use crate::key::AsBytes;
-use crate::node::{
-    Leaf, Node16, Node256, Node4, Node48, NodeType, TaggedPtr, NODE48_EMPTY,
-};
+use crate::node::{Leaf, Node16, Node256, Node4, Node48, NodeType, TaggedPtr, NODE48_EMPTY};
 use crate::tree::Tree;
 
 const INLINE_KEY_BUF: usize = 64;

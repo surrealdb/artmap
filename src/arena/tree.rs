@@ -1196,12 +1196,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             header.latch.unlock();
                             self.len.fetch_add(1, Ordering::Relaxed);
                             if let Some(ref mut ins) = inserter {
-                                ins.update(
-                                    current.inner_offset(),
-                                    v_header,
-                                    node_depth,
-                                    key_bytes,
-                                );
+                                ins.update(current.inner_offset(), v_header, node_depth, key_bytes);
                             }
                             return None;
                         }

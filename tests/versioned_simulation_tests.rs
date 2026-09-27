@@ -70,7 +70,10 @@ impl VersionOracle {
         if let Some(pos) = chain.iter().position(|&(v, _)| v == version) {
             chain[pos] = (version, value);
         } else {
-            let pos = chain.iter().position(|&(v, _)| v < version).unwrap_or(chain.len());
+            let pos = chain
+                .iter()
+                .position(|&(v, _)| v < version)
+                .unwrap_or(chain.len());
             chain.insert(pos, (version, value));
         }
     }

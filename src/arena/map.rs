@@ -65,7 +65,10 @@ impl ArenaInserter {
 
     #[inline]
     pub fn matches(&self, key_bytes: &[u8]) -> bool {
-        if self.last_parent_offset == 0 || self.last_depth == 0 || key_bytes.len() <= self.last_depth {
+        if self.last_parent_offset == 0
+            || self.last_depth == 0
+            || key_bytes.len() <= self.last_depth
+        {
             return false;
         }
         if self.last_depth <= 16 {

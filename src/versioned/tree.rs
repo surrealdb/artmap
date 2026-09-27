@@ -1310,7 +1310,9 @@ unsafe fn insert_version_into_leaf<K: AsBytes + Send + 'static, V: Send + Clone 
     let mut was_removed = false;
     loop {
         if cur_head.is_null() {
-            (*new_node_ptr).next_version.store(ptr::null_mut(), Ordering::Relaxed);
+            (*new_node_ptr)
+                .next_version
+                .store(ptr::null_mut(), Ordering::Relaxed);
             match (*leaf_ptr).versions.compare_exchange_weak(
                 cur_head,
                 new_node_ptr,
@@ -1324,7 +1326,9 @@ unsafe fn insert_version_into_leaf<K: AsBytes + Send + 'static, V: Send + Clone 
             if (*cur_head).removed.load(Ordering::Acquire) {
                 was_removed = true;
             }
-            (*new_node_ptr).next_version.store(cur_head, Ordering::Relaxed);
+            (*new_node_ptr)
+                .next_version
+                .store(cur_head, Ordering::Relaxed);
             match (*leaf_ptr).versions.compare_exchange_weak(
                 cur_head,
                 new_node_ptr,
@@ -1386,7 +1390,9 @@ unsafe fn insert_version_into_leaf<K: AsBytes + Send + 'static, V: Send + Clone 
                 } else if (*next).version == new_ver {
                     // Replace matching middle version
                     let next_next = (*next).next_version.load(Ordering::Acquire);
-                    (*new_node_ptr).next_version.store(next_next, Ordering::Relaxed);
+                    (*new_node_ptr)
+                        .next_version
+                        .store(next_next, Ordering::Relaxed);
                     match (*prev).next_version.compare_exchange_weak(
                         next,
                         new_node_ptr,
