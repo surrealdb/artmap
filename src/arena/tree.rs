@@ -689,10 +689,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         value: V,
         inserter: &mut crate::arena::map::ArenaInserter,
     ) -> Option<V> {
-        let leaf_off = self.alloc_leaf(key, value).expect("arena full");
-        let new_leaf_ptr = self.arena.get_pointer_mut(leaf_off) as *mut Leaf<K, V>;
-        let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
-        let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
+        let key_bytes = key.as_bytes();
 
         // Fast path: check if cached parent node can absorb this key directly
         if inserter.last_parent_offset != 0 && key_bytes.len() > inserter.last_depth {
@@ -704,6 +701,8 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
             if header.node_type == NodeType::Node256 {
                 let n256 = unsafe { &*(header_ptr as *const Node256) };
                 if n256.children[next_byte as usize].load(Ordering::Acquire) == 0 {
+                    let leaf_off = self.alloc_leaf(key, value).expect("arena full");
+                    let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
                     if n256.children[next_byte as usize]
                         .compare_exchange(
                             0,
@@ -723,6 +722,14 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             n256.children[next_byte as usize].store(0, Ordering::Release);
                         }
                     }
+                    let new_leaf_ptr = self.arena.get_pointer_mut(leaf_off) as *mut Leaf<K, V>;
+                    let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
+                    return self.insert_internal_cached(
+                        key_bytes,
+                        new_leaf_ptr,
+                        tagged_new_leaf,
+                        Some(inserter),
+                    );
                 }
             } else if header
                 .latch
@@ -732,6 +739,8 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                 let is_full = is_node_full(header);
                 let child = unsafe { find_child(header_ptr, next_byte) };
                 if !is_full && child.is_none() {
+                    let leaf_off = self.alloc_leaf(key, value).expect("arena full");
+                    let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
                     unsafe { self.insert_child_into_node(header_ptr, next_byte, tagged_new_leaf) };
                     header.latch.unlock();
                     self.len.fetch_add(1, Ordering::Relaxed);
@@ -742,6 +751,11 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
             }
             inserter.reset();
         }
+
+        let leaf_off = self.alloc_leaf(key, value).expect("arena full");
+        let new_leaf_ptr = self.arena.get_pointer_mut(leaf_off) as *mut Leaf<K, V>;
+        let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
+        let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
 
         self.insert_internal_cached(key_bytes, new_leaf_ptr, tagged_new_leaf, Some(inserter))
     }
