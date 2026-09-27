@@ -21,7 +21,7 @@ use crate::arena::node::{
 };
 use crate::arena::Arena;
 use crate::key::AsBytes;
-use crate::latch::HybridLatch;
+use crate::latch::{CachePadded, HybridLatch};
 use crate::node::{NodeType, MAX_PREFIX_LEN, NODE48_EMPTY};
 use crate::simd::find_child_node16;
 
@@ -29,7 +29,7 @@ use crate::simd::find_child_node16;
 pub struct ArenaTree<K: AsBytes + Clone, V: Clone> {
     pub(crate) root: AtomicU32,
     pub(crate) root_latch: HybridLatch,
-    pub(crate) len: AtomicUsize,
+    pub(crate) len: CachePadded<AtomicUsize>,
     pub(crate) arena: Arc<Arena>,
     _marker: std::marker::PhantomData<(K, V)>,
 }
@@ -42,7 +42,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         Self {
             root: AtomicU32::new(0),
             root_latch: HybridLatch::new(),
-            len: AtomicUsize::new(0),
+            len: CachePadded(AtomicUsize::new(0)),
             arena,
             _marker: std::marker::PhantomData,
         }

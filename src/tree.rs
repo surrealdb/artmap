@@ -23,7 +23,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::key::AsBytes;
-use crate::latch::HybridLatch;
+use crate::latch::{CachePadded, HybridLatch};
 use crate::node::{
     Leaf, Node16, Node256, Node4, Node48, NodeHeader, NodeType, TaggedPtr, MAX_PREFIX_LEN,
     NODE48_EMPTY,
@@ -33,7 +33,7 @@ use crate::node::{
 pub struct Tree<K, V> {
     root: AtomicPtr<u8>,
     root_latch: HybridLatch,
-    len: AtomicUsize,
+    len: CachePadded<AtomicUsize>,
     _marker: PhantomData<(K, V)>,
 }
 
@@ -121,7 +121,7 @@ impl<K, V> Tree<K, V> {
         Self {
             root: AtomicPtr::new(ptr::null_mut()),
             root_latch: HybridLatch::new(),
-            len: AtomicUsize::new(0),
+            len: CachePadded(AtomicUsize::new(0)),
             _marker: PhantomData,
         }
     }
