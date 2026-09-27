@@ -114,17 +114,17 @@ unsafe impl<K: Sync, V: Sync> Sync for VersionedLeaf<K, V> {}
 
 impl<K, V> VersionedLeaf<K, V> {
     #[inline]
-    pub fn new(key: K, version: u64, value: V) -> Box<Self> {
-        let leaf = Box::new(Self {
+    pub fn new(key: K, version: u64, value: V) -> *mut Self {
+        let leaf_ptr = Box::into_raw(Box::new(Self {
             key,
             slot0: UnsafeCell::new(VersionNode::new_inline(version, value)),
             slot1: UnsafeCell::new(MaybeUninit::uninit()),
             slot1_used: AtomicBool::new(false),
             versions: AtomicPtr::new(ptr::null_mut()),
-        });
-        let slot0_ptr = leaf.slot0.get();
-        leaf.versions.store(slot0_ptr, Ordering::Relaxed);
-        leaf
+        }));
+        let slot0_ptr = unsafe { (*leaf_ptr).slot0.get() };
+        unsafe { (*leaf_ptr).versions.store(slot0_ptr, Ordering::Relaxed) };
+        leaf_ptr
     }
 
     #[inline]

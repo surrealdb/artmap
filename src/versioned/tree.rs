@@ -297,8 +297,7 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
             }
         }
 
-        let new_leaf_box = VersionedLeaf::new(key, version, value);
-        let new_leaf_ptr = Box::into_raw(new_leaf_box);
+        let new_leaf_ptr = VersionedLeaf::new(key, version, value);
         let tagged_new_leaf = TaggedPtr::from_versioned_leaf(new_leaf_ptr);
         let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
 

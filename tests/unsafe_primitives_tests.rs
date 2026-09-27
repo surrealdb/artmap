@@ -371,13 +371,14 @@ fn test_versioned_leaf_inline_slots_drop_safety() {
     let drop_counter = Arc::new(AtomicUsize::new(0));
 
     {
-        let leaf = VersionedLeaf::new(
+        let leaf_ptr = VersionedLeaf::new(
             "key1".to_string(),
             10,
             DropDetect {
                 drop_counter: Arc::clone(&drop_counter),
             },
         );
+        let leaf = unsafe { &*leaf_ptr };
 
         // Update 1: claims slot1 inline
         let node2 = leaf.alloc_version_node(
@@ -407,8 +408,6 @@ fn test_versioned_leaf_inline_slots_drop_safety() {
         // Before drop: 0 values dropped
         assert_eq!(drop_counter.load(Ordering::SeqCst), 0);
 
-        // Drop leaf manually via Box::from_raw
-        let leaf_ptr = Box::into_raw(leaf);
         unsafe {
             // Drop entire version chain
             let mut cur = (*leaf_ptr).versions.load(Ordering::Relaxed);
