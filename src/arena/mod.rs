@@ -37,7 +37,7 @@ pub mod versioned_map;
 pub mod versioned_tree;
 
 use std::cell::{Cell, UnsafeCell};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub use iter::{ArenaEntryRef, Range};
@@ -54,8 +54,8 @@ pub const NODE_ALIGNMENT: u32 = 8;
 /// Size of thread-local allocation buffer chunks (64 KB).
 const TLAB_CHUNK_SIZE: u32 = 64 * 1024;
 
-#[derive(Clone, Copy)]
-struct TlabState {
+#[derive(Clone, Copy, Default)]
+struct TlabSlot {
     arena_id: usize,
     gen: u32,
     current: u32,
@@ -63,15 +63,17 @@ struct TlabState {
 }
 
 thread_local! {
-    static TLAB: Cell<TlabState> = const {
-        Cell::new(TlabState {
+    static TLAB: Cell<[TlabSlot; 4]> = const {
+        Cell::new([TlabSlot {
             arena_id: 0,
             gen: 0,
             current: 0,
             limit: 0,
-        })
+        }; 4])
     };
 }
+
+static NEXT_ARENA_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// A lock-free contiguous byte arena allocator for [`ArenaArtMap`].
 ///
@@ -79,9 +81,10 @@ thread_local! {
 /// accelerated by thread-local allocation buffers (TLAB).
 /// When dropped, the entire memory block is reclaimed in $O(1)$.
 pub struct Arena {
+    id: usize,
     n: AtomicU64,
     gen: AtomicU32,
-    _pad: [u8; 52],
+    _pad: [u8; 44],
     buf: Box<[UnsafeCell<u8>]>,
 }
 
@@ -103,9 +106,10 @@ impl Arena {
             unsafe { Box::from_raw(Box::into_raw(buf) as *mut [UnsafeCell<u8>]) };
 
         Self {
+            id: NEXT_ARENA_ID.fetch_add(1, Ordering::Relaxed),
             n: AtomicU64::new(NODE_ALIGNMENT as u64),
             gen: AtomicU32::new(0),
-            _pad: [0u8; 52],
+            _pad: [0u8; 44],
             buf,
         }
     }
@@ -181,17 +185,20 @@ impl Arena {
 
         // Try thread-local allocation buffer (TLAB) for small allocations
         if padded <= TLAB_CHUNK_SIZE / 4 {
-            let arena_id = self.buf.as_ptr() as usize;
+            let arena_id = self.id;
             let current_gen = self.gen.load(Ordering::Relaxed);
             let res = TLAB.with(|cell| {
-                let mut state = cell.get();
-                if state.arena_id == arena_id && state.gen == current_gen {
-                    let cur_aligned = (state.current + align_mask) & !align_mask;
-                    let next = cur_aligned + padded;
-                    if next <= state.limit {
-                        state.current = next;
-                        cell.set(state);
-                        return Some(cur_aligned);
+                let mut slots = cell.get();
+                for slot in slots.iter_mut() {
+                    if slot.arena_id == arena_id && slot.gen == current_gen {
+                        let cur_aligned = (slot.current + align_mask) & !align_mask;
+                        let next = cur_aligned + padded;
+                        if next <= slot.limit {
+                            slot.current = next;
+                            cell.set(slots);
+                            return Some(cur_aligned);
+                        }
+                        break;
                     }
                 }
 
@@ -200,12 +207,20 @@ impl Arena {
                 if let Some(block_start) = self.alloc_global(chunk_size, alignment, overflow) {
                     let cur_aligned = (block_start + align_mask) & !align_mask;
                     let next = cur_aligned + padded;
-                    cell.set(TlabState {
+                    let mut target_idx = 0;
+                    for (i, slot) in slots.iter().enumerate() {
+                        if slot.arena_id == arena_id || slot.current >= slot.limit {
+                            target_idx = i;
+                            break;
+                        }
+                    }
+                    slots[target_idx] = TlabSlot {
                         arena_id,
                         gen: current_gen,
                         current: next,
                         limit: block_start + chunk_size,
-                    });
+                    };
+                    cell.set(slots);
                     Some(cur_aligned)
                 } else {
                     None
