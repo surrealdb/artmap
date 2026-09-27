@@ -17,6 +17,8 @@ use artmap::arena::ArenaArtMap;
 use artmap::ArtMap;
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use crossbeam_skiplist::SkipMap;
+use dashmap::DashMap;
+use papaya::HashMap as PapayaMap;
 use parking_lot::RwLock;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -191,6 +193,39 @@ fn bench_insert(c: &mut Criterion) {
         })
     });
 
+    // DashMap
+    group.bench_function("dashmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let map = DashMap::new();
+                let start = Instant::now();
+                for key in 0..BATCH {
+                    map.insert(key, key);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    // Papaya
+    group.bench_function("papaya", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let map = PapayaMap::new();
+                let pin = map.pin();
+                let start = Instant::now();
+                for key in 0..BATCH {
+                    pin.insert(key, key);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
     group.finish();
 }
 
@@ -316,6 +351,39 @@ fn bench_random_insert(c: &mut Criterion) {
         })
     });
 
+    // DashMap
+    group.bench_function("dashmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let map = DashMap::new();
+                let start = Instant::now();
+                for (i, &k) in random_keys.iter().enumerate() {
+                    map.insert(k, i as u64);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    // Papaya
+    group.bench_function("papaya", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let map = PapayaMap::new();
+                let pin = map.pin();
+                let start = Instant::now();
+                for (i, &k) in random_keys.iter().enumerate() {
+                    pin.insert(k, i as u64);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
     group.finish();
 }
 
@@ -331,16 +399,23 @@ fn bench_get(c: &mut Criterion) {
     let mut btree = BTreeMap::new();
     let mut hmap = HashMap::new();
     let mut imbl_map = imbl::OrdMap::new();
+    let dmap = DashMap::<u64, u64>::new();
+    let pmap = PapayaMap::<u64, u64>::new();
 
-    for i in 0..SAMPLE_SIZE as u64 {
-        let k = i.to_be_bytes();
-        art_map.insert(k, i);
-        arena_map.insert(k, i);
-        let _ = skiplist.insert(&k, &k);
-        skip_map.insert(k, i);
-        btree.insert(i, i);
-        hmap.insert(i, i);
-        imbl_map.insert(i, i);
+    {
+        let pin = pmap.pin();
+        for i in 0..SAMPLE_SIZE as u64 {
+            let k = i.to_be_bytes();
+            art_map.insert(k, i);
+            arena_map.insert(k, i);
+            let _ = skiplist.insert(&k, &k);
+            skip_map.insert(k, i);
+            btree.insert(i, i);
+            hmap.insert(i, i);
+            imbl_map.insert(i, i);
+            dmap.insert(i, i);
+            pin.insert(i, i);
+        }
     }
 
     group.bench_function("artmap", |b| {
@@ -418,6 +493,23 @@ fn bench_get(c: &mut Criterion) {
         b.iter(|| {
             let key = rng.gen_range(0..SAMPLE_SIZE as u64);
             black_box(imbl_map.get(&key))
+        })
+    });
+
+    group.bench_function("dashmap", |b| {
+        let mut rng = seeded_rng(0x12345678);
+        b.iter(|| {
+            let key = rng.gen_range(0..SAMPLE_SIZE as u64);
+            black_box(dmap.get(&key))
+        })
+    });
+
+    group.bench_function("papaya", |b| {
+        let mut rng = seeded_rng(0x12345678);
+        let pin = pmap.pin();
+        b.iter(|| {
+            let key = rng.gen_range(0..SAMPLE_SIZE as u64);
+            black_box(pin.get(&key))
         })
     });
 
@@ -736,6 +828,73 @@ fn bench_concurrent_writes(c: &mut Criterion) {
                             for i in 0..PER_THREAD {
                                 let key = (start + i).to_be_bytes();
                                 map.write().insert(key, start + i);
+                            }
+                        })
+                    })
+                    .collect();
+
+                let start_time = Instant::now();
+                barrier.wait();
+                for h in handles {
+                    h.join().unwrap();
+                }
+                total_duration += start_time.elapsed();
+            }
+            total_duration
+        })
+    });
+
+    // DashMap
+    group.bench_function("dashmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total_duration = Duration::ZERO;
+            for _ in 0..iters {
+                let map = Arc::new(DashMap::<[u8; 8], u64>::new());
+                let barrier = Arc::new(Barrier::new(NUM_THREADS + 1));
+                let handles: Vec<_> = (0..NUM_THREADS)
+                    .map(|t| {
+                        let map = Arc::clone(&map);
+                        let barrier = Arc::clone(&barrier);
+                        std::thread::spawn(move || {
+                            barrier.wait();
+                            let start = t as u64 * PER_THREAD;
+                            for i in 0..PER_THREAD {
+                                let key = (start + i).to_be_bytes();
+                                map.insert(key, start + i);
+                            }
+                        })
+                    })
+                    .collect();
+
+                let start_time = Instant::now();
+                barrier.wait();
+                for h in handles {
+                    h.join().unwrap();
+                }
+                total_duration += start_time.elapsed();
+            }
+            total_duration
+        })
+    });
+
+    // Papaya
+    group.bench_function("papaya", |b| {
+        b.iter_custom(|iters| {
+            let mut total_duration = Duration::ZERO;
+            for _ in 0..iters {
+                let map = Arc::new(PapayaMap::<[u8; 8], u64>::new());
+                let barrier = Arc::new(Barrier::new(NUM_THREADS + 1));
+                let handles: Vec<_> = (0..NUM_THREADS)
+                    .map(|t| {
+                        let map = Arc::clone(&map);
+                        let barrier = Arc::clone(&barrier);
+                        std::thread::spawn(move || {
+                            barrier.wait();
+                            let pin = map.pin();
+                            let start = t as u64 * PER_THREAD;
+                            for i in 0..PER_THREAD {
+                                let key = (start + i).to_be_bytes();
+                                pin.insert(key, start + i);
                             }
                         })
                     })
@@ -1118,6 +1277,111 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
                         for _ in 0..OPS_PER_THREAD {
                             let key = rng.gen_range(0..PRE_POPULATE).to_be_bytes();
                             black_box(map.read().get(&key).copied());
+                        }
+                    }));
+                }
+
+                let start_time = Instant::now();
+                barrier.wait();
+                for h in handles {
+                    h.join().unwrap();
+                }
+                total_duration += start_time.elapsed();
+            }
+            total_duration
+        })
+    });
+
+    // DashMap
+    group.bench_function("dashmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total_duration = Duration::ZERO;
+            for _ in 0..iters {
+                let map = Arc::new(DashMap::<[u8; 8], u64>::new());
+                for i in 0..PRE_POPULATE {
+                    map.insert(i.to_be_bytes(), i);
+                }
+                let barrier = Arc::new(Barrier::new(NUM_READERS + NUM_WRITERS + 1));
+
+                let mut handles = Vec::new();
+
+                for t in 0..NUM_WRITERS {
+                    let map = Arc::clone(&map);
+                    let barrier = Arc::clone(&barrier);
+                    handles.push(std::thread::spawn(move || {
+                        barrier.wait();
+                        let start = PRE_POPULATE + (t as u64 * OPS_PER_THREAD);
+                        for i in 0..OPS_PER_THREAD {
+                            let key = (start + i).to_be_bytes();
+                            map.insert(key, start + i);
+                        }
+                    }));
+                }
+
+                for _ in 0..NUM_READERS {
+                    let map = Arc::clone(&map);
+                    let barrier = Arc::clone(&barrier);
+                    handles.push(std::thread::spawn(move || {
+                        barrier.wait();
+                        let mut rng = seeded_rng(0x12345678);
+                        for _ in 0..OPS_PER_THREAD {
+                            let key = rng.gen_range(0..PRE_POPULATE).to_be_bytes();
+                            black_box(map.get(&key));
+                        }
+                    }));
+                }
+
+                let start_time = Instant::now();
+                barrier.wait();
+                for h in handles {
+                    h.join().unwrap();
+                }
+                total_duration += start_time.elapsed();
+            }
+            total_duration
+        })
+    });
+
+    // Papaya
+    group.bench_function("papaya", |b| {
+        b.iter_custom(|iters| {
+            let mut total_duration = Duration::ZERO;
+            for _ in 0..iters {
+                let map = Arc::new(PapayaMap::<[u8; 8], u64>::new());
+                {
+                    let pin = map.pin();
+                    for i in 0..PRE_POPULATE {
+                        pin.insert(i.to_be_bytes(), i);
+                    }
+                }
+                let barrier = Arc::new(Barrier::new(NUM_READERS + NUM_WRITERS + 1));
+
+                let mut handles = Vec::new();
+
+                for t in 0..NUM_WRITERS {
+                    let map = Arc::clone(&map);
+                    let barrier = Arc::clone(&barrier);
+                    handles.push(std::thread::spawn(move || {
+                        barrier.wait();
+                        let pin = map.pin();
+                        let start = PRE_POPULATE + (t as u64 * OPS_PER_THREAD);
+                        for i in 0..OPS_PER_THREAD {
+                            let key = (start + i).to_be_bytes();
+                            pin.insert(key, start + i);
+                        }
+                    }));
+                }
+
+                for _ in 0..NUM_READERS {
+                    let map = Arc::clone(&map);
+                    let barrier = Arc::clone(&barrier);
+                    handles.push(std::thread::spawn(move || {
+                        barrier.wait();
+                        let pin = map.pin();
+                        let mut rng = seeded_rng(0x12345678);
+                        for _ in 0..OPS_PER_THREAD {
+                            let key = rng.gen_range(0..PRE_POPULATE).to_be_bytes();
+                            black_box(pin.get(&key));
                         }
                     }));
                 }

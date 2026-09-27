@@ -15,6 +15,8 @@
 use artmap::arena::ArenaArtMap;
 use artmap::ArtMap;
 use crossbeam_skiplist::SkipMap;
+use dashmap::DashMap;
+use papaya::HashMap as PapayaMap;
 use std::collections::{BTreeMap, HashMap};
 
 #[global_allocator]
@@ -118,6 +120,31 @@ fn alloc_imbl_ordmap_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
 
     bencher.counter(count).bench_local(|| {
         map.insert(key, key);
+        key += 1;
+    });
+}
+
+#[divan::bench(args = COUNTS)]
+fn alloc_dashmap_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
+    let map = DashMap::<[u8; 8], usize>::new();
+    let mut key = 0usize;
+
+    bencher.counter(count).bench_local(|| {
+        let k = (key as u64).to_be_bytes();
+        map.insert(k, key);
+        key += 1;
+    });
+}
+
+#[divan::bench(args = COUNTS)]
+fn alloc_papaya_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
+    let map = PapayaMap::<[u8; 8], usize>::new();
+    let pin = map.pin();
+    let mut key = 0usize;
+
+    bencher.counter(count).bench_local(|| {
+        let k = (key as u64).to_be_bytes();
+        pin.insert(k, key);
         key += 1;
     });
 }
