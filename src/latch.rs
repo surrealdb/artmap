@@ -91,6 +91,12 @@ impl HybridLatch {
         self.version.load(Ordering::Relaxed) == start_version
     }
 
+    /// Checks if the latch is currently write-locked.
+    #[inline]
+    pub fn is_locked(&self) -> bool {
+        self.version.load(Ordering::Acquire) & LOCK_BIT != 0
+    }
+
     /// Checks if the node has been marked obsolete.
     #[inline]
     pub fn is_obsolete(&self) -> bool {
@@ -158,6 +164,26 @@ impl HybridLatch {
     }
 }
 
+/// 64-byte cache-line aligned wrapper to avoid false sharing.
+#[repr(align(64))]
+#[derive(Debug, Default)]
+pub struct CachePadded<T>(pub T);
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for CachePadded<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// Exponential backoff helper for spinning writers.
 pub struct SpinBackoff {
     step: u32,
@@ -177,15 +203,15 @@ impl SpinBackoff {
 
     #[inline]
     pub fn spin(&mut self) {
-        if self.step <= 10 {
-            let spins = 1 << self.step.min(8);
+        if self.step <= 16 {
+            let spins = 1 << self.step.min(10);
             for _ in 0..spins {
                 std::hint::spin_loop();
             }
         } else {
             std::thread::yield_now();
         }
-        if self.step < 16 {
+        if self.step < 24 {
             self.step += 1;
         }
     }

@@ -16,7 +16,8 @@
 //!
 //! Implements `Node4`, `Node16`, `Node48`, and `Node256` layouts with prefix compression.
 
-use std::mem::ManuallyDrop;
+use std::cell::UnsafeCell;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
@@ -58,28 +59,95 @@ impl<K, V> Leaf<K, V> {
     }
 }
 
-/// A multi-version (MVCC) leaf node holding a version chain.
+/// A version entry in an MVCC version chain.
 #[repr(C, align(8))]
-pub struct VersionedLeaf<K, V> {
-    pub(crate) removed: AtomicBool,
-    pub(crate) value_taken: AtomicBool,
+pub struct VersionNode<V> {
+    pub removed: AtomicBool,
+    pub value_taken: AtomicBool,
+    pub is_inline: bool,
+    pub _pad: [u8; 5],
     pub version: u64,
-    pub next_version: AtomicPtr<VersionedLeaf<K, V>>,
-    pub key: K,
+    pub next_version: AtomicPtr<VersionNode<V>>,
     pub value: ManuallyDrop<V>,
 }
 
-impl<K, V> VersionedLeaf<K, V> {
+impl<V> VersionNode<V> {
     #[inline]
-    pub fn new(key: K, version: u64, value: V) -> Box<Self> {
+    pub fn new(version: u64, value: V) -> Box<Self> {
         Box::new(Self {
             removed: AtomicBool::new(false),
             value_taken: AtomicBool::new(false),
+            is_inline: false,
+            _pad: [0; 5],
             version,
             next_version: AtomicPtr::new(ptr::null_mut()),
-            key,
             value: ManuallyDrop::new(value),
         })
+    }
+
+    #[inline]
+    pub fn new_inline(version: u64, value: V) -> Self {
+        Self {
+            removed: AtomicBool::new(false),
+            value_taken: AtomicBool::new(false),
+            is_inline: true,
+            _pad: [0; 5],
+            version,
+            next_version: AtomicPtr::new(ptr::null_mut()),
+            value: ManuallyDrop::new(value),
+        }
+    }
+}
+
+/// A multi-version (MVCC) leaf anchor holding the key, up to two inline versions, and overflow version chain.
+#[repr(C, align(8))]
+pub struct VersionedLeaf<K, V> {
+    pub key: K,
+    pub slot0: UnsafeCell<VersionNode<V>>,
+    pub slot1: UnsafeCell<MaybeUninit<VersionNode<V>>>,
+    pub slot1_used: AtomicBool,
+    pub versions: AtomicPtr<VersionNode<V>>,
+}
+
+unsafe impl<K: Send, V: Send> Send for VersionedLeaf<K, V> {}
+unsafe impl<K: Sync, V: Sync> Sync for VersionedLeaf<K, V> {}
+
+impl<K, V> VersionedLeaf<K, V> {
+    #[inline]
+    pub fn new(key: K, version: u64, value: V) -> *mut Self {
+        let leaf_ptr = Box::into_raw(Box::new(Self {
+            key,
+            slot0: UnsafeCell::new(VersionNode::new_inline(version, value)),
+            slot1: UnsafeCell::new(MaybeUninit::uninit()),
+            slot1_used: AtomicBool::new(false),
+            versions: AtomicPtr::new(ptr::null_mut()),
+        }));
+        let slot0_ptr = unsafe { (*leaf_ptr).slot0.get() };
+        unsafe { (*leaf_ptr).versions.store(slot0_ptr, Ordering::Relaxed) };
+        leaf_ptr
+    }
+
+    #[inline]
+    pub fn alloc_version_node(&self, version: u64, value: V) -> *mut VersionNode<V> {
+        if !self.slot1_used.swap(true, Ordering::AcqRel) {
+            let slot1_ptr = self.slot1.get();
+            unsafe {
+                (*slot1_ptr).write(VersionNode::new_inline(version, value));
+                slot1_ptr as *mut VersionNode<V>
+            }
+        } else {
+            Box::into_raw(VersionNode::new(version, value))
+        }
+    }
+
+    #[inline]
+    pub fn is_removed(&self) -> bool {
+        let head = self.versions.load(Ordering::Acquire);
+        if head.is_null() {
+            true
+        } else {
+            unsafe { (*head).removed.load(Ordering::Acquire) }
+        }
     }
 }
 
@@ -306,6 +374,16 @@ impl Node4 {
         self.children[count - 1].store(ptr::null_mut(), Ordering::Relaxed);
         self.header.num_children -= 1;
         Some(old)
+    }
+
+    pub fn replace_child(&mut self, key: u8, child: TaggedPtr) {
+        let count = self.header.num_children as usize;
+        for i in 0..count {
+            if self.keys[i] == key {
+                self.children[i].store(child.as_raw(), Ordering::Release);
+                return;
+            }
+        }
     }
 }
 

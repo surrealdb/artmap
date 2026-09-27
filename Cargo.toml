@@ -7,7 +7,6 @@ license = "Apache-2.0"
 readme = "README.md"
 description = "A concurrent in-memory Adaptive Radix Tree (ART) featuring optimistic lock coupling."
 repository = "https://github.com/surrealdb/artmap"
-homepage = "https://github.com/surrealdb/artmap"
 documentation = "https://docs.rs/artmap"
 keywords = [
     "art",
@@ -35,6 +34,12 @@ papaya = "0.2"
 scc = "3.8"
 concread = "0.5"
 vart = "0.10"
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [[bench]]
 name = "artmap_bench"

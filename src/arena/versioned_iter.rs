@@ -21,8 +21,8 @@ use std::ops::{Bound, Deref};
 use std::sync::atomic::Ordering;
 
 use crate::arena::node::{
-    next_present_byte, prev_present_byte, Node16, Node256, Node4, Node48, NodeHeader, TaggedOffset,
-    VersionedLeaf,
+    next_present_byte, prev_present_byte, ArenaVersionNode, Node16, Node256, Node4, Node48,
+    NodeHeader, TaggedOffset, VersionedLeaf,
 };
 use crate::arena::versioned_tree::ArenaVersionedTree;
 use crate::key::AsBytes;
@@ -48,6 +48,7 @@ impl CursorFrame {
 #[derive(Clone, Copy)]
 pub struct ArenaVersionedEntryRef<'a, K: AsBytes + Clone, V: Clone> {
     pub(crate) leaf_ptr: *const VersionedLeaf<K, V>,
+    pub(crate) arena: &'a crate::arena::Arena,
     pub(crate) _marker: PhantomData<&'a ()>,
 }
 
@@ -61,19 +62,35 @@ impl<'a, K: AsBytes + Clone, V: Clone> ArenaVersionedEntryRef<'a, K, V> {
     /// Returns a reference to the entry's value.
     #[inline]
     pub fn value(&self) -> &'a V {
-        unsafe { &(*self.leaf_ptr).value }
+        unsafe {
+            let head_off = (*self.leaf_ptr).versions_offset.load(Ordering::Acquire) & !1;
+            let node = self.arena.get_pointer(head_off) as *const ArenaVersionNode<V>;
+            &(*node).value
+        }
     }
 
     /// Returns the entry's monotonic MVCC version number.
     #[inline]
     pub fn version(&self) -> u64 {
-        unsafe { (*self.leaf_ptr).version }
+        unsafe {
+            let head_off = (*self.leaf_ptr).versions_offset.load(Ordering::Acquire) & !1;
+            let node = self.arena.get_pointer(head_off) as *const ArenaVersionNode<V>;
+            (*node).version
+        }
     }
 
     /// Checks if this entry has been removed from the map.
     #[inline]
     pub fn is_removed(&self) -> bool {
-        unsafe { (*self.leaf_ptr).removed.load(Ordering::Acquire) }
+        unsafe {
+            let head_off = (*self.leaf_ptr).versions_offset.load(Ordering::Acquire) & !1;
+            if head_off == 0 {
+                true
+            } else {
+                let node = self.arena.get_pointer(head_off) as *const ArenaVersionNode<V>;
+                (*node).removed.load(Ordering::Acquire)
+            }
+        }
     }
 
     /// Returns the raw pointer to the underlying [`VersionedLeaf`].
@@ -87,19 +104,15 @@ impl<'a, K: AsBytes + Clone, V: Clone> ArenaVersionedEntryRef<'a, K, V> {
     where
         V: 'a,
     {
-        let mut cur = self.leaf_ptr;
+        let head_off = unsafe { (*self.leaf_ptr).versions_offset.load(Ordering::Acquire) & !1 };
+        let mut cur_off = head_off;
         std::iter::from_fn(move || {
-            if cur.is_null() {
+            if cur_off == 0 {
                 None
             } else {
-                let leaf = unsafe { &*cur };
-                let item = (leaf.version, &leaf.value);
-                let next_off = leaf.next_version_offset.load(Ordering::Acquire);
-                if next_off == 0 {
-                    cur = std::ptr::null();
-                } else {
-                    cur = arena.get_pointer(next_off) as *const VersionedLeaf<K, V>;
-                }
+                let node = unsafe { &*(arena.get_pointer(cur_off) as *const ArenaVersionNode<V>) };
+                let item = (node.version, &node.value);
+                cur_off = node.next_version_offset.load(Ordering::Acquire) & !1;
                 Some(item)
             }
         })
@@ -438,6 +451,7 @@ impl<'a, K: AsBytes + Clone, V: Clone> Iterator for ArenaVersionedRange<'a, K, V
 
             let entry = ArenaVersionedEntryRef {
                 leaf_ptr,
+                arena: &self.tree.arena,
                 _marker: PhantomData,
             };
             if !entry.is_removed() {
@@ -493,6 +507,7 @@ impl<'a, K: AsBytes + Clone, V: Clone> DoubleEndedIterator for ArenaVersionedRan
 
             let entry = ArenaVersionedEntryRef {
                 leaf_ptr,
+                arena: &self.tree.arena,
                 _marker: PhantomData,
             };
             if !entry.is_removed() {
@@ -745,7 +760,7 @@ pub(crate) unsafe fn first_leaf_in_subtree<K: AsBytes + Clone, V: Clone>(
             let leaf_ptr =
                 tree.arena.get_pointer(offset.leaf_offset()) as *const VersionedLeaf<K, V>;
             let leaf = &*leaf_ptr;
-            if !leaf.removed.load(Ordering::Acquire) {
+            if !leaf.is_removed(&tree.arena) {
                 return Some(leaf_ptr);
             }
             return None;
@@ -757,7 +772,7 @@ pub(crate) unsafe fn first_leaf_in_subtree<K: AsBytes + Clone, V: Clone>(
             let leaf_ptr = tree.arena.get_pointer(TaggedOffset(exact).leaf_offset())
                 as *const VersionedLeaf<K, V>;
             let leaf = &*leaf_ptr;
-            if !leaf.removed.load(Ordering::Acquire) {
+            if !leaf.is_removed(&tree.arena) {
                 return Some(leaf_ptr);
             }
         }
@@ -778,7 +793,7 @@ pub(crate) unsafe fn last_leaf_in_subtree<K: AsBytes + Clone, V: Clone>(
             let leaf_ptr =
                 tree.arena.get_pointer(offset.leaf_offset()) as *const VersionedLeaf<K, V>;
             let leaf = &*leaf_ptr;
-            if !leaf.removed.load(Ordering::Acquire) {
+            if !leaf.is_removed(&tree.arena) {
                 return Some(leaf_ptr);
             }
             return None;
@@ -793,7 +808,7 @@ pub(crate) unsafe fn last_leaf_in_subtree<K: AsBytes + Clone, V: Clone>(
                     let leaf_ptr = tree.arena.get_pointer(TaggedOffset(exact).leaf_offset())
                         as *const VersionedLeaf<K, V>;
                     let leaf = &*leaf_ptr;
-                    if !leaf.removed.load(Ordering::Acquire) {
+                    if !leaf.is_removed(&tree.arena) {
                         return Some(leaf_ptr);
                     }
                 }

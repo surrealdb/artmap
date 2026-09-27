@@ -47,33 +47,48 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> VersionedEntryRef<'a, K
     /// Returns a reference to the head (latest) version's value.
     #[inline]
     pub fn value(&self) -> &'a V {
-        unsafe { &(*self.leaf_ptr).value }
+        unsafe {
+            let head = (*self.leaf_ptr).versions.load(Ordering::Acquire);
+            debug_assert!(!head.is_null());
+            &(*head).value
+        }
     }
 
     /// Returns the head entry's monotonic version number.
     #[inline]
     pub fn version(&self) -> u64 {
-        unsafe { (*self.leaf_ptr).version }
+        unsafe {
+            let head = (*self.leaf_ptr).versions.load(Ordering::Acquire);
+            debug_assert!(!head.is_null());
+            (*head).version
+        }
     }
 
     /// Checks if this head entry has been marked removed.
     #[inline]
     pub fn is_removed(&self) -> bool {
-        unsafe { (*self.leaf_ptr).removed.load(Ordering::Acquire) }
+        unsafe {
+            let head = (*self.leaf_ptr).versions.load(Ordering::Acquire);
+            if head.is_null() {
+                true
+            } else {
+                (*head).removed.load(Ordering::Acquire)
+            }
+        }
     }
 
     /// Returns the newest version and value for this key that is $\le$ `max_version`.
     pub fn get_version_le(&self, max_version: u64) -> Option<(u64, &'a V)> {
-        let mut cur = self.leaf_ptr;
+        let mut cur = unsafe { (*self.leaf_ptr).versions.load(Ordering::Acquire) };
         while !cur.is_null() {
-            let leaf = unsafe { &*cur };
-            if leaf.version <= max_version {
-                if leaf.removed.load(Ordering::Acquire) {
+            let node = unsafe { &*cur };
+            if node.version <= max_version {
+                if node.removed.load(Ordering::Acquire) {
                     return None;
                 }
-                return Some((leaf.version, &*leaf.value));
+                return Some((node.version, &*node.value));
             }
-            cur = leaf.next_version.load(Ordering::Acquire);
+            cur = node.next_version.load(Ordering::Acquire);
         }
         None
     }

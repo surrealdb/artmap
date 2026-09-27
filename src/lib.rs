@@ -68,6 +68,14 @@ impl<K, V> ArtMap<K, V> {
         Self { tree: Tree::new() }
     }
 
+    /// Creates a new [`ArtMap`] pre-sized for high-capacity ingestion.
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            tree: Tree::with_capacity(capacity),
+        }
+    }
+
     /// Returns the number of entries in the map.
     #[inline]
     pub fn len(&self) -> usize {
@@ -162,6 +170,12 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
     #[inline]
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         let guard = &crossbeam_epoch::pin();
+        self.tree.insert(key, value, guard)
+    }
+
+    /// Inserts a key-value pair using a pre-pinned epoch [`Guard`], avoiding per-operation pinning overhead.
+    #[inline]
+    pub fn insert_with_guard(&self, key: K, value: V, guard: &crossbeam_epoch::Guard) -> Option<V> {
         self.tree.insert(key, value, guard)
     }
 
@@ -313,6 +327,26 @@ mod tests {
             .map(|e| (e.key().as_str(), *e.value()))
             .collect();
         assert_eq!(rev_items, vec![("k:4", 4), ("k:3", 3), ("k:2", 2)]);
+    }
+
+    #[test]
+    fn test_artmap_with_capacity() {
+        let map = ArtMap::<String, i32>::with_capacity(2048);
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
+
+        for i in 0..500 {
+            let k = format!("key:{i:04}");
+            assert_eq!(map.insert(k, i), None);
+        }
+        assert_eq!(map.len(), 500);
+
+        for i in 0..500 {
+            let k = format!("key:{i:04}");
+            assert_eq!(map.get(&k).as_deref(), Some(&i));
+        }
+
+        map.validate_invariants();
     }
 
     #[test]

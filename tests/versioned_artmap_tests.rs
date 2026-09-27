@@ -183,3 +183,82 @@ fn test_versioned_artmap_pruning() {
     assert_eq!(map.len(), 0);
     assert_eq!(map.get("account:1"), None);
 }
+
+#[test]
+fn test_versioned_artmap_concurrent_updates() {
+    let map = Arc::new(VersionedArtMap::<String, usize>::new());
+    const NUM_KEYS: usize = 50;
+    const UPDATES_PER_KEY: usize = 200;
+    const NUM_THREADS: usize = 8;
+
+    // Pre-populate keys with version 0
+    for k in 0..NUM_KEYS {
+        map.insert(format!("key:{k:03}"), 0, 0);
+    }
+    assert_eq!(map.len(), NUM_KEYS);
+
+    let barrier = Arc::new(Barrier::new(NUM_THREADS));
+    let mut handles = Vec::new();
+
+    for t in 0..NUM_THREADS {
+        let map = Arc::clone(&map);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for u in 1..=UPDATES_PER_KEY {
+                let ver = (u * NUM_THREADS + t) as u64;
+                let k = u % NUM_KEYS;
+                map.insert(format!("key:{k:03}"), ver, t * 1000 + u);
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert_eq!(map.len(), NUM_KEYS);
+
+    // Verify all keys have versions in strictly descending order
+    for k in 0..NUM_KEYS {
+        let key_str = format!("key:{k:03}");
+        let versions = map.get_all_versions(&key_str);
+        assert!(!versions.is_empty());
+        for i in 1..versions.len() {
+            assert!(
+                versions[i - 1].0 > versions[i].0,
+                "versions must be strictly descending"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_versioned_artmap_inline_slots_lifecycle() {
+    let map = VersionedArtMap::<String, String>::new();
+
+    // Create: version 10 (stored in slot0 inline)
+    assert!(map.insert("k".to_string(), 10, "val10".to_string()));
+    assert_eq!(map.get_version_le("k", 10), Some((10, "val10".to_string())));
+    assert_eq!(map.version_count("k"), 1);
+
+    // Update 1: version 20 (stored in slot1 inline, 0 heap allocations)
+    assert!(map.insert("k".to_string(), 20, "val20".to_string()));
+    assert_eq!(map.get_version_le("k", 20), Some((20, "val20".to_string())));
+    assert_eq!(map.get_version_le("k", 15), Some((10, "val10".to_string())));
+    assert_eq!(map.version_count("k"), 2);
+
+    // Update 2: version 30 (spills to heap overflow)
+    assert!(map.insert("k".to_string(), 30, "val30".to_string()));
+    assert_eq!(map.get_version_le("k", 30), Some((30, "val30".to_string())));
+    assert_eq!(map.get_version_le("k", 25), Some((20, "val20".to_string())));
+    assert_eq!(map.get_version_le("k", 15), Some((10, "val10".to_string())));
+    assert_eq!(map.version_count("k"), 3);
+
+    // Prune versions older than 25 -> version 10 pruned
+    let pruned = map.prune_key("k", 25, |_| false);
+    assert_eq!(pruned, 1);
+    assert_eq!(map.get_version_le("k", 15), None);
+    assert_eq!(map.get_version_le("k", 25), Some((20, "val20".to_string())));
+    assert_eq!(map.get_version_le("k", 35), Some((30, "val30".to_string())));
+}

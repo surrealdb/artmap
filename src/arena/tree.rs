@@ -21,7 +21,7 @@ use crate::arena::node::{
 };
 use crate::arena::Arena;
 use crate::key::AsBytes;
-use crate::latch::HybridLatch;
+use crate::latch::{CachePadded, HybridLatch};
 use crate::node::{NodeType, MAX_PREFIX_LEN, NODE48_EMPTY};
 use crate::simd::find_child_node16;
 
@@ -29,7 +29,7 @@ use crate::simd::find_child_node16;
 pub struct ArenaTree<K: AsBytes + Clone, V: Clone> {
     pub(crate) root: AtomicU32,
     pub(crate) root_latch: HybridLatch,
-    pub(crate) len: AtomicUsize,
+    pub(crate) len: CachePadded<AtomicUsize>,
     pub(crate) arena: Arc<Arena>,
     _marker: std::marker::PhantomData<(K, V)>,
 }
@@ -42,10 +42,14 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         Self {
             root: AtomicU32::new(0),
             root_latch: HybridLatch::new(),
-            len: AtomicUsize::new(0),
+            len: CachePadded(AtomicUsize::new(0)),
             arena,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    pub fn with_capacity(arena: Arc<Arena>, _capacity: usize) -> Self {
+        Self::new(arena)
     }
 
     #[inline]
@@ -181,6 +185,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         depth: usize,
         include_equal: bool,
     ) -> Result<Option<*const Leaf<K, V>>, ()> {
+        if offset.is_null() {
+            return Ok(None);
+        }
         if offset.is_leaf() {
             let leaf_ptr = self.arena.get_pointer(offset.leaf_offset()) as *const Leaf<K, V>;
             let leaf = &*leaf_ptr;
@@ -395,6 +402,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         depth: usize,
         include_equal: bool,
     ) -> Result<Option<*const Leaf<K, V>>, ()> {
+        if offset.is_null() {
+            return Ok(None);
+        }
         if offset.is_leaf() {
             let leaf_ptr = self.arena.get_pointer(offset.leaf_offset()) as *const Leaf<K, V>;
             let leaf = &*leaf_ptr;
@@ -679,25 +689,58 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         value: V,
         inserter: &mut crate::arena::map::ArenaInserter,
     ) -> Option<V> {
-        let leaf_off = self.alloc_leaf(key, value).expect("arena full");
-        let new_leaf_ptr = self.arena.get_pointer_mut(leaf_off) as *mut Leaf<K, V>;
-        let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
-        let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
+        let key_bytes = key.as_bytes();
 
         // Fast path: check if cached parent node can absorb this key directly
-        if inserter.last_parent_offset != 0 && key_bytes.len() > inserter.last_depth {
+        if inserter.matches(key_bytes) {
             let header_ptr =
                 self.arena.get_pointer_mut(inserter.last_parent_offset) as *mut NodeHeader;
             let header = unsafe { &mut *header_ptr };
-            if header
+            let next_byte = key_bytes[inserter.last_depth];
+
+            if header.node_type == NodeType::Node256 {
+                let n256 = unsafe { &*(header_ptr as *const Node256) };
+                if n256.children[next_byte as usize].load(Ordering::Acquire) == 0 {
+                    let leaf_off = self.alloc_leaf(key, value).expect("arena full");
+                    let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
+                    if n256.children[next_byte as usize]
+                        .compare_exchange(
+                            0,
+                            tagged_new_leaf.raw(),
+                            Ordering::Release,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        set_bitmap_bit(&n256.child_bitmap, next_byte);
+                        if header.latch.validate(inserter.last_parent_version) {
+                            n256.header.inc_num_children();
+                            self.len.fetch_add(1, Ordering::Relaxed);
+                            return None;
+                        } else {
+                            clear_bitmap_bit(&n256.child_bitmap, next_byte);
+                            n256.children[next_byte as usize].store(0, Ordering::Release);
+                        }
+                    }
+                    let new_leaf_ptr = self.arena.get_pointer_mut(leaf_off) as *mut Leaf<K, V>;
+                    let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
+                    return self.insert_internal_cached(
+                        key_bytes,
+                        new_leaf_ptr,
+                        tagged_new_leaf,
+                        Some(inserter),
+                    );
+                }
+            } else if header
                 .latch
                 .lock_version(inserter.last_parent_version)
                 .is_ok()
             {
-                let next_byte = key_bytes[inserter.last_depth];
                 let is_full = is_node_full(header);
                 let child = unsafe { find_child(header_ptr, next_byte) };
                 if !is_full && child.is_none() {
+                    let leaf_off = self.alloc_leaf(key, value).expect("arena full");
+                    let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
                     unsafe { self.insert_child_into_node(header_ptr, next_byte, tagged_new_leaf) };
                     header.latch.unlock();
                     self.len.fetch_add(1, Ordering::Relaxed);
@@ -708,6 +751,11 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
             }
             inserter.reset();
         }
+
+        let leaf_off = self.alloc_leaf(key, value).expect("arena full");
+        let new_leaf_ptr = self.arena.get_pointer_mut(leaf_off) as *mut Leaf<K, V>;
+        let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
+        let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
 
         self.insert_internal_cached(key_bytes, new_leaf_ptr, tagged_new_leaf, Some(inserter))
     }
@@ -778,14 +826,19 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
 
             // Case 0: Empty tree
             if root_raw == 0 {
-                let _ = self.root_latch.lock();
-                if self.root.load(Ordering::Relaxed) == 0 {
-                    self.root.store(tagged_new_leaf.raw(), Ordering::Release);
+                if self
+                    .root
+                    .compare_exchange(
+                        0,
+                        tagged_new_leaf.raw(),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
                     self.len.fetch_add(1, Ordering::Relaxed);
-                    self.root_latch.unlock();
                     return None;
                 }
-                self.root_latch.unlock();
                 continue 'retry;
             }
 
@@ -927,16 +980,19 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                         let tagged_split = TaggedOffset::from_inner(split_node_off);
 
                         match parent {
-                            Some(p) => self.replace_child(p, parent_byte, tagged_split),
-                            None => self.root.store(tagged_split.raw(), Ordering::Release),
+                            Some(p) => {
+                                self.replace_child(p, parent_byte, tagged_split);
+                                header.latch.unlock();
+                                (*p).latch.unlock();
+                            }
+                            None => {
+                                self.root.store(tagged_split.raw(), Ordering::Release);
+                                header.latch.unlock();
+                                self.root_latch.unlock();
+                            }
                         }
 
                         self.len.fetch_add(1, Ordering::Relaxed);
-                        header.latch.unlock();
-                        match parent {
-                            Some(p) => (*p).latch.unlock(),
-                            None => self.root_latch.unlock(),
-                        }
                     }
                     if let Some(ref mut ins) = inserter {
                         ins.reset();
@@ -944,10 +1000,10 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                     return None;
                 }
 
-                depth += header.prefix_len as usize;
+                let node_depth = depth + header.prefix_len as usize;
 
                 // Exact key match at this inner node
-                if depth == key_bytes.len() {
+                if node_depth == key_bytes.len() {
                     if header.latch.lock_version(v_header).is_err() {
                         continue 'retry;
                     }
@@ -987,7 +1043,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                     }
                 }
 
-                let next_byte = key_bytes[depth];
+                let next_byte = key_bytes[node_depth];
                 let next_child = unsafe { find_child(header_ptr, next_byte) };
 
                 match next_child {
@@ -1016,10 +1072,12 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                                     n256.header.inc_num_children();
                                     self.len.fetch_add(1, Ordering::Relaxed);
                                     if let Some(ref mut ins) = inserter {
-                                        ins.last_parent_offset = current.inner_offset();
-                                        ins.last_parent_version =
-                                            header.latch.read_version().unwrap_or(0);
-                                        ins.last_depth = depth;
+                                        ins.update(
+                                            current.inner_offset(),
+                                            header.latch.read_version().unwrap_or(0),
+                                            node_depth,
+                                            key_bytes,
+                                        );
                                     }
                                     return None;
                                 } else {
@@ -1032,7 +1090,6 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                         }
 
                         if is_node_full(header) {
-                            // Node needs to grow: lock parent and header
                             let parent_ok = match parent {
                                 Some(p) => unsafe { (*p).latch.lock().is_ok() },
                                 None => self.root_latch.lock().is_ok(),
@@ -1050,7 +1107,10 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             }
 
                             let parent_valid = match parent {
-                                Some(p) => unsafe { find_child(p, parent_byte) == Some(current) },
+                                Some(p) => unsafe {
+                                    !(*p).latch.is_obsolete()
+                                        && find_child(p, parent_byte) == Some(current)
+                                },
                                 None => self.root.load(Ordering::Acquire) == current.raw(),
                             };
                             if !parent_valid {
@@ -1085,22 +1145,24 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
 
                             match parent {
                                 Some(p) => unsafe {
-                                    self.replace_child(p, parent_byte, tagged_new_node)
+                                    self.replace_child(p, parent_byte, tagged_new_node);
+                                    header.latch.mark_obsolete_and_unlock();
+                                    (*p).latch.unlock();
                                 },
-                                None => self.root.store(tagged_new_node.raw(), Ordering::Release),
-                            }
-
-                            header.latch.mark_obsolete_and_unlock();
-                            match parent {
-                                Some(p) => unsafe { (*p).latch.unlock() },
-                                None => self.root_latch.unlock(),
+                                None => {
+                                    self.root.store(tagged_new_node.raw(), Ordering::Release);
+                                    header.latch.mark_obsolete_and_unlock();
+                                    self.root_latch.unlock();
+                                }
                             }
                             self.len.fetch_add(1, Ordering::Relaxed);
                             if let Some(ref mut ins) = inserter {
-                                ins.last_parent_offset = new_node_off;
-                                ins.last_parent_version =
-                                    unsafe { (*new_node_ptr).latch.read_version().unwrap_or(0) };
-                                ins.last_depth = depth;
+                                ins.update(
+                                    new_node_off,
+                                    unsafe { (*new_node_ptr).latch.read_version().unwrap_or(0) },
+                                    node_depth,
+                                    key_bytes,
+                                );
                             }
                             return None;
                         } else {
@@ -1134,9 +1196,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             header.latch.unlock();
                             self.len.fetch_add(1, Ordering::Relaxed);
                             if let Some(ref mut ins) = inserter {
-                                ins.last_parent_offset = current.inner_offset();
-                                ins.last_parent_version = header.latch.read_version().unwrap_or(0);
-                                ins.last_depth = depth;
+                                ins.update(current.inner_offset(), v_header, node_depth, key_bytes);
                             }
                             return None;
                         }
@@ -1177,8 +1237,8 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             }
 
                             let existing_key = existing_leaf.key.as_bytes();
-                            let suffix_existing = &existing_key[(depth + 1)..];
-                            let suffix_new = &key_bytes[(depth + 1)..];
+                            let suffix_existing = &existing_key[(node_depth + 1)..];
+                            let suffix_new = &key_bytes[(node_depth + 1)..];
                             let common_len = longest_common_prefix(suffix_existing, suffix_new);
 
                             let exact1 = suffix_existing.len() == common_len;
@@ -1215,7 +1275,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             parent = Some(header_ptr);
                             parent_byte = next_byte;
                             current = child;
-                            depth += 1;
+                            depth = node_depth + 1;
                             continue 'traverse;
                         }
                     }

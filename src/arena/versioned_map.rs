@@ -45,7 +45,10 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
     /// Creates an `ArenaVersionedArtMap` with a dedicated new arena of the given capacity.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::new(Arena::with_capacity(capacity))
+        let arena = Arena::with_capacity(capacity);
+        Self {
+            tree: ArenaVersionedTree::with_capacity(arena, capacity),
+        }
     }
 
     /// Returns a reference to the underlying [`Arena`].
@@ -82,6 +85,12 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
         self.tree.get_latest(key_bytes).map(|(_, v)| v)
     }
 
+    /// Looks up a value by raw byte slice without converting to the owned key type.
+    #[inline]
+    pub fn get_by_slice(&self, key_bytes: &[u8]) -> Option<V> {
+        self.get_slice(key_bytes)
+    }
+
     /// Looks up the newest committed version and value for `key`.
     #[inline]
     pub fn get_latest<Q>(&self, key: &Q) -> Option<(u64, V)>
@@ -102,6 +111,26 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
         Q: AsBytes + ?Sized,
     {
         self.tree.get_version_le(key.as_bytes(), max_version)
+    }
+
+    /// Returns all versions stored for `key`, ordered from newest to oldest.
+    #[inline]
+    pub fn get_all_versions<Q>(&self, key: &Q) -> Vec<(u64, V)>
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        self.tree.get_all_versions(key.as_bytes())
+    }
+
+    /// Returns the number of versions stored for `key`.
+    #[inline]
+    pub fn version_count<Q>(&self, key: &Q) -> usize
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        self.tree.version_count(key.as_bytes())
     }
 
     /// Checks if the key is present in the map with a non-deleted head version.
@@ -148,11 +177,19 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
     {
         let leaf_ptr = self.tree.get_leaf(key.as_bytes())?;
         let leaf = unsafe { &*leaf_ptr };
-        if leaf.removed.swap(true, Ordering::AcqRel) {
+        let head_off = leaf.versions_offset.load(Ordering::Acquire) & !1;
+        if head_off == 0 {
+            return None;
+        }
+        let head = unsafe {
+            &*(self.tree.arena.get_pointer(head_off)
+                as *const crate::arena::node::ArenaVersionNode<V>)
+        };
+        if head.removed.swap(true, Ordering::AcqRel) {
             None
         } else {
             self.tree.len.fetch_sub(1, Ordering::Relaxed);
-            Some(leaf.value.clone())
+            Some(head.value.clone())
         }
     }
 
@@ -192,6 +229,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
             .find_successor(search_key, include_equal)
             .map(|leaf_ptr| ArenaVersionedEntryRef {
                 leaf_ptr,
+                arena: &self.tree.arena,
                 _marker: PhantomData,
             })
     }
@@ -207,6 +245,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
             .find_predecessor(search_key, include_equal)
             .map(|leaf_ptr| ArenaVersionedEntryRef {
                 leaf_ptr,
+                arena: &self.tree.arena,
                 _marker: PhantomData,
             })
     }
@@ -224,6 +263,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
             .last_leaf()
             .map(|leaf_ptr| ArenaVersionedEntryRef {
                 leaf_ptr,
+                arena: &self.tree.arena,
                 _marker: PhantomData,
             })
     }

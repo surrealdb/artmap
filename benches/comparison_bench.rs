@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use arenaskiplist::{Arena as SkiplistArena, SkipList};
-use artmap::arena::ArenaArtMap;
+use artmap::arena::{ArenaArtMap, ArenaInserter, ArenaVersionedArtMap};
+use artmap::versioned::VersionedArtMap;
 use artmap::ArtMap;
 use concread::bptree::BptreeMap;
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
@@ -58,12 +59,29 @@ fn bench_insert(c: &mut Criterion) {
         })
     });
 
+    // VersionedArtMap
+    group.bench_function("versioned_artmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let map = VersionedArtMap::<[u8; 8], u64>::new();
+                let start = Instant::now();
+                for key in 0..BATCH {
+                    let k = key.to_be_bytes();
+                    let _ = map.insert(k, 1, key);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
     // ArenaArtMap
     group.bench_function("arena_artmap", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
+                let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
                 let start = Instant::now();
                 for key in 0..BATCH {
                     let k = key.to_be_bytes();
@@ -80,12 +98,47 @@ fn bench_insert(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
+                let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
                 let mut ins = artmap::arena::ArenaInserter::new();
                 let start = Instant::now();
                 for key in 0..BATCH {
                     let k = key.to_be_bytes();
                     let _ = map.insert_with_inserter(k, key, &mut ins);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    // ArenaVersionedArtMap
+    group.bench_function("arena_versioned_artmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
+                let start = Instant::now();
+                for key in 0..BATCH {
+                    let k = key.to_be_bytes();
+                    let _ = map.insert(k, 1, key);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    // ArenaVersionedArtMap with Inserter
+    group.bench_function("arena_versioned_artmap_with_inserter", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
+                let mut ins = ArenaInserter::new();
+                let start = Instant::now();
+                for key in 0..BATCH {
+                    let k = key.to_be_bytes();
+                    let _ = map.insert_with_inserter(k, 1, key, &mut ins);
                 }
                 total += start.elapsed();
             }
@@ -324,15 +377,47 @@ fn bench_random_insert(c: &mut Criterion) {
         })
     });
 
+    // VersionedArtMap
+    group.bench_function("versioned_artmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let map = VersionedArtMap::<[u8; 8], u64>::new();
+                let start = Instant::now();
+                for (i, &k) in random_keys.iter().enumerate() {
+                    let _ = map.insert(k, 1, i as u64);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
     // ArenaArtMap
     group.bench_function("arena_artmap", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
+                let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
                 let start = Instant::now();
                 for (i, &k) in random_keys.iter().enumerate() {
                     let _ = map.insert(k, i as u64);
+                }
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    // ArenaVersionedArtMap
+    group.bench_function("arena_versioned_artmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
+                let start = Instant::now();
+                for (i, &k) in random_keys.iter().enumerate() {
+                    let _ = map.insert(k, 1, i as u64);
                 }
                 total += start.elapsed();
             }
@@ -530,8 +615,10 @@ fn bench_get(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     let art_map = ArtMap::<[u8; 8], u64>::new();
-    let arena_map = ArenaArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
-    let sl_arena = SkiplistArena::with_capacity(32 * 1024 * 1024);
+    let versioned_map = VersionedArtMap::<[u8; 8], u64>::new();
+    let arena_map = ArenaArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
+    let arena_versioned_map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
+    let sl_arena = SkiplistArena::with_capacity(64 * 1024 * 1024);
     let skiplist = SkipList::new(sl_arena);
     let skip_map = SkipMap::<[u8; 8], u64>::new();
     let mut btree = BTreeMap::new();
@@ -550,7 +637,9 @@ fn bench_get(c: &mut Criterion) {
         for i in 0..SAMPLE_SIZE as u64 {
             let k = i.to_be_bytes();
             art_map.insert(k, i);
+            versioned_map.insert(k, 1, i);
             arena_map.insert(k, i);
+            arena_versioned_map.insert(k, 1, i);
             let _ = skiplist.insert(&k, &k);
             skip_map.insert(k, i);
             btree.insert(i, i);
@@ -586,6 +675,24 @@ fn bench_get(c: &mut Criterion) {
         })
     });
 
+    group.bench_function("versioned_artmap", |b| {
+        let mut rng = seeded_rng(0x12345678);
+        b.iter(|| {
+            let key = rng.gen_range(0..SAMPLE_SIZE as u64);
+            let k = key.to_be_bytes();
+            black_box(versioned_map.get(&k))
+        })
+    });
+
+    group.bench_function("versioned_artmap_slice", |b| {
+        let mut rng = seeded_rng(0x12345678);
+        b.iter(|| {
+            let key = rng.gen_range(0..SAMPLE_SIZE as u64);
+            let bytes = key.to_be_bytes();
+            black_box(versioned_map.get_by_slice(&bytes))
+        })
+    });
+
     group.bench_function("arena_artmap", |b| {
         let mut rng = seeded_rng(0x12345678);
         b.iter(|| {
@@ -601,6 +708,24 @@ fn bench_get(c: &mut Criterion) {
             let key = rng.gen_range(0..SAMPLE_SIZE as u64);
             let bytes = key.to_be_bytes();
             black_box(arena_map.get_slice(&bytes))
+        })
+    });
+
+    group.bench_function("arena_versioned_artmap", |b| {
+        let mut rng = seeded_rng(0x12345678);
+        b.iter(|| {
+            let key = rng.gen_range(0..SAMPLE_SIZE as u64);
+            let k = key.to_be_bytes();
+            black_box(arena_versioned_map.get(&k))
+        })
+    });
+
+    group.bench_function("arena_versioned_artmap_slice", |b| {
+        let mut rng = seeded_rng(0x12345678);
+        b.iter(|| {
+            let key = rng.gen_range(0..SAMPLE_SIZE as u64);
+            let bytes = key.to_be_bytes();
+            black_box(arena_versioned_map.get_slice(&bytes))
         })
     });
 
@@ -713,8 +838,10 @@ fn bench_scan(c: &mut Criterion) {
     group.throughput(Throughput::Elements(100));
 
     let art_map = ArtMap::<[u8; 8], u64>::new();
-    let arena_map = ArenaArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
-    let sl_arena = SkiplistArena::with_capacity(32 * 1024 * 1024);
+    let versioned_map = VersionedArtMap::<[u8; 8], u64>::new();
+    let arena_map = ArenaArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
+    let arena_versioned_map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
+    let sl_arena = SkiplistArena::with_capacity(64 * 1024 * 1024);
     let skiplist = SkipList::new(sl_arena);
     let skip_map = SkipMap::<[u8; 8], u64>::new();
     let mut btree = BTreeMap::new();
@@ -728,7 +855,9 @@ fn bench_scan(c: &mut Criterion) {
         for i in 0..SAMPLE_SIZE as u64 {
             let k = i.to_be_bytes();
             art_map.insert(k, i);
+            versioned_map.insert(k, 1, i);
             arena_map.insert(k, i);
+            arena_versioned_map.insert(k, 1, i);
             let _ = skiplist.insert(&k, &k);
             skip_map.insert(k, i);
             btree.insert(i, i);
@@ -753,6 +882,17 @@ fn bench_scan(c: &mut Criterion) {
         })
     });
 
+    group.bench_function("versioned_artmap", |b| {
+        let mut rng = seeded_rng(0x12345678);
+        b.iter(|| {
+            let start = rng.gen_range(0..(SAMPLE_SIZE - 200) as u64);
+            let start_k = start.to_be_bytes();
+            let end_k = (start + 100).to_be_bytes();
+            let count = versioned_map.range(start_k..end_k).count();
+            black_box(count)
+        })
+    });
+
     group.bench_function("arena_artmap", |b| {
         let mut rng = seeded_rng(0x12345678);
         b.iter(|| {
@@ -760,6 +900,17 @@ fn bench_scan(c: &mut Criterion) {
             let start_k = start.to_be_bytes();
             let end_k = (start + 100).to_be_bytes();
             let count = arena_map.range(start_k..end_k).count();
+            black_box(count)
+        })
+    });
+
+    group.bench_function("arena_versioned_artmap", |b| {
+        let mut rng = seeded_rng(0x12345678);
+        b.iter(|| {
+            let start = rng.gen_range(0..(SAMPLE_SIZE - 200) as u64);
+            let start_k = start.to_be_bytes();
+            let end_k = (start + 100).to_be_bytes();
+            let count = arena_versioned_map.range(start_k..end_k).count();
             black_box(count)
         })
     });
@@ -878,6 +1029,39 @@ fn bench_concurrent_writes(c: &mut Criterion) {
         })
     });
 
+    // VersionedArtMap
+    group.bench_function("versioned_artmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total_duration = Duration::ZERO;
+            for _ in 0..iters {
+                let map = Arc::new(VersionedArtMap::<[u8; 8], u64>::new());
+                let barrier = Arc::new(Barrier::new(NUM_THREADS + 1));
+                let handles: Vec<_> = (0..NUM_THREADS)
+                    .map(|t| {
+                        let map = Arc::clone(&map);
+                        let barrier = Arc::clone(&barrier);
+                        std::thread::spawn(move || {
+                            barrier.wait();
+                            let start = t as u64 * PER_THREAD;
+                            for i in 0..PER_THREAD {
+                                let key = (start + i).to_be_bytes();
+                                let _ = map.insert(key, 1, start + i);
+                            }
+                        })
+                    })
+                    .collect();
+
+                let start_time = Instant::now();
+                barrier.wait();
+                for h in handles {
+                    h.join().unwrap();
+                }
+                total_duration += start_time.elapsed();
+            }
+            total_duration
+        })
+    });
+
     // ArenaArtMap
     group.bench_function("arena_artmap", |b| {
         b.iter_custom(|iters| {
@@ -895,6 +1079,41 @@ fn bench_concurrent_writes(c: &mut Criterion) {
                             for i in 0..PER_THREAD {
                                 let key = (start + i).to_be_bytes();
                                 let _ = map.insert(key, start + i);
+                            }
+                        })
+                    })
+                    .collect();
+
+                let start_time = Instant::now();
+                barrier.wait();
+                for h in handles {
+                    h.join().unwrap();
+                }
+                total_duration += start_time.elapsed();
+            }
+            total_duration
+        })
+    });
+
+    // ArenaVersionedArtMap
+    group.bench_function("arena_versioned_artmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total_duration = Duration::ZERO;
+            for _ in 0..iters {
+                let map = Arc::new(ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(
+                    64 * 1024 * 1024,
+                ));
+                let barrier = Arc::new(Barrier::new(NUM_THREADS + 1));
+                let handles: Vec<_> = (0..NUM_THREADS)
+                    .map(|t| {
+                        let map = Arc::clone(&map);
+                        let barrier = Arc::clone(&barrier);
+                        std::thread::spawn(move || {
+                            barrier.wait();
+                            let start = t as u64 * PER_THREAD;
+                            for i in 0..PER_THREAD {
+                                let key = (start + i).to_be_bytes();
+                                let _ = map.insert(key, 1, start + i);
                             }
                         })
                     })
@@ -1344,6 +1563,58 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
         })
     });
 
+    // VersionedArtMap
+    group.bench_function("versioned_artmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total_duration = Duration::ZERO;
+            for _ in 0..iters {
+                let map = Arc::new(VersionedArtMap::<[u8; 8], u64>::new());
+                for i in 0..PRE_POPULATE {
+                    map.insert(i.to_be_bytes(), 1, i);
+                }
+                let barrier = Arc::new(Barrier::new(NUM_READERS + NUM_WRITERS + 1));
+
+                let mut handles = Vec::new();
+
+                // Writers
+                for t in 0..NUM_WRITERS {
+                    let map = Arc::clone(&map);
+                    let barrier = Arc::clone(&barrier);
+                    handles.push(std::thread::spawn(move || {
+                        barrier.wait();
+                        let start = PRE_POPULATE + (t as u64 * OPS_PER_THREAD);
+                        for i in 0..OPS_PER_THREAD {
+                            let key = (start + i).to_be_bytes();
+                            let _ = map.insert(key, 2, start + i);
+                        }
+                    }));
+                }
+
+                // Readers
+                for _ in 0..NUM_READERS {
+                    let map = Arc::clone(&map);
+                    let barrier = Arc::clone(&barrier);
+                    handles.push(std::thread::spawn(move || {
+                        barrier.wait();
+                        let mut rng = seeded_rng(0x12345678);
+                        for _ in 0..OPS_PER_THREAD {
+                            let key = rng.gen_range(0..PRE_POPULATE).to_be_bytes();
+                            black_box(map.get_by_slice(&key));
+                        }
+                    }));
+                }
+
+                let start_time = Instant::now();
+                barrier.wait();
+                for h in handles {
+                    h.join().unwrap();
+                }
+                total_duration += start_time.elapsed();
+            }
+            total_duration
+        })
+    });
+
     // ArenaArtMap
     group.bench_function("arena_artmap", |b| {
         b.iter_custom(|iters| {
@@ -1367,6 +1638,60 @@ fn bench_concurrent_mixed(c: &mut Criterion) {
                         for i in 0..OPS_PER_THREAD {
                             let key = (start + i).to_be_bytes();
                             let _ = map.insert(key, start + i);
+                        }
+                    }));
+                }
+
+                // Readers
+                for _ in 0..NUM_READERS {
+                    let map = Arc::clone(&map);
+                    let barrier = Arc::clone(&barrier);
+                    handles.push(std::thread::spawn(move || {
+                        barrier.wait();
+                        let mut rng = seeded_rng(0x12345678);
+                        for _ in 0..OPS_PER_THREAD {
+                            let key = rng.gen_range(0..PRE_POPULATE).to_be_bytes();
+                            black_box(map.get_slice(&key));
+                        }
+                    }));
+                }
+
+                let start_time = Instant::now();
+                barrier.wait();
+                for h in handles {
+                    h.join().unwrap();
+                }
+                total_duration += start_time.elapsed();
+            }
+            total_duration
+        })
+    });
+
+    // ArenaVersionedArtMap
+    group.bench_function("arena_versioned_artmap", |b| {
+        b.iter_custom(|iters| {
+            let mut total_duration = Duration::ZERO;
+            for _ in 0..iters {
+                let map = Arc::new(ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(
+                    64 * 1024 * 1024,
+                ));
+                for i in 0..PRE_POPULATE {
+                    map.insert(i.to_be_bytes(), 1, i);
+                }
+                let barrier = Arc::new(Barrier::new(NUM_READERS + NUM_WRITERS + 1));
+
+                let mut handles = Vec::new();
+
+                // Writers
+                for t in 0..NUM_WRITERS {
+                    let map = Arc::clone(&map);
+                    let barrier = Arc::clone(&barrier);
+                    handles.push(std::thread::spawn(move || {
+                        barrier.wait();
+                        let start = PRE_POPULATE + (t as u64 * OPS_PER_THREAD);
+                        for i in 0..OPS_PER_THREAD {
+                            let key = (start + i).to_be_bytes();
+                            let _ = map.insert(key, 2, start + i);
                         }
                     }));
                 }
