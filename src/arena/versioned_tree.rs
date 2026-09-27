@@ -221,12 +221,36 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
             let header_ptr =
                 self.arena.get_pointer_mut(inserter.last_parent_offset) as *mut NodeHeader;
             let header = unsafe { &mut *header_ptr };
-            if header
+            let next_byte = key_bytes[inserter.last_depth];
+
+            if header.node_type == NodeType::Node256 {
+                let n256 = unsafe { &*(header_ptr as *const Node256) };
+                if n256.children[next_byte as usize].load(Ordering::Acquire) == 0 {
+                    if n256.children[next_byte as usize]
+                        .compare_exchange(
+                            0,
+                            tagged_new_leaf.raw(),
+                            Ordering::Release,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        set_bitmap_bit(&n256.child_bitmap, next_byte);
+                        if header.latch.validate(inserter.last_parent_version) {
+                            n256.header.inc_num_children();
+                            self.len.fetch_add(1, Ordering::Relaxed);
+                            return true;
+                        } else {
+                            clear_bitmap_bit(&n256.child_bitmap, next_byte);
+                            n256.children[next_byte as usize].store(0, Ordering::Release);
+                        }
+                    }
+                }
+            } else if header
                 .latch
                 .lock_version(inserter.last_parent_version)
                 .is_ok()
             {
-                let next_byte = key_bytes[inserter.last_depth];
                 let is_full = is_node_full(header);
                 let child = unsafe { find_child(header_ptr, next_byte) };
                 if !is_full && child.is_none() {
