@@ -54,9 +54,6 @@ harness = false
 name = "alloc_comparison"
 harness = false
 
-[profile.bench]
-debug = true
-
 [lints.clippy]
 allow_attributes = "allow"
 assigning_clones = "warn"
