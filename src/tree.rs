@@ -621,7 +621,8 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
 
                     let parent_valid = match parent {
                         Some(p) => unsafe {
-                            !(*p).latch.is_obsolete() && find_child(&*p, parent_byte) == Some(current)
+                            !(*p).latch.is_obsolete()
+                                && find_child(&*p, parent_byte) == Some(current)
                         },
                         None => self.root.load(Ordering::Acquire) == current.as_raw(),
                     };
