@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # Versioned Range Iterators
+//! # Multi-Version Range Iterators
 //!
-//! Provides bidirectional range scanning for [`VersionedArtMap`](crate::versioned::VersionedArtMap).
+//! Provides bidirectional range scanning over MVCC versioned entries in a [`VersionedArtMap`](crate::versioned::VersionedArtMap).
 
 use crossbeam_epoch::Guard;
 use std::ops::Bound;
 use std::sync::atomic::Ordering;
 
+use crate::iter::{child_pos_for_byte, next_child_in_node};
 use crate::key::AsBytes;
 use crate::node::{
     Node16, Node256, Node4, Node48, NodeHeader, NodeType, TaggedPtr, VersionedLeaf, NODE48_EMPTY,
@@ -28,7 +29,6 @@ use crate::versioned::entry::VersionedEntryRef;
 use crate::versioned::tree::VersionedTree;
 
 const MAX_STACK_DEPTH: usize = 16;
-const INLINE_KEY_BUF: usize = 64;
 
 #[derive(Clone, Copy)]
 struct CursorFrame {
@@ -52,14 +52,8 @@ pub struct Range<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> {
     stack: [CursorFrame; MAX_STACK_DEPTH],
     stack_len: usize,
     stack_overflow: Vec<CursorFrame>,
-    cursor_front_buf: [u8; INLINE_KEY_BUF],
-    cursor_front_len: usize,
-    cursor_front_overflow: Vec<u8>,
-    cursor_back_buf: [u8; INLINE_KEY_BUF],
-    cursor_back_len: usize,
-    cursor_back_overflow: Vec<u8>,
-    has_front: bool,
-    has_back: bool,
+    last_leaf_front: Option<*mut VersionedLeaf<K, V>>,
+    last_leaf_back: Option<*mut VersionedLeaf<K, V>>,
     exhausted: bool,
 }
 
@@ -78,19 +72,13 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Range<'a, K, V>
             stack: [CursorFrame::NULL; MAX_STACK_DEPTH],
             stack_len: 0,
             stack_overflow: Vec::new(),
-            cursor_front_buf: [0u8; INLINE_KEY_BUF],
-            cursor_front_len: 0,
-            cursor_front_overflow: Vec::new(),
-            cursor_back_buf: [0u8; INLINE_KEY_BUF],
-            cursor_back_len: 0,
-            cursor_back_overflow: Vec::new(),
-            has_front: false,
-            has_back: false,
+            last_leaf_front: None,
+            last_leaf_back: None,
             exhausted: false,
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn stack_push(&mut self, frame: CursorFrame) {
         if self.stack_len < MAX_STACK_DEPTH && self.stack_overflow.is_empty() {
             self.stack[self.stack_len] = frame;
@@ -100,7 +88,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Range<'a, K, V>
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn stack_last_mut(&mut self) -> Option<&mut CursorFrame> {
         if let Some(f) = self.stack_overflow.last_mut() {
             Some(f)
@@ -111,7 +99,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Range<'a, K, V>
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn stack_pop(&mut self) -> Option<CursorFrame> {
         if let Some(f) = self.stack_overflow.pop() {
             Some(f)
@@ -123,33 +111,30 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Range<'a, K, V>
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn stack_clear(&mut self) {
         self.stack_len = 0;
         self.stack_overflow.clear();
     }
 
-    #[inline]
-    fn set_cursor_front(&mut self, bytes: &[u8]) {
-        self.has_front = true;
-        if bytes.len() <= INLINE_KEY_BUF {
-            self.cursor_front_buf[..bytes.len()].copy_from_slice(bytes);
-            self.cursor_front_len = bytes.len();
-            self.cursor_front_overflow.clear();
-        } else {
-            self.cursor_front_len = 0;
-            self.cursor_front_overflow.clear();
-            self.cursor_front_overflow.extend_from_slice(bytes);
-        }
+    #[inline(always)]
+    fn set_cursor_front(&mut self, ptr: *mut VersionedLeaf<K, V>) {
+        self.last_leaf_front = Some(ptr);
     }
 
-    #[inline]
-    fn cursor_front(&self) -> &[u8] {
-        if self.cursor_front_len > 0 {
-            &self.cursor_front_buf[..self.cursor_front_len]
-        } else {
-            &self.cursor_front_overflow
-        }
+    #[inline(always)]
+    fn cursor_front(&self) -> Option<&[u8]> {
+        self.last_leaf_front.map(|p| unsafe { (*p).key.as_bytes() })
+    }
+
+    #[inline(always)]
+    fn set_cursor_back(&mut self, ptr: *mut VersionedLeaf<K, V>) {
+        self.last_leaf_back = Some(ptr);
+    }
+
+    #[inline(always)]
+    fn cursor_back(&self) -> Option<&[u8]> {
+        self.last_leaf_back.map(|p| unsafe { (*p).key.as_bytes() })
     }
 
     fn push_and_descend_left(&mut self, mut ptr: TaggedPtr) -> Option<*mut VersionedLeaf<K, V>> {
@@ -252,7 +237,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Iterator for Ra
         }
 
         loop {
-            let leaf_ptr = if !self.has_front {
+            let mut leaf_ptr = if self.last_leaf_front.is_none() {
                 let (search_key, include_equal) = match &self.start_bound {
                     Bound::Included(k) => (k.as_slice(), true),
                     Bound::Excluded(k) => (k.as_slice(), false),
@@ -303,7 +288,14 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Iterator for Ra
                 match self.advance_forward() {
                     Some(ptr) => ptr,
                     None => {
-                        let ptr = self.tree.find_successor(self.cursor_front(), false)?;
+                        let prev_k = self.cursor_front().unwrap();
+                        let ptr = match self.tree.find_successor(prev_k, false) {
+                            Some(p) => p,
+                            None => {
+                                self.exhausted = true;
+                                return None;
+                            }
+                        };
                         let leaf = unsafe { &*ptr };
                         self.seek_to_key(leaf.key.as_bytes());
                         ptr
@@ -311,8 +303,25 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Iterator for Ra
                 }
             };
 
-            let leaf = unsafe { &*leaf_ptr };
-            let k_bytes = leaf.key.as_bytes();
+            let mut leaf = unsafe { &*leaf_ptr };
+            let mut k_bytes = leaf.key.as_bytes();
+
+            if let Some(prev_k) = self.cursor_front() {
+                if k_bytes <= prev_k {
+                    match self.tree.find_successor(prev_k, false) {
+                        Some(p) => {
+                            leaf_ptr = p;
+                            leaf = unsafe { &*leaf_ptr };
+                            k_bytes = leaf.key.as_bytes();
+                            self.seek_to_key(k_bytes);
+                        }
+                        None => {
+                            self.exhausted = true;
+                            return None;
+                        }
+                    }
+                }
+            }
 
             // Check upper range bound
             match &self.end_bound {
@@ -332,12 +341,14 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Iterator for Ra
             }
 
             // Check overlap with backward cursor
-            if self.has_back && k_bytes > self.cursor_back() {
-                self.exhausted = true;
-                return None;
+            if let Some(back_k) = self.cursor_back() {
+                if k_bytes >= back_k {
+                    self.exhausted = true;
+                    return None;
+                }
             }
 
-            self.set_cursor_front(k_bytes);
+            self.set_cursor_front(leaf_ptr);
 
             if !leaf.is_removed() {
                 return Some(VersionedEntryRef {
@@ -358,8 +369,8 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> DoubleEndedIter
         }
 
         loop {
-            let (search_key, include_equal) = if self.has_back {
-                (self.cursor_back(), false)
+            let (search_key, include_equal) = if let Some(back_k) = self.cursor_back() {
+                (back_k, false)
             } else {
                 match &self.end_bound {
                     Bound::Included(k) => (k.as_slice(), true),
@@ -386,12 +397,14 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> DoubleEndedIter
             }
 
             // Check overlap with forward cursor
-            if self.has_front && k_bytes < self.cursor_front() {
-                self.exhausted = true;
-                return None;
+            if let Some(front_k) = self.cursor_front() {
+                if k_bytes <= front_k {
+                    self.exhausted = true;
+                    return None;
+                }
             }
 
-            self.set_cursor_back(k_bytes);
+            self.set_cursor_back(leaf_ptr);
 
             if !leaf.is_removed() {
                 return Some(VersionedEntryRef {
@@ -399,31 +412,6 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> DoubleEndedIter
                     _marker: std::marker::PhantomData,
                 });
             }
-        }
-    }
-}
-
-impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> Range<'a, K, V> {
-    #[inline]
-    fn set_cursor_back(&mut self, bytes: &[u8]) {
-        self.has_back = true;
-        if bytes.len() <= INLINE_KEY_BUF {
-            self.cursor_back_buf[..bytes.len()].copy_from_slice(bytes);
-            self.cursor_back_len = bytes.len();
-            self.cursor_back_overflow.clear();
-        } else {
-            self.cursor_back_len = 0;
-            self.cursor_back_overflow.clear();
-            self.cursor_back_overflow.extend_from_slice(bytes);
-        }
-    }
-
-    #[inline]
-    fn cursor_back(&self) -> &[u8] {
-        if self.cursor_back_len > 0 {
-            &self.cursor_back_buf[..self.cursor_back_len]
-        } else {
-            &self.cursor_back_overflow
         }
     }
 }
@@ -520,6 +508,7 @@ pub(crate) unsafe fn last_leaf_in_subtree<K, V>(
                     }
                 }
             }
+            header.load_exact_versioned_leaf::<K, V>(Ordering::Acquire)
         }
         NodeType::Node16 => {
             let n = &*(ptr.as_inner_ptr() as *const Node16);
@@ -531,6 +520,7 @@ pub(crate) unsafe fn last_leaf_in_subtree<K, V>(
                     }
                 }
             }
+            header.load_exact_versioned_leaf::<K, V>(Ordering::Acquire)
         }
         NodeType::Node48 => {
             let n = &*(ptr.as_inner_ptr() as *const Node48);
@@ -546,6 +536,7 @@ pub(crate) unsafe fn last_leaf_in_subtree<K, V>(
                     }
                 }
             }
+            header.load_exact_versioned_leaf::<K, V>(Ordering::Acquire)
         }
         NodeType::Node256 => {
             let n = &*(ptr.as_inner_ptr() as *const Node256);
@@ -557,139 +548,7 @@ pub(crate) unsafe fn last_leaf_in_subtree<K, V>(
                     }
                 }
             }
-        }
-    }
-
-    if let Some(leaf) = header.load_exact_versioned_leaf::<K, V>(Ordering::Acquire) {
-        return Some(leaf);
-    }
-
-    None
-}
-
-unsafe fn next_child_in_node(
-    header: *mut NodeHeader,
-    current_pos: usize,
-) -> Option<(usize, TaggedPtr)> {
-    let h = &*header;
-    match h.node_type {
-        NodeType::Node4 => {
-            let n = &*(header as *const Node4);
-            let count = n.header.num_children as usize;
-            let next_idx = if current_pos == usize::MAX {
-                0
-            } else {
-                current_pos + 1
-            };
-            if next_idx < count {
-                let child = TaggedPtr::from_raw(n.children[next_idx].load(Ordering::Acquire));
-                if !child.is_null() {
-                    return Some((next_idx, child));
-                }
-            }
-            None
-        }
-        NodeType::Node16 => {
-            let n = &*(header as *const Node16);
-            let count = n.header.num_children as usize;
-            let next_idx = if current_pos == usize::MAX {
-                0
-            } else {
-                current_pos + 1
-            };
-            if next_idx < count {
-                let child = TaggedPtr::from_raw(n.children[next_idx].load(Ordering::Acquire));
-                if !child.is_null() {
-                    return Some((next_idx, child));
-                }
-            }
-            None
-        }
-        NodeType::Node48 => {
-            let n = &*(header as *const Node48);
-            let next_byte = if current_pos == usize::MAX {
-                0
-            } else {
-                current_pos + 1
-            };
-            for byte in next_byte..=255 {
-                let slot = n.child_indices[byte];
-                if slot != NODE48_EMPTY {
-                    let child =
-                        TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
-                    if !child.is_null() {
-                        return Some((byte, child));
-                    }
-                }
-            }
-            None
-        }
-        NodeType::Node256 => {
-            let n = &*(header as *const Node256);
-            let next_byte = if current_pos == usize::MAX {
-                0
-            } else {
-                current_pos + 1
-            };
-            for byte in next_byte..=255 {
-                let child = TaggedPtr::from_raw(n.children[byte].load(Ordering::Acquire));
-                if !child.is_null() {
-                    return Some((byte, child));
-                }
-            }
-            None
-        }
-    }
-}
-
-unsafe fn child_pos_for_byte(header: *mut NodeHeader, needle: u8) -> Option<(usize, TaggedPtr)> {
-    let h = &*header;
-    match h.node_type {
-        NodeType::Node4 => {
-            let n = &*(header as *const Node4);
-            let count = n.header.num_children as usize;
-            for i in 0..count {
-                if n.keys[i] == needle {
-                    let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
-                    if !child.is_null() {
-                        return Some((i, child));
-                    }
-                }
-            }
-            None
-        }
-        NodeType::Node16 => {
-            let n = &*(header as *const Node16);
-            let count = n.header.num_children as usize;
-            for i in 0..count {
-                if n.keys[i] == needle {
-                    let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
-                    if !child.is_null() {
-                        return Some((i, child));
-                    }
-                }
-            }
-            None
-        }
-        NodeType::Node48 => {
-            let n = &*(header as *const Node48);
-            let slot = n.child_indices[needle as usize];
-            if slot != NODE48_EMPTY {
-                let child = TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
-                if !child.is_null() {
-                    return Some((needle as usize, child));
-                }
-            }
-            None
-        }
-        NodeType::Node256 => {
-            let n = &*(header as *const Node256);
-            let child = TaggedPtr::from_raw(n.children[needle as usize].load(Ordering::Acquire));
-            if !child.is_null() {
-                Some((needle as usize, child))
-            } else {
-                None
-            }
+            header.load_exact_versioned_leaf::<K, V>(Ordering::Acquire)
         }
     }
 }
