@@ -48,6 +48,16 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
         }
     }
 
+    pub fn with_capacity(arena: Arc<Arena>, capacity: usize) -> Self {
+        let tree = Self::new(arena);
+        if capacity >= 1024 {
+            if let Some(n256_off) = tree.alloc_node256(&[]) {
+                tree.root.store(TaggedOffset::from_inner(n256_off).raw(), Ordering::Release);
+            }
+        }
+        tree
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.len.load(Ordering::Relaxed)

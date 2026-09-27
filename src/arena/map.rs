@@ -72,7 +72,10 @@ impl<K: AsBytes + Clone, V: Clone> ArenaArtMap<K, V> {
     /// Creates an `ArenaArtMap` with a dedicated new arena of the given capacity.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::new(Arena::with_capacity(capacity))
+        let arena = Arena::with_capacity(capacity);
+        Self {
+            tree: ArenaTree::with_capacity(arena, capacity),
+        }
     }
 
     /// Returns a reference to the underlying [`Arena`].

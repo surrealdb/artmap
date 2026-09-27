@@ -47,6 +47,13 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedArtMap<K, 
         }
     }
 
+    /// Creates a new `VersionedArtMap` pre-sized for high-capacity ingestion.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            tree: VersionedTree::with_capacity(capacity),
+        }
+    }
+
     /// Returns the number of distinct keys stored in the map.
     #[inline]
     pub fn len(&self) -> usize {

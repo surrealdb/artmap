@@ -45,7 +45,10 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
     /// Creates an `ArenaVersionedArtMap` with a dedicated new arena of the given capacity.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::new(Arena::with_capacity(capacity))
+        let arena = Arena::with_capacity(capacity);
+        Self {
+            tree: ArenaVersionedTree::with_capacity(arena, capacity),
+        }
     }
 
     /// Returns a reference to the underlying [`Arena`].
