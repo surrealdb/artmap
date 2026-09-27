@@ -21,7 +21,7 @@ use crate::arena::node::{
 };
 use crate::arena::Arena;
 use crate::key::AsBytes;
-use crate::latch::{CachePadded, HybridLatch, SpinBackoff};
+use crate::latch::{CachePadded, HybridLatch};
 use crate::node::{NodeType, MAX_PREFIX_LEN, NODE48_EMPTY};
 use crate::simd::find_child_node16;
 
@@ -898,13 +898,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                 let v_header = match header.latch.read_version() {
                     Some(v) => v,
                     None => {
-                        let mut backoff = SpinBackoff::new();
-                        while header.latch.is_locked() {
-                            backoff.spin();
-                        }
-                        if !header.latch.is_obsolete() {
-                            continue 'traverse;
-                        }
+                        std::hint::spin_loop();
                         continue 'retry;
                     }
                 };
@@ -913,15 +907,18 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
 
                 // Prefix mismatch -> prefix split
                 if !is_full {
-                    if let Some(p) = parent {
-                        if unsafe { (*p).latch.lock().is_err() } {
-                            continue 'retry;
-                        }
+                    let parent_ok = match parent {
+                        Some(p) => unsafe { (*p).latch.lock().is_ok() },
+                        None => self.root_latch.lock().is_ok(),
+                    };
+                    if !parent_ok {
+                        continue 'retry;
                     }
 
                     if header.latch.lock_version(v_header).is_err() {
-                        if let Some(p) = parent {
-                            unsafe { (*p).latch.unlock() };
+                        match parent {
+                            Some(p) => unsafe { (*p).latch.unlock() },
+                            None => self.root_latch.unlock(),
                         }
                         continue 'retry;
                     }
@@ -932,8 +929,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                     };
                     if !parent_valid {
                         header.latch.unlock();
-                        if let Some(p) = parent {
-                            unsafe { (*p).latch.unlock() };
+                        match parent {
+                            Some(p) => unsafe { (*p).latch.unlock() },
+                            None => self.root_latch.unlock(),
                         }
                         continue 'retry;
                     }
@@ -984,6 +982,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             None => {
                                 self.root.store(tagged_split.raw(), Ordering::Release);
                                 header.latch.unlock();
+                                self.root_latch.unlock();
                             }
                         }
 
@@ -1083,35 +1082,43 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                         }
 
                         if is_node_full(header) {
-                            if let Some(p) = parent {
-                                if unsafe { (*p).latch.lock().is_err() } {
-                                    continue 'retry;
-                                }
+                            let parent_ok = match parent {
+                                Some(p) => unsafe { (*p).latch.lock().is_ok() },
+                                None => self.root_latch.lock().is_ok(),
+                            };
+                            if !parent_ok {
+                                continue 'retry;
                             }
 
                             if header.latch.lock_version(v_header).is_err() {
-                                if let Some(p) = parent {
-                                    unsafe { (*p).latch.unlock() };
+                                match parent {
+                                    Some(p) => unsafe { (*p).latch.unlock() },
+                                    None => self.root_latch.unlock(),
                                 }
                                 continue 'retry;
                             }
 
                             let parent_valid = match parent {
-                                Some(p) => unsafe { find_child(p, parent_byte) == Some(current) },
+                                Some(p) => unsafe {
+                                    !(*p).latch.is_obsolete()
+                                        && find_child(p, parent_byte) == Some(current)
+                                },
                                 None => self.root.load(Ordering::Acquire) == current.raw(),
                             };
                             if !parent_valid {
                                 header.latch.unlock();
-                                if let Some(p) = parent {
-                                    unsafe { (*p).latch.unlock() };
+                                match parent {
+                                    Some(p) => unsafe { (*p).latch.unlock() },
+                                    None => self.root_latch.unlock(),
                                 }
                                 continue 'retry;
                             }
 
                             if unsafe { find_child(header_ptr, next_byte) }.is_some() {
                                 header.latch.unlock();
-                                if let Some(p) = parent {
-                                    unsafe { (*p).latch.unlock() };
+                                match parent {
+                                    Some(p) => unsafe { (*p).latch.unlock() },
+                                    None => self.root_latch.unlock(),
                                 }
                                 continue 'retry;
                             }
@@ -1137,6 +1144,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                                 None => {
                                     self.root.store(tagged_new_node.raw(), Ordering::Release);
                                     header.latch.mark_obsolete_and_unlock();
+                                    self.root_latch.unlock();
                                 }
                             }
                             self.len.fetch_add(1, Ordering::Relaxed);
@@ -1150,9 +1158,6 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                         } else {
                             // Node has room: lock header only
                             if header.latch.lock_version(v_header).is_err() {
-                                if !header.latch.is_obsolete() {
-                                    continue 'traverse;
-                                }
                                 continue 'retry;
                             }
 
@@ -1165,9 +1170,6 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             };
                             if !parent_valid {
                                 header.latch.unlock();
-                                if !header.latch.is_obsolete() {
-                                    continue 'traverse;
-                                }
                                 continue 'retry;
                             }
 
@@ -1175,9 +1177,6 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                                 || unsafe { find_child(header_ptr, next_byte) }.is_some()
                             {
                                 header.latch.unlock();
-                                if !header.latch.is_obsolete() {
-                                    continue 'traverse;
-                                }
                                 continue 'retry;
                             }
 
@@ -1197,9 +1196,6 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                     Some(child) => {
                         if child.is_leaf() {
                             if header.latch.lock_version(v_header).is_err() {
-                                if !header.latch.is_obsolete() {
-                                    continue 'traverse;
-                                }
                                 continue 'retry;
                             }
 
@@ -1212,16 +1208,10 @@ impl<K: AsBytes + Clone, V: Clone> ArenaTree<K, V> {
                             };
                             if !parent_valid {
                                 header.latch.unlock();
-                                if !header.latch.is_obsolete() {
-                                    continue 'traverse;
-                                }
                                 continue 'retry;
                             }
                             if unsafe { find_child(header_ptr, next_byte) } != Some(child) {
                                 header.latch.unlock();
-                                if !header.latch.is_obsolete() {
-                                    continue 'traverse;
-                                }
                                 continue 'retry;
                             }
 

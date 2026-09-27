@@ -23,7 +23,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::key::AsBytes;
-use crate::latch::{CachePadded, HybridLatch, SpinBackoff};
+use crate::latch::{CachePadded, HybridLatch};
 use crate::node::{
     Leaf, Node16, Node256, Node4, Node48, NodeHeader, NodeType, TaggedPtr, MAX_PREFIX_LEN,
     NODE48_EMPTY,
@@ -481,13 +481,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                 let v_header = match header.latch.read_version() {
                     Some(v) => v,
                     None => {
-                        let mut backoff = SpinBackoff::new();
-                        while header.latch.is_locked() {
-                            backoff.spin();
-                        }
-                        if !header.latch.is_obsolete() {
-                            continue 'traverse;
-                        }
+                        std::hint::spin_loop();
                         continue 'retry;
                     }
                 };
@@ -496,15 +490,18 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
 
                 // Prefix mismatch -> prefix split
                 if !is_full {
-                    if let Some(p) = parent {
-                        if unsafe { (*p).latch.lock().is_err() } {
-                            continue 'retry;
-                        }
+                    let parent_ok = match parent {
+                        Some(p) => unsafe { (*p).latch.lock().is_ok() },
+                        None => self.root_latch.lock().is_ok(),
+                    };
+                    if !parent_ok {
+                        continue 'retry;
                     }
 
                     if header.latch.lock_version(v_header).is_err() {
-                        if let Some(p) = parent {
-                            unsafe { (*p).latch.unlock() };
+                        match parent {
+                            Some(p) => unsafe { (*p).latch.unlock() },
+                            None => self.root_latch.unlock(),
                         }
                         continue 'retry;
                     }
@@ -515,8 +512,9 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                     };
                     if !parent_valid {
                         header.latch.unlock();
-                        if let Some(p) = parent {
-                            unsafe { (*p).latch.unlock() };
+                        match parent {
+                            Some(p) => unsafe { (*p).latch.unlock() },
+                            None => self.root_latch.unlock(),
                         }
                         continue 'retry;
                     }
@@ -564,6 +562,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             self.root.store(tagged_split.as_raw(), Ordering::Release);
                             self.len.fetch_add(1, Ordering::Relaxed);
                             header.latch.unlock();
+                            self.root_latch.unlock();
                         }
                     }
                     if let Some(ref mut ins) = inserter {
@@ -645,15 +644,18 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
 
                         if is_node_full(header) {
                             // Node needs to grow
-                            if let Some(p) = parent {
-                                if unsafe { (*p).latch.lock().is_err() } {
-                                    continue 'retry;
-                                }
+                            let parent_ok = match parent {
+                                Some(p) => unsafe { (*p).latch.lock().is_ok() },
+                                None => self.root_latch.lock().is_ok(),
+                            };
+                            if !parent_ok {
+                                continue 'retry;
                             }
 
                             if header.latch.lock_version(v_header).is_err() {
-                                if let Some(p) = parent {
-                                    unsafe { (*p).latch.unlock() };
+                                match parent {
+                                    Some(p) => unsafe { (*p).latch.unlock() },
+                                    None => self.root_latch.unlock(),
                                 }
                                 continue 'retry;
                             }
@@ -664,16 +666,18 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             };
                             if !parent_valid {
                                 header.latch.unlock();
-                                if let Some(p) = parent {
-                                    unsafe { (*p).latch.unlock() };
+                                match parent {
+                                    Some(p) => unsafe { (*p).latch.unlock() },
+                                    None => self.root_latch.unlock(),
                                 }
                                 continue 'retry;
                             }
 
                             if unsafe { find_child(header, next_byte) }.is_some() {
                                 header.latch.unlock();
-                                if let Some(p) = parent {
-                                    unsafe { (*p).latch.unlock() };
+                                match parent {
+                                    Some(p) => unsafe { (*p).latch.unlock() },
+                                    None => self.root_latch.unlock(),
                                 }
                                 continue 'retry;
                             }
@@ -693,6 +697,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 None => {
                                     self.root.store(tagged_new_node.as_raw(), Ordering::Release);
                                     header.latch.mark_obsolete_and_unlock();
+                                    self.root_latch.unlock();
                                 }
                             }
                             self.len.fetch_add(1, Ordering::Relaxed);
@@ -706,9 +711,6 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                         } else {
                             // Fast path: node has room. Lock header only (no parent or root latch)
                             if header.latch.lock_version(v_header).is_err() {
-                                if !header.latch.is_obsolete() {
-                                    continue 'traverse;
-                                }
                                 continue 'retry;
                             }
 
@@ -716,9 +718,6 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 || unsafe { find_child(header, next_byte) }.is_some()
                             {
                                 header.latch.unlock();
-                                if !header.latch.is_obsolete() {
-                                    continue 'traverse;
-                                }
                                 continue 'retry;
                             }
 
@@ -739,16 +738,10 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                     Some(child) => {
                         if child.is_leaf() {
                             if header.latch.lock_version(v_header).is_err() {
-                                if !header.latch.is_obsolete() {
-                                    continue 'traverse;
-                                }
                                 continue 'retry;
                             }
                             if unsafe { find_child(header, next_byte) } != Some(child) {
                                 header.latch.unlock();
-                                if !header.latch.is_obsolete() {
-                                    continue 'traverse;
-                                }
                                 continue 'retry;
                             }
 

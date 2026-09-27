@@ -23,7 +23,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::key::AsBytes;
-use crate::latch::{CachePadded, HybridLatch, SpinBackoff};
+use crate::latch::{CachePadded, HybridLatch};
 use crate::node::{
     Node16, Node256, Node4, Node48, NodeHeader, NodeType, TaggedPtr, VersionNode, VersionedLeaf,
     MAX_PREFIX_LEN, NODE48_EMPTY,
@@ -381,13 +381,7 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                 let v_header = match header.latch.read_version() {
                     Some(v) => v,
                     None => {
-                        let mut backoff = SpinBackoff::new();
-                        while header.latch.is_locked() {
-                            backoff.spin();
-                        }
-                        if !header.latch.is_obsolete() {
-                            continue 'traverse;
-                        }
+                        std::hint::spin_loop();
                         continue 'retry;
                     }
                 };
@@ -558,9 +552,6 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                             }
                         } else {
                             if header.latch.lock_version(v_header).is_err() {
-                                if !header.latch.is_obsolete() {
-                                    continue 'traverse;
-                                }
                                 continue 'retry;
                             }
 
@@ -568,9 +559,6 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                                 || unsafe { find_child(header, next_byte) }.is_some()
                             {
                                 header.latch.unlock();
-                                if !header.latch.is_obsolete() {
-                                    continue 'traverse;
-                                }
                                 continue 'retry;
                             }
 
@@ -590,16 +578,10 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                     Some(child) => {
                         if child.is_leaf() {
                             if header.latch.lock_version(v_header).is_err() {
-                                if !header.latch.is_obsolete() {
-                                    continue 'traverse;
-                                }
                                 continue 'retry;
                             }
                             if unsafe { find_child(header, next_byte) } != Some(child) {
                                 header.latch.unlock();
-                                if !header.latch.is_obsolete() {
-                                    continue 'traverse;
-                                }
                                 continue 'retry;
                             }
 
