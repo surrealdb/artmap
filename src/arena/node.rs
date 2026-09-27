@@ -96,23 +96,21 @@ impl<K, V> Leaf<K, V> {
     }
 }
 
-/// Multi-version (MVCC) leaf node allocated within an [`Arena`].
+/// A version entry in an arena MVCC version chain.
 #[repr(C, align(8))]
-pub struct VersionedLeaf<K, V> {
+pub struct ArenaVersionNode<V> {
     pub removed: AtomicBool,
     pub _pad: [u8; 3],
-    /// 32-bit offset to an older version of this key, or 0 if none.
+    /// 32-bit offset to next older version in arena, or 0 if none.
     pub next_version_offset: AtomicU32,
-    /// 64-bit monotonic sequence number or timestamp.
     pub version: u64,
-    pub key: K,
     pub value: V,
 }
 
-impl<K, V> VersionedLeaf<K, V> {
+impl<V> ArenaVersionNode<V> {
     #[inline]
     #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn init(ptr: *mut Self, key: K, version: u64, value: V) {
+    pub unsafe fn init(ptr: *mut Self, version: u64, value: V) {
         unsafe {
             std::ptr::write(
                 ptr,
@@ -121,10 +119,46 @@ impl<K, V> VersionedLeaf<K, V> {
                     _pad: [0; 3],
                     next_version_offset: AtomicU32::new(0),
                     version,
-                    key,
                     value,
                 },
             );
+        }
+    }
+}
+
+/// Multi-version (MVCC) leaf anchor allocated within an [`Arena`].
+#[repr(C, align(8))]
+pub struct VersionedLeaf<K, V> {
+    pub key: K,
+    /// 32-bit offset to newest ArenaVersionNode in arena.
+    pub versions_offset: AtomicU32,
+    pub _marker: std::marker::PhantomData<V>,
+}
+
+impl<K, V> VersionedLeaf<K, V> {
+    #[inline]
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn init(ptr: *mut Self, key: K, versions_offset: u32) {
+        unsafe {
+            std::ptr::write(
+                ptr,
+                Self {
+                    key,
+                    versions_offset: AtomicU32::new(versions_offset),
+                    _marker: std::marker::PhantomData,
+                },
+            );
+        }
+    }
+
+    #[inline]
+    pub fn is_removed(&self, arena: &crate::arena::Arena) -> bool {
+        let head_off = self.versions_offset.load(Ordering::Acquire) & !1;
+        if head_off == 0 {
+            true
+        } else {
+            let node = unsafe { &*(arena.get_pointer(head_off) as *const ArenaVersionNode<V>) };
+            node.removed.load(Ordering::Acquire)
         }
     }
 }

@@ -148,11 +148,19 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
     {
         let leaf_ptr = self.tree.get_leaf(key.as_bytes())?;
         let leaf = unsafe { &*leaf_ptr };
-        if leaf.removed.swap(true, Ordering::AcqRel) {
+        let head_off = leaf.versions_offset.load(Ordering::Acquire) & !1;
+        if head_off == 0 {
+            return None;
+        }
+        let head = unsafe {
+            &*(self.tree.arena.get_pointer(head_off)
+                as *const crate::arena::node::ArenaVersionNode<V>)
+        };
+        if head.removed.swap(true, Ordering::AcqRel) {
             None
         } else {
             self.tree.len.fetch_sub(1, Ordering::Relaxed);
-            Some(leaf.value.clone())
+            Some(head.value.clone())
         }
     }
 
@@ -192,6 +200,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
             .find_successor(search_key, include_equal)
             .map(|leaf_ptr| ArenaVersionedEntryRef {
                 leaf_ptr,
+                arena: &self.tree.arena,
                 _marker: PhantomData,
             })
     }
@@ -207,6 +216,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
             .find_predecessor(search_key, include_equal)
             .map(|leaf_ptr| ArenaVersionedEntryRef {
                 leaf_ptr,
+                arena: &self.tree.arena,
                 _marker: PhantomData,
             })
     }
@@ -224,6 +234,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
             .last_leaf()
             .map(|leaf_ptr| ArenaVersionedEntryRef {
                 leaf_ptr,
+                arena: &self.tree.arena,
                 _marker: PhantomData,
             })
     }
