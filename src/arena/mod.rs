@@ -36,8 +36,8 @@ pub mod versioned_iter;
 pub mod versioned_map;
 pub mod versioned_tree;
 
-use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::{Cell, UnsafeCell};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub use iter::{ArenaEntryRef, Range};
@@ -51,13 +51,37 @@ pub const MAX_ARENA_SIZE: usize = u32::MAX as usize;
 /// Node allocation alignment in the arena (8 bytes).
 pub const NODE_ALIGNMENT: u32 = 8;
 
+/// Size of thread-local allocation buffer chunks (64 KB).
+const TLAB_CHUNK_SIZE: u32 = 64 * 1024;
+
+#[derive(Clone, Copy)]
+struct TlabState {
+    arena_id: usize,
+    gen: u32,
+    current: u32,
+    limit: u32,
+}
+
+thread_local! {
+    static TLAB: Cell<TlabState> = const {
+        Cell::new(TlabState {
+            arena_id: 0,
+            gen: 0,
+            current: 0,
+            limit: 0,
+        })
+    };
+}
+
 /// A lock-free contiguous byte arena allocator for [`ArenaArtMap`].
 ///
-/// Memory is pre-allocated upon creation and allocated sequentially via atomic bump allocation.
+/// Memory is pre-allocated upon creation and allocated sequentially via atomic bump allocation
+/// accelerated by thread-local allocation buffers (TLAB).
 /// When dropped, the entire memory block is reclaimed in $O(1)$.
 pub struct Arena {
     n: AtomicU64,
-    _pad: [u8; 56],
+    gen: AtomicU32,
+    _pad: [u8; 52],
     buf: Box<[UnsafeCell<u8>]>,
 }
 
@@ -80,7 +104,8 @@ impl Arena {
 
         Self {
             n: AtomicU64::new(NODE_ALIGNMENT as u64),
-            _pad: [0u8; 56],
+            gen: AtomicU32::new(0),
+            _pad: [0u8; 52],
             buf,
         }
     }
@@ -120,6 +145,7 @@ impl Arena {
 
     /// Resets the allocation offset to allow reusing the allocated memory buffer in $O(1)$.
     pub fn reset(&mut self) {
+        self.gen.fetch_add(1, Ordering::Relaxed);
         self.n.store(NODE_ALIGNMENT as u64, Ordering::Relaxed);
     }
 
@@ -149,6 +175,48 @@ impl Arena {
     /// Allocates `size` bytes with the specified `alignment`.
     #[inline]
     pub fn alloc(&self, size: u32, alignment: u32, overflow: u32) -> Option<u32> {
+        debug_assert!(alignment.is_power_of_two());
+        let align_mask = alignment - 1;
+        let padded = (size + align_mask) & !align_mask;
+
+        // Try thread-local allocation buffer (TLAB) for small allocations
+        if padded <= TLAB_CHUNK_SIZE / 4 {
+            let arena_id = self.buf.as_ptr() as usize;
+            let current_gen = self.gen.load(Ordering::Relaxed);
+            let res = TLAB.with(|cell| {
+                let mut state = cell.get();
+                if state.arena_id == arena_id && state.gen == current_gen {
+                    let cur_aligned = (state.current + align_mask) & !align_mask;
+                    let next = cur_aligned + padded;
+                    if next <= state.limit {
+                        state.current = next;
+                        cell.set(state);
+                        return Some(cur_aligned);
+                    }
+                }
+
+                // Refill TLAB from global atomic cursor
+                let chunk_size = TLAB_CHUNK_SIZE;
+                if let Some(block_start) = self.alloc_global(chunk_size, alignment, overflow) {
+                    let cur_aligned = (block_start + align_mask) & !align_mask;
+                    let next = cur_aligned + padded;
+                    cell.set(TlabState {
+                        arena_id,
+                        gen: current_gen,
+                        current: next,
+                        limit: block_start + chunk_size,
+                    });
+                    Some(cur_aligned)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(offset) = res {
+                return Some(offset);
+            }
+        }
+
         self.alloc_global(size, alignment, overflow)
     }
 
