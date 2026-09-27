@@ -28,6 +28,7 @@ use crate::node::{
     Node16, Node256, Node4, Node48, NodeHeader, NodeType, TaggedPtr, VersionNode, VersionedLeaf,
     MAX_PREFIX_LEN, NODE48_EMPTY,
 };
+use crate::tree::Inserter;
 
 /// Internal multi-version concurrent tree structure.
 pub struct VersionedTree<K: AsBytes + Send + 'static, V: Send + Clone + 'static> {
@@ -301,6 +302,91 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
         let tagged_new_leaf = TaggedPtr::from_versioned_leaf(new_leaf_ptr);
         let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
 
+        self.insert_internal_cached(key_bytes, new_leaf_ptr, tagged_new_leaf, None, guard)
+    }
+
+    /// Inserts a versioned key-value pair using an [`Inserter`] cache to accelerate sequential or localized writes.
+    pub fn insert_with_inserter(
+        &self,
+        key: K,
+        version: u64,
+        value: V,
+        inserter: &mut Inserter,
+        guard: &Guard,
+    ) -> bool {
+        let new_leaf_ptr = VersionedLeaf::new(key, version, value);
+        let tagged_new_leaf = TaggedPtr::from_versioned_leaf(new_leaf_ptr);
+        let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
+
+        // Fast path: check if cached parent node can absorb this key directly
+        if inserter.matches(key_bytes) {
+            let header = unsafe { &*inserter.last_parent };
+            let next_byte = key_bytes[inserter.last_depth];
+
+            if header.node_type == NodeType::Node256 {
+                let n256 = unsafe { &*(inserter.last_parent as *const Node256) };
+                if n256.children[next_byte as usize]
+                    .load(Ordering::Acquire)
+                    .is_null()
+                    && n256.children[next_byte as usize]
+                        .compare_exchange(
+                            ptr::null_mut(),
+                            tagged_new_leaf.as_raw(),
+                            Ordering::Release,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                {
+                    if header.latch.validate(inserter.last_parent_version) {
+                        unsafe { (*inserter.last_parent).num_children += 1 };
+                        self.len.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    } else {
+                        n256.children[next_byte as usize].store(ptr::null_mut(), Ordering::Release);
+                    }
+                }
+            } else if header
+                .latch
+                .lock_version(inserter.last_parent_version)
+                .is_ok()
+            {
+                let is_full = is_node_full(header);
+                let child = unsafe { find_child(header, next_byte) };
+                if !is_full && child.is_none() {
+                    unsafe {
+                        self.insert_child_into_node(
+                            inserter.last_parent,
+                            next_byte,
+                            tagged_new_leaf,
+                        )
+                    };
+                    header.latch.unlock();
+                    self.len.fetch_add(1, Ordering::Relaxed);
+                    inserter.last_parent_version = header.latch.read_version().unwrap_or(0);
+                    return true;
+                }
+                header.latch.unlock();
+            }
+            inserter.reset();
+        }
+
+        self.insert_internal_cached(
+            key_bytes,
+            new_leaf_ptr,
+            tagged_new_leaf,
+            Some(inserter),
+            guard,
+        )
+    }
+
+    fn insert_internal_cached(
+        &self,
+        key_bytes: &[u8],
+        new_leaf_ptr: *mut VersionedLeaf<K, V>,
+        tagged_new_leaf: TaggedPtr,
+        mut inserter: Option<&mut Inserter>,
+        guard: &Guard,
+    ) -> bool {
         'retry: loop {
             let root_ptr = TaggedPtr::from_raw(self.root.load(Ordering::Acquire));
 
@@ -501,6 +587,42 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
 
                 match next_child {
                     None => {
+                        // Node256 lock-free atomic insertion fast-path
+                        if header.node_type == NodeType::Node256 {
+                            let n256 = unsafe { &mut *(header as *mut NodeHeader as *mut Node256) };
+                            if n256.children[next_byte as usize]
+                                .load(Ordering::Acquire)
+                                .is_null()
+                                && n256.children[next_byte as usize]
+                                    .compare_exchange(
+                                        ptr::null_mut(),
+                                        tagged_new_leaf.as_raw(),
+                                        Ordering::Release,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok()
+                            {
+                                if header.latch.validate(v_header) {
+                                    unsafe { (*(header as *mut NodeHeader)).num_children += 1 };
+                                    self.len.fetch_add(1, Ordering::Relaxed);
+                                    if let Some(ref mut ins) = inserter {
+                                        ins.update(
+                                            current.as_inner_ptr(),
+                                            v_header,
+                                            node_depth,
+                                            key_bytes,
+                                        );
+                                    }
+                                    return true;
+                                } else {
+                                    n256.children[next_byte as usize]
+                                        .store(ptr::null_mut(), Ordering::Release);
+                                    continue 'retry;
+                                }
+                            }
+                            continue 'retry;
+                        }
+
                         if is_node_full(header) {
                             let parent_ok = match parent {
                                 Some(p) => unsafe { (*p).latch.lock().is_ok() },
@@ -549,6 +671,16 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                                 Some(p) => unsafe { (*p).latch.unlock() },
                                 None => self.root_latch.unlock(),
                             }
+                            self.len.fetch_add(1, Ordering::Relaxed);
+                            if let Some(ref mut ins) = inserter {
+                                ins.update(
+                                    new_node,
+                                    unsafe { (*new_node).latch.read_version().unwrap_or(0) },
+                                    node_depth,
+                                    key_bytes,
+                                );
+                            }
+                            return true;
                         } else {
                             if header.latch.lock_version(v_header).is_err() {
                                 continue 'retry;
@@ -569,10 +701,17 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                                 );
                             }
                             header.latch.unlock();
+                            self.len.fetch_add(1, Ordering::Relaxed);
+                            if let Some(ref mut ins) = inserter {
+                                ins.update(
+                                    current.as_inner_ptr(),
+                                    header.latch.read_version().unwrap_or(0),
+                                    node_depth,
+                                    key_bytes,
+                                );
+                            }
+                            return true;
                         }
-
-                        self.len.fetch_add(1, Ordering::Relaxed);
-                        return true;
                     }
                     Some(child) => {
                         if child.is_leaf() {
