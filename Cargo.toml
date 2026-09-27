@@ -32,6 +32,9 @@ arenaskiplist = "0.2.0"
 parking_lot = "0.12"
 dashmap = "6.1"
 papaya = "0.2"
+scc = "3.8"
+concread = "0.5"
+vart = "0.10"
 
 [[bench]]
 name = "artmap_bench"
