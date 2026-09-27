@@ -23,7 +23,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::key::AsBytes;
-use crate::latch::{CachePadded, HybridLatch};
+use crate::latch::{CachePadded, HybridLatch, SpinBackoff};
 use crate::node::{
     Leaf, Node16, Node256, Node4, Node48, NodeHeader, NodeType, TaggedPtr, MAX_PREFIX_LEN,
     NODE48_EMPTY,
@@ -493,7 +493,13 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                 let v_header = match header.latch.read_version() {
                     Some(v) => v,
                     None => {
-                        std::hint::spin_loop();
+                        let mut backoff = SpinBackoff::new();
+                        while header.latch.is_locked() {
+                            backoff.spin();
+                        }
+                        if !header.latch.is_obsolete() {
+                            continue 'traverse;
+                        }
                         continue 'retry;
                     }
                 };
@@ -578,10 +584,10 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                     return Ok((None, new_leaf_ptr));
                 }
 
-                depth += header.prefix_len as usize;
+                let node_depth = depth + header.prefix_len as usize;
 
                 // Exact key match at this inner node
-                if depth == key_bytes.len() {
+                if node_depth == key_bytes.len() {
                     if header.latch.lock_version(v_header).is_err() {
                         continue 'retry;
                     }
@@ -611,7 +617,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                     }
                 }
 
-                let next_byte = key_bytes[depth];
+                let next_byte = key_bytes[node_depth];
                 let next_child = unsafe { find_child(header, next_byte) };
 
                 match next_child {
@@ -634,12 +640,15 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                     if let Some(ref mut ins) = inserter {
                                         ins.last_parent = current.as_inner_ptr();
                                         ins.last_parent_version = v_header;
-                                        ins.last_depth = depth;
+                                        ins.last_depth = node_depth;
                                     }
                                     return Ok((None, new_leaf_ptr));
                                 } else {
                                     n256.children[next_byte as usize]
                                         .store(ptr::null_mut(), Ordering::Release);
+                                    if !header.latch.is_obsolete() {
+                                        continue 'traverse;
+                                    }
                                     continue 'retry;
                                 }
                             }
@@ -703,12 +712,15 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 ins.last_parent = new_node;
                                 ins.last_parent_version =
                                     unsafe { (*new_node).latch.read_version().unwrap_or(0) };
-                                ins.last_depth = depth;
+                                ins.last_depth = node_depth;
                             }
                             return Ok((None, new_leaf_ptr));
                         } else {
                             // Fast path: node has room. Lock header only (no parent or root latch)
                             if header.latch.lock_version(v_header).is_err() {
+                                if !header.latch.is_obsolete() {
+                                    continue 'traverse;
+                                }
                                 continue 'retry;
                             }
 
@@ -716,6 +728,9 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                 || unsafe { find_child(header, next_byte) }.is_some()
                             {
                                 header.latch.unlock();
+                                if !header.latch.is_obsolete() {
+                                    continue 'traverse;
+                                }
                                 continue 'retry;
                             }
 
@@ -726,7 +741,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             if let Some(ref mut ins) = inserter {
                                 ins.last_parent = current.as_inner_ptr();
                                 ins.last_parent_version = header.latch.read_version().unwrap_or(0);
-                                ins.last_depth = depth;
+                                ins.last_depth = node_depth;
                             }
                         }
 
@@ -736,10 +751,16 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                     Some(child) => {
                         if child.is_leaf() {
                             if header.latch.lock_version(v_header).is_err() {
+                                if !header.latch.is_obsolete() {
+                                    continue 'traverse;
+                                }
                                 continue 'retry;
                             }
                             if unsafe { find_child(header, next_byte) } != Some(child) {
                                 header.latch.unlock();
+                                if !header.latch.is_obsolete() {
+                                    continue 'traverse;
+                                }
                                 continue 'retry;
                             }
 
@@ -762,8 +783,8 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             }
 
                             let existing_key = existing_leaf.key.as_bytes();
-                            let suffix_existing = &existing_key[(depth + 1)..];
-                            let suffix_new = &key_bytes[(depth + 1)..];
+                            let suffix_existing = &existing_key[(node_depth + 1)..];
+                            let suffix_new = &key_bytes[(node_depth + 1)..];
                             let common_len = longest_common_prefix(suffix_existing, suffix_new);
 
                             let exact1 = suffix_existing.len() == common_len;
@@ -797,7 +818,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             parent = Some(header);
                             parent_byte = next_byte;
                             current = child;
-                            depth += 1;
+                            depth = node_depth + 1;
                             continue 'traverse;
                         }
                     }

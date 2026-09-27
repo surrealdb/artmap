@@ -91,6 +91,12 @@ impl HybridLatch {
         self.version.load(Ordering::Relaxed) == start_version
     }
 
+    /// Checks if the latch is currently write-locked.
+    #[inline]
+    pub fn is_locked(&self) -> bool {
+        self.version.load(Ordering::Acquire) & LOCK_BIT != 0
+    }
+
     /// Checks if the node has been marked obsolete.
     #[inline]
     pub fn is_obsolete(&self) -> bool {

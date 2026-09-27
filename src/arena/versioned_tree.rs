@@ -21,7 +21,7 @@ use crate::arena::node::{
 };
 use crate::arena::Arena;
 use crate::key::AsBytes;
-use crate::latch::{CachePadded, HybridLatch};
+use crate::latch::{CachePadded, HybridLatch, SpinBackoff};
 use crate::node::{NodeType, MAX_PREFIX_LEN, NODE48_EMPTY};
 use crate::simd::find_child_node16;
 
@@ -466,11 +466,16 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                 let header_ptr =
                     self.arena.get_pointer_mut(current.inner_offset()) as *mut NodeHeader;
                 let header = unsafe { &mut *header_ptr };
-
                 let v_header = match header.latch.read_version() {
                     Some(v) => v,
                     None => {
-                        std::hint::spin_loop();
+                        let mut backoff = SpinBackoff::new();
+                        while header.latch.is_locked() {
+                            backoff.spin();
+                        }
+                        if !header.latch.is_obsolete() {
+                            continue 'traverse;
+                        }
                         continue 'retry;
                     }
                 };
@@ -565,10 +570,10 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                     return true;
                 }
 
-                depth += header.prefix_len as usize;
+                let node_depth = depth + header.prefix_len as usize;
 
                 // Exact key match at this inner node
-                if depth == key_bytes.len() {
+                if node_depth == key_bytes.len() {
                     if header.latch.lock_version(v_header).is_err() {
                         continue 'retry;
                     }
@@ -617,7 +622,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                     }
                 }
 
-                let next_byte = key_bytes[depth];
+                let next_byte = key_bytes[node_depth];
                 let next_child = unsafe { find_child(header_ptr, next_byte) };
 
                 match next_child {
@@ -735,6 +740,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                         } else {
                             // Node has room: lock header only
                             if header.latch.lock_version(v_header).is_err() {
+                                if !header.latch.is_obsolete() {
+                                    continue 'traverse;
+                                }
                                 continue 'retry;
                             }
 
@@ -747,6 +755,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                             };
                             if !parent_valid {
                                 header.latch.unlock();
+                                if !header.latch.is_obsolete() {
+                                    continue 'traverse;
+                                }
                                 continue 'retry;
                             }
 
@@ -754,6 +765,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                                 || unsafe { find_child(header_ptr, next_byte) }.is_some()
                             {
                                 header.latch.unlock();
+                                if !header.latch.is_obsolete() {
+                                    continue 'traverse;
+                                }
                                 continue 'retry;
                             }
 
@@ -773,6 +787,9 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                     Some(child) => {
                         if child.is_leaf() {
                             if header.latch.lock_version(v_header).is_err() {
+                                if !header.latch.is_obsolete() {
+                                    continue 'traverse;
+                                }
                                 continue 'retry;
                             }
 
@@ -785,11 +802,17 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                             };
                             if !parent_valid {
                                 header.latch.unlock();
+                                if !header.latch.is_obsolete() {
+                                    continue 'traverse;
+                                }
                                 continue 'retry;
                             }
 
                             if unsafe { find_child(header_ptr, next_byte) } != Some(child) {
                                 header.latch.unlock();
+                                if !header.latch.is_obsolete() {
+                                    continue 'traverse;
+                                }
                                 continue 'retry;
                             }
 
@@ -815,8 +838,8 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                             }
 
                             let existing_key = existing_leaf.key.as_bytes();
-                            let suffix_existing = &existing_key[(depth + 1)..];
-                            let suffix_new = &key_bytes[(depth + 1)..];
+                            let suffix_existing = &existing_key[(node_depth + 1)..];
+                            let suffix_new = &key_bytes[(node_depth + 1)..];
                             let common_len = longest_common_prefix(suffix_existing, suffix_new);
 
                             let exact1 = suffix_existing.len() == common_len;
@@ -856,7 +879,7 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
                             parent = Some(header_ptr);
                             parent_byte = next_byte;
                             current = child;
-                            depth += 1;
+                            depth = node_depth + 1;
                             continue 'traverse;
                         }
                     }
