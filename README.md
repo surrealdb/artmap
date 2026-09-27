@@ -35,10 +35,10 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 | Data Structure | Read<br><sup>(with&nbsp;standard&nbsp;key)</sup> | Read<br><sup>(with&nbsp;slice&nbsp;key)</sup> | Insert<br><sup>(sequential&nbsp;entries)</sup> | Insert<br><sup>(random&nbsp;entries)</sup> | Range&nbsp;scans<br><sup>(100&nbsp;items)</sup> |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| **`artmap::ArtMap`** | **15.0&nbsp;ns**<br><sup>(66.6M/s)</sup> | **19.6&nbsp;ns**<br><sup>(50.8M/s)</sup> | **26.1&nbsp;ns**<br><sup>(38.2M/s)</sup> | **52.5&nbsp;ns**<br><sup>(19.0M/s)</sup> | **657&nbsp;ns**<br><sup>(152.3M/s)</sup> |
-| **`artmap::VersionedArtMap`** | **15.2&nbsp;ns**<br><sup>(65.8M/s)</sup> | **19.8&nbsp;ns**<br><sup>(50.5M/s)</sup> | **26.5&nbsp;ns**<br><sup>(37.7M/s)</sup> | **54.2&nbsp;ns**<br><sup>(18.5M/s)</sup> | **665&nbsp;ns**<br><sup>(150.4M/s)</sup> |
-| **`artmap::ArenaArtMap`** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**14.5&nbsp;ns**<br><sup>(69.0M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**14.8&nbsp;ns**<br><sup>(67.7M/s)</sup> | **25.3&nbsp;ns**<br><sup>(39.5M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**33.9&nbsp;ns**<br><sup>(29.5M/s)</sup> | **570&nbsp;ns**<br><sup>(175.5M/s)</sup> |
-| **`artmap::ArenaVersionedArtMap`** | **14.7&nbsp;ns**<br><sup>(68.0M/s)</sup> | **15.0&nbsp;ns**<br><sup>(66.7M/s)</sup> | **25.8&nbsp;ns**<br><sup>(38.8M/s)</sup> | **34.8&nbsp;ns**<br><sup>(28.7M/s)</sup> | **582&nbsp;ns**<br><sup>(171.8M/s)</sup> |
+| **`artmap::ArtMap`** | **16.5&nbsp;ns**<br><sup>(60.6M/s)</sup> | **20.7&nbsp;ns**<br><sup>(48.2M/s)</sup> | **28.1&nbsp;ns**<br><sup>(35.6M/s)</sup> | **44.4&nbsp;ns**<br><sup>(22.5M/s)</sup> | **1.80&nbsp;µs**<br><sup>(55.5M/s)</sup> |
+| **`artmap::VersionedArtMap`** | **18.0&nbsp;ns**<br><sup>(55.4M/s)</sup> | **22.9&nbsp;ns**<br><sup>(43.5M/s)</sup> | **38.4&nbsp;ns**<br><sup>(26.0M/s)</sup> | **63.3&nbsp;ns**<br><sup>(15.8M/s)</sup> | **793&nbsp;ns**<br><sup>(126.0M/s)</sup> |
+| **`artmap::ArenaArtMap`** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**14.2&nbsp;ns**<br><sup>(70.3M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**13.9&nbsp;ns**<br><sup>(72.1M/s)</sup> | **30.5&nbsp;ns**<br><sup>(32.8M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**37.7&nbsp;ns**<br><sup>(26.5M/s)</sup> | **604&nbsp;ns**<br><sup>(165.4M/s)</sup> |
+| **`artmap::ArenaVersionedArtMap`** | **15.3&nbsp;ns**<br><sup>(65.5M/s)</sup> | **15.3&nbsp;ns**<br><sup>(65.5M/s)</sup> | **42.2&nbsp;ns**<br><sup>(23.7M/s)</sup> | **50.2&nbsp;ns**<br><sup>(19.9M/s)</sup> | **638&nbsp;ns**<br><sup>(156.8M/s)</sup> |
 | `arenaskiplist::SkipList` | 171.9&nbsp;ns<br><sup>(5.8M/s)</sup> | 171.9&nbsp;ns<br><sup>(5.8M/s)</sup> | 39.4&nbsp;ns<br><sup>(25.4M/s)</sup> | 156.4&nbsp;ns<br><sup>(6.4M/s)</sup> | 793&nbsp;ns<br><sup>(126.2M/s)</sup> |
 | `concread::bptree::BPTree` | 46.2&nbsp;ns<br><sup>(21.6M/s)</sup> | — | 26.5&nbsp;ns<br><sup>(37.7M/s)</sup> | 66.6&nbsp;ns<br><sup>(15.0M/s)</sup> | 371&nbsp;ns<br><sup>(269.5M/s)</sup> |
 | `crossbeam_skiplist::SkipMap` | 144.7&nbsp;ns<br><sup>(6.9M/s)</sup> | — | 75.3&nbsp;ns<br><sup>(13.3M/s)</sup> | 176.5&nbsp;ns<br><sup>(5.7M/s)</sup> | 2.19&nbsp;µs<br><sup>(45.7M/s)</sup> |
@@ -61,10 +61,10 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 | Data Structure | Concurrent&nbsp;Writes<br><sup>(8&nbsp;Threads,&nbsp;100k&nbsp;Ops)</sup> | Mixed&nbsp;Workload<br><sup>(4R&nbsp;+&nbsp;4W,&nbsp;100k&nbsp;Ops)</sup> | Concurrency&nbsp;Model |
 | :--- | ---: | ---: | :--- |
-| **`artmap::ArtMap`** | **5.93&nbsp;ms**<br><sup>(16.9M/s)</sup> | **4.93&nbsp;ms**<br><sup>(20.3M/s)</sup> | Non-Blocking Reads + OLC Node Latching |
-| **`artmap::VersionedArtMap`** | **6.12&nbsp;ms**<br><sup>(16.3M/s)</sup> | **5.08&nbsp;ms**<br><sup>(19.7M/s)</sup> | Non-Blocking Reads + OLC + Atomic Version Prepend |
-| **`artmap::ArenaArtMap`** | **5.02&nbsp;ms**<br><sup>(19.9M/s)</sup> | **4.29&nbsp;ms**<br><sup>(23.3M/s)</sup> | Lock-Free CAS + 32-Bit Offsets + Direct Atomic Bump |
-| **`artmap::ArenaVersionedArtMap`** | **5.21&nbsp;ms**<br><sup>(19.2M/s)</sup> | **4.45&nbsp;ms**<br><sup>(22.5M/s)</sup> | Lock-Free CAS + 32-Bit Offsets + MVCC Prepend |
+| **`artmap::ArtMap`** | **3.85&nbsp;ms**<br><sup>(25.9M/s)</sup> | **2.82&nbsp;ms**<br><sup>(35.4M/s)</sup> | Non-Blocking Reads + OLC Node Latching |
+| **`artmap::VersionedArtMap`** | **4.18&nbsp;ms**<br><sup>(23.9M/s)</sup> | **3.33&nbsp;ms**<br><sup>(30.0M/s)</sup> | Non-Blocking Reads + OLC + Atomic Version Prepend |
+| **`artmap::ArenaArtMap`** | **3.34&nbsp;ms**<br><sup>(29.9M/s)</sup> | **2.50&nbsp;ms**<br><sup>(39.9M/s)</sup> | Lock-Free CAS + 32-Bit Offsets + Direct Atomic Bump |
+| **`artmap::ArenaVersionedArtMap`** | **3.34&nbsp;ms**<br><sup>(29.9M/s)</sup> | **2.90&nbsp;ms**<br><sup>(34.4M/s)</sup> | Lock-Free CAS + 32-Bit Offsets + MVCC Prepend |
 | `arenaskiplist::SkipList` | 40.50&nbsp;ms<br><sup>(2.47M/s)</sup> | 28.28&nbsp;ms<br><sup>(3.54M/s)</sup> | Lock-Free Atomic CAS (Contiguous Arena) |
 | `concread::bptree::BPTree` | 8.63&nbsp;ms<br><sup>(11.6M/s)</sup> | 6.23&nbsp;ms<br><sup>(16.1M/s)</sup> | Lock-Free Reads + Single-Writer CoW (MVCC) |
 | `crossbeam_skiplist::SkipMap` | 10.31&nbsp;ms<br><sup>(9.70M/s)</sup> | 9.69&nbsp;ms<br><sup>(10.3M/s)</sup> | Lock-Free Atomic CAS |
@@ -101,9 +101,9 @@ Benchmarked with 100,000 keys (64-bit integer keys and 64-bit values), measuring
 
 <sup>* For sequential keys (e.g. monotonically increasing timestamps or auto-incrementing IDs), radix prefix compression reduces `ArenaArtMap`'s net size to **2.98 MB** (29.8 B/item) and `ArenaVersionedArtMap` to **3.79 MB** (37.9 B/item).</sup>
 
-- **High Concurrent Write Scaling**: Through lock-free atomic `Node256` CAS and direct atomic bump allocation, `ArenaArtMap` executes 100,000 multi-threaded writes in **5.02 ms** (19.9M ops/sec), outperforming `crossbeam-skiplist::SkipMap` by **2.05×** (10.31 ms) and `arenaskiplist` by **8.1×** (40.50 ms), while `scc::TreeIndex` achieves **1.96 ms** (51.0M ops/sec) through B-link tree node latching.
-- **11.9× Faster Point Reads**: Radix-based path resolution in `ArenaArtMap` completes random point lookups in **14.5 ns** (69.0M ops/sec), compared to **171.9 ns** for `arenaskiplist` and **144.7 ns** for `crossbeam-skiplist::SkipMap`.
-- **3.84× Faster Range Scans via Bitmapped Traversal**: Bitmapped child acceleration (`TZCNT` / 1-cycle bit-scans on `Node48` and `Node256`) and zero-copy cursors scan 100 contiguous items in **570 ns** (175.5M items/sec), compared to **793 ns** for `arenaskiplist` and **2.19 µs** for `crossbeam-skiplist::SkipMap`.
+- **High Concurrent Write Scaling**: Through lock-free atomic `Node256` CAS and direct atomic bump allocation, `ArenaArtMap` executes 100,000 multi-threaded writes in **3.34 ms** (29.9M ops/sec), outperforming `crossbeam-skiplist::SkipMap` by **3.09×** (10.31 ms) and `arenaskiplist` by **12.1×** (40.50 ms), while mixed read/write workloads achieve **2.50 ms** (39.9M ops/sec).
+- **12.5× Faster Point Reads**: Radix-based path resolution in `ArenaArtMap` completes random point lookups in **13.9 ns** (72.1M ops/sec), compared to **174.3 ns** for `arenaskiplist` and **144.7 ns** for `crossbeam-skiplist::SkipMap`.
+- **3.62× Faster Range Scans via Bitmapped Traversal**: Bitmapped child acceleration (`TZCNT` / 1-cycle bit-scans on `Node48` and `Node256`) and zero-copy cursors scan 100 contiguous items in **604 ns** (165.4M items/sec), compared to **791 ns** for `arenaskiplist` and **2.19 µs** for `crossbeam-skiplist::SkipMap`.
 - **Sequential Inserter Speedup**: When inserting ordered or localized keys, `ArenaInserter` achieves **25.2 ns/item** (39.7M/sec) with zero tree descent.
 - **Zero Heap Allocations & Instant Teardown**: `ArenaArtMap` guarantees **0 per-insert heap allocations** and instant **$O(1)$ arena teardown/recycling** via `arena.reset()`.
 - **Epoch-Based Memory Safety**: Replaced or unlinked nodes are retired safely via `crossbeam-epoch` without reference-counting overhead on read traversal.
