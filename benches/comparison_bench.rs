@@ -434,7 +434,7 @@ fn bench_random_insert(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
+                let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
                 let start = Instant::now();
                 for (i, &k) in random_keys.iter().enumerate() {
                     let _ = map.insert(k, i as u64);
@@ -450,7 +450,7 @@ fn bench_random_insert(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
-                let map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(32 * 1024 * 1024);
+                let map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
                 let start = Instant::now();
                 for (i, &k) in random_keys.iter().enumerate() {
                     let _ = map.insert(k, 1, i as u64);
