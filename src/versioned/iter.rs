@@ -29,7 +29,11 @@ use crate::versioned::tree::{Storage, VersionedTree};
 ///
 /// A key whose newest version is a tombstone is skipped. Each item captures
 /// the head it saw, once. Filtering this iterator with `get_version_le` is not
-/// a snapshot scan. The validated-scan guarantee of [`crate::iter`] applies.
+/// a snapshot scan.
+///
+/// Every key present for the whole scan is yielded exactly once, in key order
+/// (descending with `rev`). A key inserted or removed during the scan may or
+/// may not appear.
 pub struct Range<'a, K, V> {
     tree: &'a VersionedTree<K, V>,
     guard: GuardHandle<'a>,

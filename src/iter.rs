@@ -36,6 +36,10 @@ use crate::tree::{Storage, Tree};
 
 /// An iterator over a range of entries of an [`ArtMap`](crate::ArtMap), in
 /// ascending key order (or descending, with `rev`).
+///
+/// Every key present for the whole scan is yielded exactly once, in key order
+/// (descending with `rev`). A key inserted or removed during the scan may or
+/// may not appear.
 pub struct Range<'a, K, V> {
     tree: &'a Tree<K, V>,
     guard: GuardHandle<'a>,

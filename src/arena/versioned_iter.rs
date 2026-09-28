@@ -182,6 +182,10 @@ impl<K: Eq, V: Eq> Eq for ArenaVersionedEntryRef<'_, K, V> {}
 
 /// A latest-view iterator over an [`ArenaVersionedArtMap`](crate::ArenaVersionedArtMap):
 /// keys whose newest version is a tombstone are skipped.
+///
+/// Every key present for the whole scan is yielded exactly once, in key order
+/// (descending with `rev`). A key inserted or removed during the scan may or
+/// may not appear.
 pub struct ArenaVersionedRange<'a, K, V> {
     tree: &'a ArenaVersionedTree<K, V>,
     cursor: Cursor<Storage<K, V>>,

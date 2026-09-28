@@ -105,8 +105,11 @@ impl<K: PartialEq, V: PartialEq> PartialEq for ArenaEntryRef<'_, K, V> {
 
 impl<K: Eq, V: Eq> Eq for ArenaEntryRef<'_, K, V> {}
 
-/// An iterator over a range of an [`ArenaArtMap`](crate::ArenaArtMap), with
-/// the validated-scan guarantee of the other maps' iterators.
+/// An iterator over a range of an [`ArenaArtMap`](crate::ArenaArtMap).
+///
+/// Every key present for the whole scan is yielded exactly once, in key order
+/// (descending with `rev`). A key inserted or removed during the scan may or
+/// may not appear.
 pub struct Range<'a, K, V> {
     tree: &'a ArenaTree<K, V>,
     cursor: Cursor<Storage<K, V>>,
