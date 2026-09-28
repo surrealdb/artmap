@@ -29,7 +29,7 @@ use crate::versioned::tree::{chain, find_le, VersionedTree};
 /// A concurrent ordered map with 64-bit MVCC versions per key.
 ///
 /// Each key has a chain of versions, newest first; a version may be a
-/// tombstone. Snapshot reads (`get_version_le`) are lock-free. Writers of one
+/// tombstone. Snapshot reads (`get_version_le`) take no latches. Writers of one
 /// key serialise on a per-key latch; writers of different keys run in parallel.
 ///
 /// ## Semantics

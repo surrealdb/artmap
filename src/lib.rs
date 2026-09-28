@@ -132,9 +132,10 @@ const _: () = {
 
 /// A concurrent ordered map backed by an adaptive radix tree.
 ///
-/// Reads are lock-free and linearizable; writes take per-node latches. Values
-/// are never mutated in place: an overwrite publishes a new entry and returns
-/// the displaced one, which stays readable through its handle.
+/// Reads take no latches (they validate optimistically and retry) and are
+/// linearizable; writes take per-node latches. Values are never mutated in
+/// place: an overwrite publishes a new entry and returns the displaced one,
+/// which stays readable through its handle.
 pub struct ArtMap<K, V> {
     tree: Tree<K, V>,
 }

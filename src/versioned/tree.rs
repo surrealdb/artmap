@@ -26,7 +26,7 @@
 //!   (inline slot) after unlocking;
 //! - `len` changes by the liveness of the head before and after, decided under
 //!   the latch;
-//! - readers are lock-free: `head` and `next` are loaded with `Acquire`.
+//! - readers take no latch: `head` and `next` are loaded with `Acquire`.
 
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
