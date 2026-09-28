@@ -80,6 +80,8 @@
 #![deny(let_underscore_drop, clippy::let_underscore_must_use)]
 
 pub mod arena;
+#[cfg(doctest)]
+pub mod compile_fail_tests;
 mod entry;
 mod guard;
 #[cfg(artmap_hooks)]

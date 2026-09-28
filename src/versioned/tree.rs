@@ -255,7 +255,10 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
     ) -> usize {
         // SAFETY: protected by `guard`.
         let leaf = unsafe { leaf.as_ref() };
-        loop {
+        // Prune is best-effort maintenance: a chain that keeps moving (for
+        // example, an `is_tombstone` that writes this key) is left alone
+        // rather than retried forever.
+        for _attempt in 0..64 {
             // 1. Without any latch, find T and evaluate the user closure on it.
             let head = leaf.head_ptr();
             // SAFETY: live.
@@ -274,10 +277,13 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
             // SAFETY: live.
             let t_now = find_le(unsafe { &*head_now }, min_version)
                 .map(|n| std::ptr::from_ref(n).cast_mut());
-            if t_now != Some(t_ptr) || (is_head && head_now != head) || t.is_superseded() {
+            if t_now != Some(t_ptr) || t.is_superseded() {
                 drop(w);
                 continue;
             }
+            // T is unchanged; if newer versions arrived it is no longer the
+            // head, and only the head can be replaced by a tombstone.
+            let dead = dead && head_now == t_ptr;
 
             // 3. Replace a user tombstone head by a built-in one.
             let bomb = AbortOnUnwind;
@@ -318,6 +324,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
             }
             return count;
         }
+        0
     }
 }
 
