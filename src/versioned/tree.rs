@@ -360,3 +360,40 @@ unsafe fn retire_version<V: Send + 'static>(
         Retired::from_non_null(NonNull::new_unchecked(n))
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// §16.5 transient `len` for the versioned tree (Inv 12): a key whose
+    /// head alternates between a value and a tombstone never shows a
+    /// negative or over-counted raw counter.
+    #[test]
+    fn transient_len_never_negative() {
+        let t = Arc::new(VersionedTree::<Vec<u8>, u64>::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (t, stop) = (Arc::clone(&t), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let n = if cfg!(miri) { 20 } else { 100_000 };
+                let mut v = 1u64;
+                while !stop.load(Ordering::Relaxed) && v < n {
+                    let g = crate::guard::pin();
+                    t.insert(vec![7], v, Some(v), &g);
+                    t.insert(vec![7], v + 1, None, &g);
+                    v += 2;
+                }
+            })
+        };
+        let polls = if cfg!(miri) { 50 } else { 200_000 };
+        for _ in 0..polls {
+            let len = t.raw.raw_len();
+            assert!((0..=1).contains(&len), "raw len {len} out of range");
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert_eq!(t.raw.raw_len(), 0);
+    }
+}

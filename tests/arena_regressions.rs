@@ -476,3 +476,59 @@ fn concurrent_scans_are_monotonic() {
     stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();
 }
+
+/// Runs `f` on another thread and fails if it does not finish in time: a
+/// latch left locked by an `ArenaFull` path would hang it.
+fn within_timeout(f: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(if cfg!(miri) {
+        600
+    } else {
+        20
+    }))
+    .expect("an ArenaFull path left a latch locked");
+}
+
+#[test]
+fn arena_full_at_every_allocation_site_releases_every_latch() {
+    // Sweep the capacity so that the arena runs out at each allocation site
+    // in turn: leaves, prefix-split Node4s, prefix chains, and every grow.
+    let keys: Vec<Vec<u8>> = (0..40u8)
+        .flat_map(|i| {
+            [
+                vec![b'a', i],                                   // grows a to Node16/48
+                vec![b'p'; 20].into_iter().chain([i]).collect(), // prefix chains
+                vec![b'z', i, i, i],                             // prefix splits
+            ]
+        })
+        .collect();
+    let step = if cfg!(miri) { 997 } else { 13 };
+    for cap in (256..16_384).step_by(step) {
+        let m = Arc::new(ArenaArtMap::<Vec<u8>, u64>::with_capacity(cap));
+        let vm = Arc::new(ArenaVersionedArtMap::<Vec<u8>, u64>::with_capacity(cap));
+        let mut stored = Vec::new();
+        for (i, k) in keys.iter().enumerate() {
+            if m.try_insert(k.clone(), i as u64).is_ok() {
+                stored.push((k.clone(), i as u64));
+            }
+            let _ = vm.try_insert(k.clone(), 1, i as u64);
+        }
+        let (m2, vm2) = (Arc::clone(&m), Arc::clone(&vm));
+        within_timeout(move || {
+            // Every latch is free: reads, removes and further inserts proceed.
+            let _ = m2.try_insert(b"after".to_vec(), 0);
+            let _ = vm2.try_insert(b"after".to_vec(), 1, 0);
+            let _ = m2.remove(&b"after"[..]);
+            let _ = vm2.get(&b"after"[..]);
+        });
+        for (k, v) in &stored {
+            assert_eq!(m.get(k), Some(*v), "cap {cap}: a committed insert was lost");
+        }
+        assert_eq!(m.len(), m.iter().count(), "cap {cap}");
+        assert_eq!(vm.len(), vm.iter().count(), "cap {cap}");
+    }
+}

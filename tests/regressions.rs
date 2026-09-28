@@ -500,3 +500,23 @@ fn every_heap_key_and_value_is_dropped_exactly_once() {
         "leaked or double-dropped"
     );
 }
+
+#[test]
+fn pruning_a_user_tombstone_in_the_only_inline_slot() {
+    // The key's only version lives in slot0 and is a user tombstone: prune
+    // replaces it out of place with a built-in tombstone and only marks the
+    // inline head superseded (§11.4).
+    let map = VersionedArtMap::<Vec<u8>, u64>::new();
+    map.insert(b"k".to_vec(), 1, 0);
+    assert_eq!(map.len(), 1);
+    map.prune_key(&b"k"[..], u64::MAX, |v| *v == 0);
+    assert_eq!(map.len(), 0);
+    assert!(map.get(&b"k"[..]).is_none());
+    assert_eq!(map.get_all_versions(&b"k"[..]), vec![(1, None)]);
+    // The key comes back with a newer version.
+    map.insert(b"k".to_vec(), 2, 5);
+    assert_eq!(map.get(&b"k"[..]), Some(5));
+    assert_eq!(map.len(), 1);
+    drop(map);
+    flush_epochs();
+}
