@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use artmap::{ArtMap, VersionedArtMap};
+use artmap::{ArenaVersionedArtMap, ArtMap, VersionedArtMap};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -454,4 +454,90 @@ fn versioned_len_under_remove_and_reinsert() {
     });
     let live = (0..4).filter(|k| map.get(&key(*k)).is_some()).count();
     assert_eq!(map.len(), live);
+}
+
+#[test]
+fn arena_versioned_concurrent_versions_of_one_key() {
+    // As `versioned_concurrent_versions_of_one_key`, on the arena chain.
+    let map = Arc::new(ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(
+        64 << 20,
+    ));
+    let n = threads() as u64;
+    let per = if cfg!(miri) { 8 } else { 400 };
+    let barrier = Arc::new(Barrier::new(n as usize));
+    let handles: Vec<_> = (0..n)
+        .map(|t| {
+            let (m, barrier) = (Arc::clone(&map), Arc::clone(&barrier));
+            std::thread::spawn(move || {
+                barrier.wait();
+                let mut rng = StdRng::seed_from_u64(t);
+                let mut versions: Vec<u64> = (0..per).map(|i| i * n + t + 1).collect();
+                for i in (1..versions.len()).rev() {
+                    versions.swap(i, rng.gen_range(0..=i));
+                }
+                for v in versions {
+                    for k in 0..4 {
+                        m.insert(key(k), v, v);
+                        if v % 5 == 0 {
+                            m.insert(key(k), v, v); // same-version replace
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    for k in 0..4 {
+        let all = map.get_all_versions(&key(k));
+        assert_eq!(all.len() as u64, per * n, "no version lost or duplicated");
+        assert!(
+            all.windows(2).all(|w| w[0].0 > w[1].0),
+            "newest first, strictly"
+        );
+        assert!(all.iter().all(|(v, x)| *x == Some(*v)));
+    }
+    assert_eq!(map.len(), 4);
+}
+
+#[test]
+fn arena_versioned_len_under_delete_and_reinsert() {
+    // Inserts and deletes of newer versions race on a few keys: `len` never
+    // exceeds the key space and equals the live-head count at quiescence.
+    const CAP: u64 = 400_000;
+    let map = Arc::new(ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(
+        128 << 20,
+    ));
+    let next = Arc::new(AtomicU64::new(1));
+    let (m, nx) = (Arc::clone(&map), Arc::clone(&next));
+    run(threads(), move |t, stop| {
+        let mut rng = StdRng::seed_from_u64(t as u64);
+        while !stop.load(Ordering::Relaxed) {
+            let v = nx.fetch_add(1, Ordering::Relaxed);
+            if v > CAP {
+                break;
+            }
+            let k = key(rng.gen_range(0..4));
+            if rng.gen() {
+                m.insert(k, v, v);
+            } else {
+                m.delete(k, v);
+            }
+            assert!(m.len() <= 4, "len never exceeds the key space");
+        }
+    });
+    let mut live = 0;
+    for k in 0..4 {
+        let all = map.get_all_versions(&key(k));
+        assert!(
+            all.windows(2).all(|w| w[0].0 > w[1].0),
+            "chains stay sorted"
+        );
+        if all.first().is_some_and(|(_, x)| x.is_some()) {
+            live += 1;
+        }
+    }
+    assert_eq!(map.len(), live);
+    assert_eq!(map.iter().count(), live);
 }
