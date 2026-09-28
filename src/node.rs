@@ -19,7 +19,7 @@
 use std::cell::UnsafeCell;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use crate::latch::HybridLatch;
 use crate::simd::find_child_node16;
@@ -446,6 +446,7 @@ impl Node16 {
 pub struct Node48 {
     pub header: NodeHeader,
     pub child_indices: [u8; 256],
+    pub child_bitmap: [AtomicU64; 4],
     pub children: [AtomicPtr<u8>; 48],
 }
 
@@ -454,6 +455,7 @@ impl Node48 {
         Box::new(Self {
             header: NodeHeader::new(NodeType::Node48, prefix),
             child_indices: [NODE48_EMPTY; 256],
+            child_bitmap: [const { AtomicU64::new(0) }; 4],
             children: [const { AtomicPtr::new(ptr::null_mut()) }; 48],
         })
     }
@@ -479,6 +481,7 @@ impl Node48 {
 
         self.children[slot].store(child.as_raw(), Ordering::Release);
         self.child_indices[key as usize] = slot as u8;
+        set_bitmap_bit(&self.child_bitmap, key);
         self.header.num_children += 1;
     }
 
@@ -488,6 +491,7 @@ impl Node48 {
             return None;
         }
         self.child_indices[key as usize] = NODE48_EMPTY;
+        clear_bitmap_bit(&self.child_bitmap, key);
         let old = TaggedPtr::from_raw(self.children[slot as usize].load(Ordering::Relaxed));
         self.children[slot as usize].store(ptr::null_mut(), Ordering::Relaxed);
         self.header.num_children -= 1;
@@ -499,6 +503,7 @@ impl Node48 {
 #[repr(C)]
 pub struct Node256 {
     pub header: NodeHeader,
+    pub child_bitmap: [AtomicU64; 4],
     pub children: [AtomicPtr<u8>; 256],
 }
 
@@ -506,6 +511,7 @@ impl Node256 {
     pub fn new(prefix: &[u8]) -> Box<Self> {
         Box::new(Self {
             header: NodeHeader::new(NodeType::Node256, prefix),
+            child_bitmap: [const { AtomicU64::new(0) }; 4],
             children: [const { AtomicPtr::new(ptr::null_mut()) }; 256],
         })
     }
@@ -525,19 +531,71 @@ impl Node256 {
             .load(Ordering::Relaxed)
             .is_null());
         self.children[key as usize].store(child.as_raw(), Ordering::Release);
+        set_bitmap_bit(&self.child_bitmap, key);
         self.header.num_children += 1;
     }
 
     pub fn remove_child(&mut self, key: u8) -> Option<TaggedPtr> {
-        let old = self.children[key as usize].load(Ordering::Relaxed);
-        if old.is_null() {
+        let child = self.children[key as usize].swap(ptr::null_mut(), Ordering::Relaxed);
+        if child.is_null() {
             None
         } else {
-            self.children[key as usize].store(ptr::null_mut(), Ordering::Relaxed);
+            clear_bitmap_bit(&self.child_bitmap, key);
             self.header.num_children -= 1;
-            Some(TaggedPtr::from_raw(old))
+            Some(TaggedPtr::from_raw(child))
         }
     }
+}
+
+#[inline(always)]
+pub fn set_bitmap_bit(bitmap: &[AtomicU64; 4], byte: u8) {
+    let word = (byte / 64) as usize;
+    let bit = byte % 64;
+    bitmap[word].fetch_or(1u64 << bit, Ordering::Release);
+}
+
+#[inline(always)]
+pub fn clear_bitmap_bit(bitmap: &[AtomicU64; 4], byte: u8) {
+    let word = (byte / 64) as usize;
+    let bit = byte % 64;
+    bitmap[word].fetch_and(!(1u64 << bit), Ordering::Release);
+}
+
+#[inline(always)]
+#[allow(clippy::needless_range_loop)]
+pub fn next_present_byte(bitmap: &[AtomicU64; 4], min_byte: u8) -> Option<u8> {
+    let start_word = (min_byte / 64) as usize;
+    let start_bit = min_byte % 64;
+
+    for word_idx in start_word..4 {
+        let mut word = bitmap[word_idx].load(Ordering::Acquire);
+        if word_idx == start_word {
+            word &= !0u64 << start_bit;
+        }
+        if word != 0 {
+            let bit = word.trailing_zeros();
+            return Some((word_idx * 64 + bit as usize) as u8);
+        }
+    }
+    None
+}
+
+#[inline(always)]
+pub fn prev_present_byte(bitmap: &[AtomicU64; 4], max_byte: u8) -> Option<u8> {
+    let end_word = (max_byte / 64) as usize;
+    let end_bit = max_byte % 64;
+
+    for word_idx in (0..=end_word).rev() {
+        let mut word = bitmap[word_idx].load(Ordering::Acquire);
+        if word_idx == end_word && end_bit < 63 {
+            word &= (1u64 << (end_bit + 1)) - 1;
+        }
+        if word != 0 {
+            let bit = 63 - word.leading_zeros();
+            return Some((word_idx * 64 + bit as usize) as u8);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

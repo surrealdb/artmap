@@ -23,7 +23,8 @@ use std::sync::atomic::Ordering;
 use crate::entry::EntryRef;
 use crate::key::AsBytes;
 use crate::node::{
-    Leaf, Node16, Node256, Node4, Node48, NodeHeader, NodeType, TaggedPtr, NODE48_EMPTY,
+    next_present_byte, prev_present_byte, Leaf, Node16, Node256, Node4, Node48, NodeHeader,
+    NodeType, TaggedPtr, NODE48_EMPTY,
 };
 use crate::tree::Tree;
 
@@ -42,12 +43,51 @@ impl CursorFrame {
     };
 }
 
+/// An inline bounded key representation avoiding heap allocations for keys <= 32 bytes.
+#[derive(Clone, Debug)]
+pub(crate) enum BoundKey {
+    Unbounded,
+    IncludedSmall([u8; 32], u8),
+    IncludedHeap(Box<[u8]>),
+    ExcludedSmall([u8; 32], u8),
+    ExcludedHeap(Box<[u8]>),
+}
+
+impl BoundKey {
+    #[inline]
+    pub fn from_bound<Q: AsBytes + ?Sized>(bound: Bound<&Q>) -> Self {
+        match bound {
+            Bound::Unbounded => BoundKey::Unbounded,
+            Bound::Included(k) => {
+                let bytes = k.as_bytes();
+                if bytes.len() <= 32 {
+                    let mut buf = [0u8; 32];
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    BoundKey::IncludedSmall(buf, bytes.len() as u8)
+                } else {
+                    BoundKey::IncludedHeap(bytes.into())
+                }
+            }
+            Bound::Excluded(k) => {
+                let bytes = k.as_bytes();
+                if bytes.len() <= 32 {
+                    let mut buf = [0u8; 32];
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    BoundKey::ExcludedSmall(buf, bytes.len() as u8)
+                } else {
+                    BoundKey::ExcludedHeap(bytes.into())
+                }
+            }
+        }
+    }
+}
+
 /// An iterator over a range of entries in an [`ArtMap`](crate::ArtMap).
 pub struct Range<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
     tree: &'a Tree<K, V>,
     _guard: Guard,
-    start_bound: Bound<Vec<u8>>,
-    end_bound: Bound<Vec<u8>>,
+    start_bound: BoundKey,
+    end_bound: BoundKey,
     stack: [CursorFrame; MAX_STACK_DEPTH],
     stack_len: usize,
     stack_overflow: Vec<CursorFrame>,
@@ -57,11 +97,7 @@ pub struct Range<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
 }
 
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
-    pub(crate) fn new(
-        tree: &'a Tree<K, V>,
-        start_bound: Bound<Vec<u8>>,
-        end_bound: Bound<Vec<u8>>,
-    ) -> Self {
+    pub(crate) fn new(tree: &'a Tree<K, V>, start_bound: BoundKey, end_bound: BoundKey) -> Self {
         let guard = crossbeam_epoch::pin();
         Self {
             tree,
@@ -136,6 +172,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
         self.last_leaf_back.map(|p| unsafe { (*p).key.as_bytes() })
     }
 
+    #[inline]
     fn push_and_descend_left(&mut self, mut ptr: TaggedPtr) -> Option<*mut Leaf<K, V>> {
         while !ptr.is_null() {
             if ptr.is_leaf() {
@@ -210,6 +247,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
         }
     }
 
+    #[inline]
     fn advance_forward(&mut self) -> Option<*mut Leaf<K, V>> {
         while let Some(frame) = self.stack_last_mut() {
             let header = frame.node;
@@ -230,6 +268,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, K, V> {
     type Item = EntryRef<'a, K, V>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.exhausted {
             return None;
@@ -238,9 +277,11 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, 
         loop {
             let mut leaf_ptr = if self.last_leaf_front.is_none() {
                 let (search_key, include_equal) = match &self.start_bound {
-                    Bound::Included(k) => (k.as_slice(), true),
-                    Bound::Excluded(k) => (k.as_slice(), false),
-                    Bound::Unbounded => (&[][..], true),
+                    BoundKey::IncludedSmall(b, len) => (&b[..*len as usize], true),
+                    BoundKey::ExcludedSmall(b, len) => (&b[..*len as usize], false),
+                    BoundKey::IncludedHeap(b) => (b.as_ref(), true),
+                    BoundKey::ExcludedHeap(b) => (b.as_ref(), false),
+                    BoundKey::Unbounded => (&[][..], true),
                 };
 
                 let root_ptr = TaggedPtr::from_raw(self.tree.raw_root().as_raw());
@@ -324,15 +365,31 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, 
 
             // Check upper range bound
             match &self.end_bound {
-                Bound::Included(end) if k_bytes > end.as_slice() => {
-                    self.exhausted = true;
-                    return None;
+                BoundKey::IncludedSmall(b, len) => {
+                    if k_bytes > &b[..*len as usize] {
+                        self.exhausted = true;
+                        return None;
+                    }
                 }
-                Bound::Excluded(end) if k_bytes >= end.as_slice() => {
-                    self.exhausted = true;
-                    return None;
+                BoundKey::ExcludedSmall(b, len) => {
+                    if k_bytes >= &b[..*len as usize] {
+                        self.exhausted = true;
+                        return None;
+                    }
                 }
-                _ => {}
+                BoundKey::IncludedHeap(b) => {
+                    if k_bytes > b.as_ref() {
+                        self.exhausted = true;
+                        return None;
+                    }
+                }
+                BoundKey::ExcludedHeap(b) => {
+                    if k_bytes >= b.as_ref() {
+                        self.exhausted = true;
+                        return None;
+                    }
+                }
+                BoundKey::Unbounded => {}
             }
 
             // Check overlap with backward cursor
@@ -357,6 +414,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, 
 }
 
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for Range<'a, K, V> {
+    #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.exhausted {
             return None;
@@ -367,9 +425,11 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for
                 (back_k, false)
             } else {
                 match &self.end_bound {
-                    Bound::Included(k) => (k.as_slice(), true),
-                    Bound::Excluded(k) => (k.as_slice(), false),
-                    Bound::Unbounded => (&[0xFF; 64][..], true),
+                    BoundKey::IncludedSmall(b, len) => (&b[..*len as usize], true),
+                    BoundKey::ExcludedSmall(b, len) => (&b[..*len as usize], false),
+                    BoundKey::IncludedHeap(b) => (b.as_ref(), true),
+                    BoundKey::ExcludedHeap(b) => (b.as_ref(), false),
+                    BoundKey::Unbounded => (&[0xFF; 64][..], true),
                 }
             };
 
@@ -379,15 +439,31 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for
 
             // Check lower range bound
             match &self.start_bound {
-                Bound::Included(start) if k_bytes < start.as_slice() => {
-                    self.exhausted = true;
-                    return None;
+                BoundKey::IncludedSmall(b, len) => {
+                    if k_bytes < &b[..*len as usize] {
+                        self.exhausted = true;
+                        return None;
+                    }
                 }
-                Bound::Excluded(start) if k_bytes <= start.as_slice() => {
-                    self.exhausted = true;
-                    return None;
+                BoundKey::ExcludedSmall(b, len) => {
+                    if k_bytes <= &b[..*len as usize] {
+                        self.exhausted = true;
+                        return None;
+                    }
                 }
-                _ => {}
+                BoundKey::IncludedHeap(b) => {
+                    if k_bytes < b.as_ref() {
+                        self.exhausted = true;
+                        return None;
+                    }
+                }
+                BoundKey::ExcludedHeap(b) => {
+                    if k_bytes <= b.as_ref() {
+                        self.exhausted = true;
+                        return None;
+                    }
+                }
+                BoundKey::Unbounded => {}
             }
 
             // Check overlap with forward cursor
@@ -419,7 +495,7 @@ pub struct Iter<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iter<'a, K, V> {
     pub(crate) fn new(tree: &'a Tree<K, V>) -> Self {
         Self {
-            inner: Range::new(tree, Bound::Unbounded, Bound::Unbounded),
+            inner: Range::new(tree, BoundKey::Unbounded, BoundKey::Unbounded),
         }
     }
 }
@@ -480,6 +556,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Values<'a,
     }
 }
 
+#[inline]
 pub(crate) unsafe fn next_child_in_node(
     header: *mut NodeHeader,
     current_pos: usize,
@@ -520,41 +597,54 @@ pub(crate) unsafe fn next_child_in_node(
         }
         NodeType::Node48 => {
             let n = &*(header as *const Node48);
-            let next_byte = if current_pos == usize::MAX {
+            let mut next_byte = if current_pos == usize::MAX {
                 0
+            } else if current_pos < 255 {
+                (current_pos + 1) as u8
             } else {
-                current_pos + 1
+                return None;
             };
-            for byte in next_byte..=255 {
-                let slot = n.child_indices[byte];
+            while let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
+                let slot = n.child_indices[byte as usize];
                 if slot != NODE48_EMPTY {
                     let child =
                         TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
                     if !child.is_null() {
-                        return Some((byte, child));
+                        return Some((byte as usize, child));
                     }
                 }
+                if byte == 255 {
+                    break;
+                }
+                next_byte = byte + 1;
             }
             None
         }
         NodeType::Node256 => {
             let n = &*(header as *const Node256);
-            let next_byte = if current_pos == usize::MAX {
+            let mut next_byte = if current_pos == usize::MAX {
                 0
+            } else if current_pos < 255 {
+                (current_pos + 1) as u8
             } else {
-                current_pos + 1
+                return None;
             };
-            for byte in next_byte..=255 {
-                let child = TaggedPtr::from_raw(n.children[byte].load(Ordering::Acquire));
+            while let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
+                let child = TaggedPtr::from_raw(n.children[byte as usize].load(Ordering::Acquire));
                 if !child.is_null() {
-                    return Some((byte, child));
+                    return Some((byte as usize, child));
                 }
+                if byte == 255 {
+                    break;
+                }
+                next_byte = byte + 1;
             }
             None
         }
     }
 }
 
+#[inline]
 pub(crate) unsafe fn child_pos_for_byte(
     header: *mut NodeHeader,
     needle: u8,
@@ -649,7 +739,8 @@ pub(crate) unsafe fn first_leaf_in_subtree<K, V>(ptr: TaggedPtr) -> Option<*mut 
         }
         NodeType::Node48 => {
             let n = &*(ptr.as_inner_ptr() as *const Node48);
-            for byte in 0..=255u8 {
+            let mut next_byte = 0u8;
+            while let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
                 let slot = n.child_indices[byte as usize];
                 if slot != NODE48_EMPTY {
                     let child =
@@ -660,18 +751,27 @@ pub(crate) unsafe fn first_leaf_in_subtree<K, V>(ptr: TaggedPtr) -> Option<*mut 
                         }
                     }
                 }
+                if byte == 255 {
+                    break;
+                }
+                next_byte = byte + 1;
             }
             None
         }
         NodeType::Node256 => {
             let n = &*(ptr.as_inner_ptr() as *const Node256);
-            for byte in 0..=255u8 {
+            let mut next_byte = 0u8;
+            while let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
                 let child = TaggedPtr::from_raw(n.children[byte as usize].load(Ordering::Acquire));
                 if !child.is_null() {
                     if let Some(leaf) = first_leaf_in_subtree(child) {
                         return Some(leaf);
                     }
                 }
+                if byte == 255 {
+                    break;
+                }
+                next_byte = byte + 1;
             }
             None
         }
@@ -714,7 +814,8 @@ pub(crate) unsafe fn last_leaf_in_subtree<K, V>(ptr: TaggedPtr) -> Option<*mut L
         }
         NodeType::Node48 => {
             let n = &*(ptr.as_inner_ptr() as *const Node48);
-            for byte in (0..=255u8).rev() {
+            let mut max_b = 255u8;
+            while let Some(byte) = prev_present_byte(&n.child_bitmap, max_b) {
                 let slot = n.child_indices[byte as usize];
                 if slot != NODE48_EMPTY {
                     let child =
@@ -725,18 +826,27 @@ pub(crate) unsafe fn last_leaf_in_subtree<K, V>(ptr: TaggedPtr) -> Option<*mut L
                         }
                     }
                 }
+                if byte == 0 {
+                    break;
+                }
+                max_b = byte - 1;
             }
             header.load_exact_leaf::<K, V>(Ordering::Acquire)
         }
         NodeType::Node256 => {
             let n = &*(ptr.as_inner_ptr() as *const Node256);
-            for byte in (0..=255u8).rev() {
+            let mut max_b = 255u8;
+            while let Some(byte) = prev_present_byte(&n.child_bitmap, max_b) {
                 let child = TaggedPtr::from_raw(n.children[byte as usize].load(Ordering::Acquire));
                 if !child.is_null() {
                     if let Some(leaf) = last_leaf_in_subtree(child) {
                         return Some(leaf);
                     }
                 }
+                if byte == 0 {
+                    break;
+                }
+                max_b = byte - 1;
             }
             header.load_exact_leaf::<K, V>(Ordering::Acquire)
         }

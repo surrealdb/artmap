@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use crate::key::AsBytes;
 use crate::latch::{CachePadded, HybridLatch};
 use crate::node::{
-    Node16, Node256, Node4, Node48, NodeHeader, NodeType, TaggedPtr, VersionNode, VersionedLeaf,
-    MAX_PREFIX_LEN, NODE48_EMPTY,
+    clear_bitmap_bit, set_bitmap_bit, Node16, Node256, Node4, Node48, NodeHeader, NodeType,
+    TaggedPtr, VersionNode, VersionedLeaf, MAX_PREFIX_LEN, NODE48_EMPTY,
 };
 
 /// Internal multi-version concurrent tree structure.
@@ -533,6 +533,7 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                                     )
                                     .is_ok()
                             {
+                                set_bitmap_bit(&n256.child_bitmap, next_byte);
                                 let parent_valid = match parent {
                                     Some(p) => unsafe {
                                         !(*p).latch.is_obsolete()
@@ -545,6 +546,7 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedTree<K, V>
                                     self.len.fetch_add(1, Ordering::Relaxed);
                                     return true;
                                 } else {
+                                    clear_bitmap_bit(&n256.child_bitmap, next_byte);
                                     n256.children[next_byte as usize]
                                         .store(ptr::null_mut(), Ordering::Release);
                                     continue 'retry;

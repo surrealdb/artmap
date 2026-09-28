@@ -39,7 +39,7 @@ pub mod tree;
 pub mod versioned;
 
 use std::borrow::Borrow;
-use std::ops::{Bound, RangeBounds};
+use std::ops::RangeBounds;
 use std::sync::atomic::Ordering;
 
 pub use arena::{Arena, ArenaArtMap, ArenaInserter, ArenaVersionedArtMap};
@@ -218,17 +218,8 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
         R: RangeBounds<Q>,
         Q: AsBytes + ?Sized,
     {
-        let start = match range.start_bound() {
-            Bound::Included(b) => Bound::Included(b.as_bytes().to_vec()),
-            Bound::Excluded(b) => Bound::Excluded(b.as_bytes().to_vec()),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-        let end = match range.end_bound() {
-            Bound::Included(b) => Bound::Included(b.as_bytes().to_vec()),
-            Bound::Excluded(b) => Bound::Excluded(b.as_bytes().to_vec()),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-
+        let start = crate::iter::BoundKey::from_bound(range.start_bound());
+        let end = crate::iter::BoundKey::from_bound(range.end_bound());
         Range::new(&self.tree, start, end)
     }
 
