@@ -118,9 +118,50 @@ fn long_scan_with_churn() {
     );
 }
 
+/// Reader p99.9 latency on an unrelated map while a 1M-entry map is cleared.
+fn clear_unrelated_reader_p999() {
+    let mut p999s = Vec::new();
+    for _ in 0..5 {
+        let big = Arc::new(ArtMap::<[u8; 8], u64>::new());
+        for i in 0..1_000_000u64 {
+            let _ = big.insert(i.to_be_bytes(), i);
+        }
+        let small = Arc::new(ArtMap::<[u8; 8], u64>::new());
+        for i in 0..10_000u64 {
+            let _ = small.insert(i.to_be_bytes(), i);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (small, stop) = (Arc::clone(&small), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut lat = Vec::with_capacity(1 << 22);
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let k = (i.wrapping_mul(7919) % 10_000).to_be_bytes();
+                    let t = std::time::Instant::now();
+                    std::hint::black_box(small.get(&k).is_some());
+                    lat.push(t.elapsed().as_nanos() as u64);
+                    i += 1;
+                }
+                lat
+            })
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        big.clear();
+        std::thread::sleep(Duration::from_millis(200));
+        stop.store(true, Ordering::Relaxed);
+        let mut lat = reader.join().unwrap();
+        lat.sort_unstable();
+        p999s.push(lat[lat.len() * 999 / 1000]);
+    }
+    p999s.sort_unstable();
+    println!("clear_unrelated_reader p999_ns(median of 5)={}", p999s[2]);
+}
+
 fn main() {
     // `cargo bench` passes `--bench`; ignore arguments.
     sliding_window();
     long_scan_with_churn();
+    clear_unrelated_reader_p999();
     println!("peak_process_bytes={}", PEAK.load(Ordering::Relaxed));
 }

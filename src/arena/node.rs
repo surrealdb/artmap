@@ -14,7 +14,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
-use crate::latch::HybridLatch;
+use crate::latch_legacy::HybridLatch;
 use crate::node::{NodeType, MAX_PREFIX_LEN, NODE48_EMPTY};
 use crate::simd::find_child_node16;
 

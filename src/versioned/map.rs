@@ -12,61 +12,87 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # Concurrent Multi-Version Adaptive Radix Tree
-//!
-//! Provides [`VersionedArtMap`], an epoch-based concurrent Adaptive Radix Tree (ART)
-//! supporting 64-bit MVCC version chains and lock-free snapshot reads.
+//! # Concurrent multi-version adaptive radix tree
+
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
 use std::borrow::Borrow;
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 
+use crate::guard::{pin, Guard, GuardHandle};
 use crate::key::AsBytes;
+use crate::raw::cursor::{owned_bound, Cursor};
 use crate::versioned::entry::VersionedEntryRef;
 use crate::versioned::iter::Range;
-use crate::versioned::tree::VersionedTree;
+use crate::versioned::tree::{chain, find_le, VersionedTree};
 
-/// A concurrent associative map with built-in 64-bit MVCC versioning.
+/// A concurrent ordered map with 64-bit MVCC versions per key.
 ///
-/// Features lock-free optimistic snapshot reads, epoch-based memory reclamation via `crossbeam-epoch`,
-/// and atomic version prepend chains in leaf nodes.
-pub struct VersionedArtMap<K: AsBytes + Send + 'static, V: Send + Clone + 'static> {
+/// Each key has a chain of versions, newest first; a version may be a
+/// tombstone. Snapshot reads (`get_version_le`) are lock-free. Writers of one
+/// key serialise on a per-key latch; writers of different keys run in parallel.
+///
+/// ## Semantics
+///
+/// - `len()` is the number of keys whose newest version is live (not a
+///   tombstone). It is exact when no operation is in flight.
+/// - `get_latest`/`get` return `None` when the newest version is a tombstone;
+///   `get_version_le` returns `None` when the selected version is one.
+///   Older snapshots are unaffected by later deletes.
+/// - `version_count` and `get_all_versions` include tombstones.
+/// - Scans (`iter`, `range`, `scan`) are latest-view: keys whose newest version
+///   is a tombstone are skipped.
+/// - After `prune_key(k, min, ..)` or `prune_all(min, ..)`, `get_version_le(k, v)`
+///   is exact for `v >= min` and unsupported for `v < min` (the watermark
+///   contract).
+/// - Deleted keys keep their leaf and one tombstone until pruned; leaves are
+///   never unlinked in this release.
+pub struct VersionedArtMap<K, V> {
     tree: VersionedTree<K, V>,
 }
 
-impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> Default for VersionedArtMap<K, V> {
+impl<K, V> Default for VersionedArtMap<K, V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedArtMap<K, V> {
-    /// Creates a new empty `VersionedArtMap`.
-    pub fn new() -> Self {
-        Self {
-            tree: VersionedTree::new(),
+impl<K, V> VersionedArtMap<K, V> {
+    crate::sync::const_fn_unless_loom! {
+        /// Creates an empty map.
+        pub fn new() -> Self {
+            Self {
+                tree: VersionedTree::new(),
+            }
         }
     }
 
-    /// Creates a new `VersionedArtMap` pre-sized for high-capacity ingestion.
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            tree: VersionedTree::with_capacity(capacity),
-        }
+    /// Creates an empty map. The capacity is a hint and currently unused.
+    pub fn with_capacity(_capacity: usize) -> Self {
+        Self::new()
     }
 
-    /// Returns the number of distinct keys stored in the map.
+    /// The number of keys whose newest version is live.
     #[inline]
     pub fn len(&self) -> usize {
         self.tree.len()
     }
 
-    /// Returns `true` if the map contains no entries.
+    /// `true` if no key has a live newest version.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.tree.is_empty()
+        self.len() == 0
+    }
+}
+
+impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
+    /// Pins the epoch, for the `*_with_guard` methods.
+    #[inline]
+    pub fn pin(&self) -> Guard<'_> {
+        Guard::new()
     }
 
-    /// Returns the newest committed value corresponding to the key, if present and not deleted.
+    /// The newest live value of `key`.
     #[inline]
     pub fn get<Q>(&self, key: &Q) -> Option<V>
     where
@@ -77,25 +103,29 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedArtMap<K, 
         self.get_latest(key).map(|(_, v)| v)
     }
 
-    /// Looks up a value by raw byte slice without converting to the owned key type.
+    /// The newest live value of a raw byte key.
     #[inline]
-    pub fn get_by_slice(&self, key_bytes: &[u8]) -> Option<V> {
-        self.get_slice(key_bytes)
-    }
-
-    /// Point lookup on raw byte slice returning the newest committed value, if present and not deleted.
-    #[inline]
-    pub fn get_slice(&self, key_bytes: &[u8]) -> Option<V>
+    pub fn get_by_slice(&self, key: &[u8]) -> Option<V>
     where
         V: Clone,
     {
-        let guard = crossbeam_epoch::pin();
-        self.tree
-            .get_latest(key_bytes, &guard)
-            .map(|(_, v)| v.clone())
+        self.get_slice(key)
     }
 
-    /// Looks up the newest committed version and value for `key`.
+    /// The newest live value of a raw byte key.
+    #[inline]
+    pub fn get_slice(&self, key: &[u8]) -> Option<V>
+    where
+        V: Clone,
+    {
+        let _g = pin();
+        let leaf = self.tree.raw.get(key)?;
+        // SAFETY: protected by `_g`.
+        let head = unsafe { leaf.as_ref() }.head();
+        head.value.clone()
+    }
+
+    /// The newest version and value of `key`, if live.
     #[inline]
     pub fn get_latest<Q>(&self, key: &Q) -> Option<(u64, V)>
     where
@@ -103,15 +133,28 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedArtMap<K, 
         Q: AsBytes + ?Sized,
         V: Clone,
     {
-        let guard = crossbeam_epoch::pin();
-        self.tree
-            .get_latest(key, &guard)
-            .map(|(ver, v)| (ver, v.clone()))
+        let _g = pin();
+        let leaf = self.tree.raw.get(key.as_bytes())?;
+        // SAFETY: protected by `_g`.
+        let head = unsafe { leaf.as_ref() }.head();
+        head.value.clone().map(|v| (head.version, v))
     }
 
-    /// Looks up the newest version of `key` whose version is less than or equal to `max_version`.
-    ///
-    /// Essential for lock-free MVCC snapshot isolation.
+    /// A handle on the newest live version of `key`, without cloning.
+    pub fn get_entry<Q>(&self, key: &Q) -> Option<VersionedEntryRef<'_, K, V>>
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        let guard = GuardHandle::owned();
+        let leaf = self.tree.raw.get(key.as_bytes())?;
+        // SAFETY: protected by `guard`, which moves into the handle.
+        let head = unsafe { leaf.as_ref() }.head();
+        VersionedEntryRef::new(leaf, head, &self.tree, guard)
+    }
+
+    /// The newest version of `key` that is `<= max_version`, unless it is a
+    /// tombstone. The basis of MVCC snapshot reads.
     #[inline]
     pub fn get_version_le<Q>(&self, key: &Q, max_version: u64) -> Option<(u64, V)>
     where
@@ -119,162 +162,223 @@ impl<K: AsBytes + Send + 'static, V: Send + Clone + 'static> VersionedArtMap<K, 
         Q: AsBytes + ?Sized,
         V: Clone,
     {
-        let guard = crossbeam_epoch::pin();
-        self.get_version_le_with_guard(key, max_version, &guard)
+        let g = &pin();
+        self.version_le(key.as_bytes(), max_version, g)
     }
 
-    /// Looks up the newest version of `key` whose version is less than or equal to `max_version` using a pre-pinned [`Guard`](crossbeam_epoch::Guard).
+    /// As [`get_version_le`](Self::get_version_le), with a pre-pinned guard.
     #[inline]
     pub fn get_version_le_with_guard<Q>(
         &self,
         key: &Q,
         max_version: u64,
-        guard: &crossbeam_epoch::Guard,
+        guard: &Guard<'_>,
     ) -> Option<(u64, V)>
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
         V: Clone,
     {
-        self.tree
-            .get_version_le(key, max_version, guard)
-            .map(|(ver, v)| (ver, v.clone()))
+        self.version_le(key.as_bytes(), max_version, &guard.inner)
     }
 
-    /// Checks if the key is present in the map with an active (non-deleted) head version.
+    fn version_le(&self, key: &[u8], max: u64, _g: &crossbeam_epoch::Guard) -> Option<(u64, V)>
+    where
+        V: Clone,
+    {
+        let leaf = self.tree.raw.get(key)?;
+        // SAFETY: protected by `_g`.
+        let n = find_le(unsafe { leaf.as_ref() }.head(), max)?;
+        n.value.clone().map(|v| (n.version, v))
+    }
+
+    /// `true` if the newest version of `key` is live.
     #[inline]
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
-        V: Clone,
     {
-        self.get(key).is_some()
+        let _g = pin();
+        self.tree
+            .raw
+            .get(key.as_bytes())
+            // SAFETY: protected by `_g`.
+            .is_some_and(|l| !unsafe { l.as_ref() }.head().is_tombstone())
     }
 
-    /// Inserts a versioned key-value pair into the map.
+    /// Adds `version` of `key`. An existing version with the same number is
+    /// replaced (out of place). Always returns `true`.
     #[inline]
     pub fn insert(&self, key: K, version: u64, value: V) -> bool {
-        let guard = crossbeam_epoch::pin();
-        self.insert_with_guard(key, version, value, &guard)
+        let g = &pin();
+        self.tree.insert(key, version, Some(value), g);
+        true
     }
 
-    /// Inserts a versioned key-value pair using a pre-pinned epoch [`Guard`](crossbeam_epoch::Guard).
+    /// As [`insert`](Self::insert), with a pre-pinned guard.
     #[inline]
-    pub fn insert_with_guard(
-        &self,
-        key: K,
-        version: u64,
-        value: V,
-        guard: &crossbeam_epoch::Guard,
-    ) -> bool {
-        self.tree.insert(key, version, value, guard)
+    pub fn insert_with_guard(&self, key: K, version: u64, value: V, guard: &Guard<'_>) -> bool {
+        self.tree.insert(key, version, Some(value), &guard.inner);
+        true
     }
 
-    /// Inserts a versioned key-value pair into the map (alias for `insert`).
+    /// Alias for [`insert`](Self::insert).
     #[inline]
     pub fn insert_versioned(&self, key: K, version: u64, value: V) -> bool {
         self.insert(key, version, value)
     }
 
-    /// Marks the latest version of a key as removed, returning the removed value if present.
-    #[inline]
-    pub fn remove<Q>(&self, key: &Q) -> Option<V>
+    /// Records a tombstone at `version` for `key`, creating the key if needed.
+    /// Older snapshots are unchanged. Returns `true` if the key's newest
+    /// version was live before and is now deleted.
+    pub fn delete(&self, key: K, version: u64) -> bool {
+        let g = &pin();
+        self.tree.insert(key, version, None, g) < 0
+    }
+
+    /// Deletes the newest version of `key` in place of its value: publishes a
+    /// tombstone with the same version number, so snapshots at or after that
+    /// version see the key as absent. Returns the replaced version.
+    #[deprecated(note = "use `delete(key, version)`, which does not rewrite history")]
+    pub fn remove<Q>(&self, key: &Q) -> Option<VersionedEntryRef<'_, K, V>>
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
-        V: Clone,
     {
-        let guard = crossbeam_epoch::pin();
-        self.tree.remove(key, &guard)
+        let guard = GuardHandle::owned();
+        let (leaf, old) = self.tree.remove_head(key.as_bytes(), guard.guard())?;
+        // SAFETY: `old` is retired through `guard`, which moves into the handle.
+        VersionedEntryRef::new(leaf, unsafe { old.as_ref() }, &self.tree, guard)
     }
 
-    /// Returns the number of versions stored for `key`.
-    #[inline]
+    /// The number of versions of `key`, including tombstones.
     pub fn version_count<Q>(&self, key: &Q) -> usize
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
     {
-        let guard = crossbeam_epoch::pin();
-        self.tree.version_count(key, &guard)
+        let _g = pin();
+        match self.tree.raw.get(key.as_bytes()) {
+            // SAFETY: protected by `_g`.
+            Some(l) => chain(unsafe { l.as_ref() }.head()).count(),
+            None => 0,
+        }
     }
 
-    /// Returns all versions stored for `key`, ordered from newest to oldest.
-    #[inline]
-    pub fn get_all_versions<Q>(&self, key: &Q) -> Vec<(u64, V)>
+    /// Every version of `key`, newest first; `None` values are tombstones.
+    pub fn get_all_versions<Q>(&self, key: &Q) -> Vec<(u64, Option<V>)>
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
+        V: Clone,
     {
-        let guard = crossbeam_epoch::pin();
-        self.tree.get_all_versions(key, &guard)
+        let _g = pin();
+        match self.tree.raw.get(key.as_bytes()) {
+            // SAFETY: protected by `_g`.
+            Some(l) => chain(unsafe { l.as_ref() }.head())
+                .map(|n| (n.version, n.value.clone()))
+                .collect(),
+            None => Vec::new(),
+        }
     }
 
-    /// Prunes stale versions older than `min_version` from the version chain of `key`.
+    /// Unlinks every version of `key` older than its newest version
+    /// `<= min_version`. If that version is the newest one and `is_tombstone`
+    /// says its value is a tombstone, it is replaced by a built-in tombstone.
+    /// Returns the number of versions unlinked. The key itself stays in the
+    /// map (with a tombstone) in this release.
     ///
-    /// If the key has become a dead tombstone at or below `min_version` with no newer versions,
-    /// the key is unlinked from the tree.
-    #[inline]
+    /// `is_tombstone` runs without any latch held.
     pub fn prune_key<Q, F>(&self, key: &Q, min_version: u64, is_tombstone: F) -> usize
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
         F: Fn(&V) -> bool,
     {
-        let guard = crossbeam_epoch::pin();
-        self.tree.prune_key(key, min_version, is_tombstone, &guard)
+        let g = &pin();
+        match self.tree.raw.get(key.as_bytes()) {
+            Some(leaf) => self.tree.prune_leaf(leaf, min_version, &is_tombstone, g),
+            None => 0,
+        }
     }
 
-    /// Prunes stale versions older than `min_version` across all keys in the map.
+    /// [`prune_key`](Self::prune_key) for every key, including deleted ones.
+    /// Repins periodically so a long prune does not stall reclamation.
     pub fn prune_all<F>(&self, min_version: u64, is_tombstone: F) -> usize
     where
-        F: Fn(&V) -> bool + Copy,
+        F: Fn(&V) -> bool,
     {
-        let guard = crossbeam_epoch::pin();
+        let mut g = pin();
+        let mut cursor = Cursor::new(Bound::Unbounded, Bound::Unbounded);
         let mut total = 0;
-        for entry in self.iter() {
-            total += self
-                .tree
-                .prune_key(entry.key(), min_version, is_tombstone, &guard);
+        let mut n = 0usize;
+        while let Some(leaf) = cursor.next(&self.tree.raw) {
+            total += self.tree.prune_leaf(leaf, min_version, &is_tombstone, &g);
+            n += 1;
+            if n % 1024 == 0 {
+                // Frames hold node pointers protected by `g`: drop them first.
+                cursor.invalidate(&self.tree.raw);
+                g.repin();
+            }
         }
         total
     }
 
-    /// Returns an iterator over a sub-range of entries.
+    /// An iterator over the latest live version of each key in `range`.
     pub fn range<R, Q>(&self, range: R) -> Range<'_, K, V>
     where
         R: RangeBounds<Q>,
         Q: AsBytes + ?Sized,
     {
-        let start = crate::iter::BoundKey::from_bound(range.start_bound());
-        let end = crate::iter::BoundKey::from_bound(range.end_bound());
-        Range::new(&self.tree, start, end)
+        Range::owned(
+            &self.tree,
+            owned_bound(range.start_bound()),
+            owned_bound(range.end_bound()),
+        )
     }
 
-    /// Returns an iterator visiting all entries in ascending key order.
+    /// As [`range`](Self::range), borrowing the caller's guard.
+    pub fn range_with_guard<'a, R, Q>(&'a self, range: R, guard: &'a Guard<'_>) -> Range<'a, K, V>
+    where
+        R: RangeBounds<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        Range::borrowed(
+            &self.tree,
+            &guard.inner,
+            owned_bound(range.start_bound()),
+            owned_bound(range.end_bound()),
+        )
+    }
+
+    /// An iterator over the latest live version of every key.
     pub fn iter(&self) -> Range<'_, K, V> {
-        self.range::<std::ops::RangeFull, [u8]>(..)
+        Range::owned(&self.tree, Bound::Unbounded, Bound::Unbounded)
     }
 
-    /// Scans entries in the given key range, invoking `callback` for each entry with its key, value, and version.
-    ///
-    /// If `callback` returns `false`, scanning terminates early.
+    /// As [`iter`](Self::iter), borrowing the caller's guard.
+    pub fn iter_with_guard<'a>(&'a self, guard: &'a Guard<'_>) -> Range<'a, K, V> {
+        Range::borrowed(&self.tree, &guard.inner, Bound::Unbounded, Bound::Unbounded)
+    }
+
+    /// Calls `callback(key, value, version)` for the latest live version of
+    /// each key in `range`, until it returns `false`.
     pub fn scan<R, Q, F>(&self, range: R, mut callback: F)
     where
         R: RangeBounds<Q>,
         Q: AsBytes + ?Sized,
         F: FnMut(&K, &V, u64) -> bool,
     {
-        for entry in self.range(range) {
-            if !callback(entry.key(), entry.value(), entry.version()) {
+        for e in self.range(range) {
+            if !callback(e.key(), e.value(), e.version()) {
                 break;
             }
         }
     }
 }
 
-impl<'a, K: AsBytes + Send + 'static, V: Send + Clone + 'static> IntoIterator
+impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> IntoIterator
     for &'a VersionedArtMap<K, V>
 {
     type Item = VersionedEntryRef<'a, K, V>;

@@ -21,7 +21,7 @@ use crate::arena::node::{
 };
 use crate::arena::Arena;
 use crate::key::AsBytes;
-use crate::latch::{CachePadded, HybridLatch};
+use crate::latch_legacy::{CachePadded, HybridLatch};
 use crate::node::{NodeType, MAX_PREFIX_LEN, NODE48_EMPTY};
 use crate::simd::find_child_node16;
 

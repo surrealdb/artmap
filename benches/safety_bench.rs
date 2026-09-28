@@ -17,7 +17,7 @@
 //! so the same file measures the baseline and every later phase.
 
 use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -131,6 +131,29 @@ fn bench_gets(c: &mut Criterion) {
             let k = &keys[i & 4095];
             i += 1;
             black_box(map.get(k).is_some());
+        });
+    });
+
+    group.bench_function("get_with_guard", |b| {
+        let map = filled_map();
+        let keys = random_keys(4096, 3);
+        let guard = map.pin();
+        let mut i = 0usize;
+        b.iter(|| {
+            let k = &keys[i & 4095];
+            i += 1;
+            black_box(map.get_with_guard(k, &guard).is_some());
+        });
+    });
+
+    group.bench_function("with_value", |b| {
+        let map = filled_map();
+        let keys = random_keys(4096, 3);
+        let mut i = 0usize;
+        b.iter(|| {
+            let k = &keys[i & 4095];
+            i += 1;
+            black_box(map.with_value(k, |v| *v));
         });
     });
 
@@ -344,54 +367,6 @@ fn bench_versioned(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_clear_latency(c: &mut Criterion) {
-    // Reader p99.9 on an unrelated map while a 1M-entry map is cleared.
-    // Criterion reports the mean; the percentile is printed once.
-    let mut group = c.benchmark_group("clear_unrelated_reader");
-    group.sample_size(10);
-    group.bench_function("p999_ns", |b| {
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                let big = Arc::new(ArtMap::<[u8; 8], u64>::new());
-                for i in 0..1_000_000u64 {
-                    let _ = big.insert(i.to_be_bytes(), i);
-                }
-                let small = Arc::new(filled_map());
-                let stop = Arc::new(AtomicBool::new(false));
-                let reader = {
-                    let small = Arc::clone(&small);
-                    let stop = Arc::clone(&stop);
-                    std::thread::spawn(move || {
-                        let keys = random_keys(4096, 40);
-                        let mut lat = Vec::with_capacity(1 << 20);
-                        let mut i = 0usize;
-                        while !stop.load(Ordering::Relaxed) {
-                            let t = Instant::now();
-                            black_box(small.get(&keys[i & 4095]).is_some());
-                            lat.push(t.elapsed().as_nanos() as u64);
-                            i += 1;
-                        }
-                        lat
-                    })
-                };
-                std::thread::sleep(Duration::from_millis(20));
-                big.clear();
-                // Keep reading while the deferred garbage is collected.
-                std::thread::sleep(Duration::from_millis(200));
-                stop.store(true, Ordering::Relaxed);
-                let mut lat = reader.join().unwrap();
-                lat.sort_unstable();
-                let p999 = lat[(lat.len() * 999) / 1000];
-                total += Duration::from_nanos(p999);
-                drop(big);
-            }
-            total
-        });
-    });
-    group.finish();
-}
-
 fn config() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_millis(500))
@@ -402,6 +377,6 @@ fn config() -> Criterion {
 criterion_group! {
     name = benches;
     config = config();
-    targets = bench_gets, bench_overwrite, bench_churn, bench_scan, bench_hot_node256, bench_versioned, bench_clear_latency
+    targets = bench_gets, bench_overwrite, bench_churn, bench_scan, bench_hot_node256, bench_versioned
 }
 criterion_main!(benches);

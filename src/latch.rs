@@ -12,162 +12,212 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # Optimistic Version Latch
+//! # Optimistic version latch
 //!
-//! Provides [`HybridLatch`], an atomic version latch implementing the
-//! Read-Optimized Write-EXclusion (ROWEX) / Optimistic Lock Coupling (OLC) protocol.
+//! [`HybridLatch`] is a sequence lock used for optimistic lock coupling. The
+//! protocol it implements is normative (`docs/SAFETY.md` §5):
+//!
+//! - **W1**: a writer acquires the latch with an `Acquire` CAS and then issues
+//!   `fence(Release)`, so the lock-bit store is ordered before every store in
+//!   the critical section (the `crossbeam` `SeqLock::write` pattern).
+//! - **W4**: `unlock` stores `v + STEP` with `Release`; `mark_obsolete` stores
+//!   `v | OBSOLETE` and is used only on nodes already unlinked (Inv 7).
+//! - **R1/R5**: a reader takes `read_version()` (`Acquire`), and validates with
+//!   `fence(Acquire)` followed by a `Relaxed` load.
+//!
+//! Exclusive access is represented by a [`WriteGuard`]. Dropping it releases
+//! the latch and bumps the version, so unwinding out of a *prepare* phase is
+//! harmless (Inv 6). Commit phases are wrapped in [`AbortOnUnwind`].
 
-use std::sync::atomic::{AtomicU64, Ordering};
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
-pub const LOCK_BIT: u64 = 0b01;
-pub const OBSOLETE_BIT: u64 = 0b10;
-pub const LOCKED_OR_OBSOLETE: u64 = LOCK_BIT | OBSOLETE_BIT;
-pub const VERSION_STEP: u64 = 0b100;
+use crate::sync::atomic::{fence, AtomicU64, Ordering};
 
-/// Error returned when acquiring a lock on an obsolete node.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum LockError {
-    Obsolete,
+/// Switches for the loom mutant self-checks (§16.3): each model must fail
+/// with the fence it depends on removed, which proves the model explores.
+/// Loom runs every thread of a model on the calling OS thread, so
+/// thread-local switches affect exactly one model at a time.
+#[cfg(loom)]
+pub(crate) mod mutants {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        pub(crate) static SKIP_W1_FENCE: Cell<bool> = const { Cell::new(false) };
+        pub(crate) static SKIP_R5_FENCE: Cell<bool> = const { Cell::new(false) };
+        pub(crate) static SKIP_R4_COUPLING: Cell<bool> = const { Cell::new(false) };
+    }
 }
 
-/// An atomic version latch supporting optimistic non-blocking reads and exclusive writes.
+pub(crate) const LOCK_BIT: u64 = 0b01;
+pub(crate) const OBSOLETE_BIT: u64 = 0b10;
+pub(crate) const VERSION_STEP: u64 = 0b100;
+
+/// An atomic version latch supporting optimistic reads and exclusive writes.
 #[repr(transparent)]
-#[derive(Debug)]
-pub struct HybridLatch {
+pub(crate) struct HybridLatch {
     version: AtomicU64,
 }
 
-impl Default for HybridLatch {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
+/// Proof that this thread holds `latch` exclusively.
+///
+/// Dropping it unlocks and bumps the version.
+#[must_use = "dropping a WriteGuard immediately releases the latch"]
+pub(crate) struct WriteGuard<'l> {
+    latch: &'l HybridLatch,
+    /// Version at acquisition: unlocked and not obsolete.
+    v: u64,
 }
 
 impl HybridLatch {
-    /// Attempts to acquire the exclusive write lock if the version matches `expected_version`.
-    #[inline]
-    pub fn lock_version(&self, expected_version: u64) -> Result<u64, LockError> {
-        if self.version.load(Ordering::Relaxed) != expected_version {
-            return Err(LockError::Obsolete);
-        }
-        match self.version.compare_exchange(
-            expected_version,
-            expected_version | LOCK_BIT,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(expected_version),
-            Err(_) => Err(LockError::Obsolete),
-        }
-    }
-
-    /// Creates a new unlocked, non-obsolete latch with initial version 0.
-    #[inline]
-    pub const fn new() -> Self {
-        Self {
-            version: AtomicU64::new(0),
-        }
-    }
-
-    /// Reads the current version if the latch is neither write-locked nor obsolete.
-    ///
-    /// Returns `Some(version)` if unlocked and live, or `None` if currently locked or obsolete.
-    #[inline]
-    pub fn read_version(&self) -> Option<u64> {
-        let v = self.version.load(Ordering::Acquire);
-        if v & LOCKED_OR_OBSOLETE != 0 {
-            None
-        } else {
-            Some(v)
-        }
-    }
-
-    /// Validates that the latch has not changed, been locked, or marked obsolete
-    /// since `start_version` was captured.
-    #[inline]
-    pub fn validate(&self, start_version: u64) -> bool {
-        std::sync::atomic::fence(Ordering::Acquire);
-        self.version.load(Ordering::Relaxed) == start_version
-    }
-
-    /// Checks if the latch is currently write-locked.
-    #[inline]
-    pub fn is_locked(&self) -> bool {
-        self.version.load(Ordering::Acquire) & LOCK_BIT != 0
-    }
-
-    /// Checks if the node has been marked obsolete.
-    #[inline]
-    pub fn is_obsolete(&self) -> bool {
-        self.version.load(Ordering::Acquire) & OBSOLETE_BIT != 0
-    }
-
-    /// Attempts to acquire the exclusive write lock without spinning.
-    ///
-    /// Returns `Ok(current_version)` on success, or `Err(true)` if obsolete, `Err(false)` if locked.
-    #[inline]
-    pub fn try_lock(&self) -> Result<u64, bool> {
-        let v = self.version.load(Ordering::Relaxed);
-        if v & OBSOLETE_BIT != 0 {
-            return Err(true);
-        }
-        if v & LOCK_BIT != 0 {
-            return Err(false);
-        }
-        match self.version.compare_exchange_weak(
-            v,
-            v | LOCK_BIT,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(v),
-            Err(_) => Err(false),
-        }
-    }
-
-    /// Acquires the exclusive write lock, spinning with exponential backoff until acquired.
-    ///
-    /// Returns `Ok(current_version)` on success, or `Err(LockError::Obsolete)` if the node becomes obsolete.
-    #[inline]
-    pub fn lock(&self) -> Result<u64, LockError> {
-        let mut backoff = SpinBackoff::new();
-        loop {
-            match self.try_lock() {
-                Ok(v) => return Ok(v),
-                Err(true) => return Err(LockError::Obsolete),
-                Err(false) => backoff.spin(),
+    crate::sync::const_fn_unless_loom! {
+        /// Creates an unlocked, live latch at version 0.
+        #[inline]
+        pub(crate) fn new() -> Self {
+            Self {
+                version: AtomicU64::new(0),
             }
         }
     }
 
-    /// Releases the exclusive write lock, incrementing the version counter to notify readers.
+    /// R1: `Some(v)` if the latch is unlocked and not obsolete.
     #[inline]
-    pub fn unlock(&self) {
-        let current = self.version.load(Ordering::Relaxed);
-        debug_assert_ne!(current & LOCK_BIT, 0, "unlock called on un-locked latch");
-        let new_version = (current & !LOCK_BIT).wrapping_add(VERSION_STEP);
-        self.version.store(new_version, Ordering::Release);
+    pub(crate) fn read_version(&self) -> Option<u64> {
+        let v = self.version.load(Ordering::Acquire);
+        (v & (LOCK_BIT | OBSOLETE_BIT) == 0).then_some(v)
     }
 
-    /// Marks the node as permanently obsolete and releases the lock.
+    /// R5: `true` if no writer has entered a critical section since `v` was read.
     #[inline]
-    pub fn mark_obsolete_and_unlock(&self) {
-        let current = self.version.load(Ordering::Relaxed);
-        debug_assert_ne!(
-            current & LOCK_BIT,
-            0,
-            "mark_obsolete called on un-locked latch"
-        );
-        let new_version = (current & !LOCK_BIT) | OBSOLETE_BIT;
-        self.version.store(new_version, Ordering::Release);
+    pub(crate) fn validate(&self, v: u64) -> bool {
+        #[cfg(loom)]
+        if mutants::SKIP_R5_FENCE.with(|m| m.get()) {
+            return self.version.load(Ordering::Relaxed) == v;
+        }
+        fence(Ordering::Acquire);
+        self.version.load(Ordering::Relaxed) == v
+    }
+
+    /// `true` if the latch has been marked obsolete.
+    #[inline]
+    pub(crate) fn is_obsolete(&self) -> bool {
+        self.version.load(Ordering::Acquire) & OBSOLETE_BIT != 0
+    }
+
+    /// Upgrades an optimistic read at version `v` to exclusive access (W1).
+    ///
+    /// Fails if the latch changed since `v` was read, or if `v` itself is
+    /// locked or obsolete (for example a stale cached version).
+    #[must_use = "binding the guard is what holds the latch"]
+    #[inline]
+    pub(crate) fn try_upgrade(&self, v: u64) -> Option<WriteGuard<'_>> {
+        if v & (LOCK_BIT | OBSOLETE_BIT) != 0 {
+            return None;
+        }
+        self.version
+            .compare_exchange(v, v | LOCK_BIT, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        // W1: orders the lock-bit store before every in-section store.
+        #[cfg(loom)]
+        if mutants::SKIP_W1_FENCE.with(|m| m.get()) {
+            return Some(WriteGuard { latch: self, v });
+        }
+        fence(Ordering::Release);
+        Some(WriteGuard { latch: self, v })
+    }
+
+    /// Blocking acquire. Used only while holding no other latch (Inv 7), or
+    /// for the terminal `chain_latch`. `None` if the latch is obsolete.
+    #[must_use = "binding the guard is what holds the latch"]
+    pub(crate) fn lock(&self) -> Option<WriteGuard<'_>> {
+        let mut backoff = SpinBackoff::new();
+        loop {
+            let v = self.version.load(Ordering::Relaxed);
+            if v & OBSOLETE_BIT != 0 {
+                return None;
+            }
+            if v & LOCK_BIT == 0 {
+                if let Some(w) = self.try_upgrade(v) {
+                    return Some(w);
+                }
+            }
+            backoff.spin();
+        }
+    }
+}
+
+impl WriteGuard<'_> {
+    /// W4: releases the latch and returns the new version, so callers that
+    /// cache versions (the arena inserters) never re-load it.
+    #[allow(dead_code)] // used by the arena inserters
+    #[inline]
+    pub(crate) fn unlock(self) -> u64 {
+        let nv = self.v.wrapping_add(VERSION_STEP);
+        self.latch.version.store(nv, Ordering::Release);
+        std::mem::forget(self);
+        nv
+    }
+
+    /// W4 / Inv 7: marks the latch obsolete. Only for nodes already unlinked
+    /// from their parent; every later upgrade or validation fails.
+    #[inline]
+    pub(crate) fn mark_obsolete(self) {
+        self.latch
+            .version
+            .store(self.v | OBSOLETE_BIT, Ordering::Release);
+        std::mem::forget(self);
+    }
+
+    /// The latch this guard holds (for capability `debug_assert`s).
+    #[allow(dead_code)] // used by the arena chain protocol
+    #[inline]
+    pub(crate) fn latch(&self) -> &HybridLatch {
+        self.latch
+    }
+
+    /// `true` if this guard holds `latch`.
+    #[inline]
+    pub(crate) fn holds(&self, latch: &HybridLatch) -> bool {
+        std::ptr::eq(self.latch, latch)
+    }
+}
+
+impl Drop for WriteGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.latch
+            .version
+            .store(self.v.wrapping_add(VERSION_STEP), Ordering::Release);
+    }
+}
+
+/// Aborts the process if dropped.
+///
+/// Created at the start of a commit phase and [`defuse`](Self::defuse)d at its
+/// end: an unexpected panic inside a commit phase must never publish a torn
+/// node by unwinding through a [`WriteGuard`] (Inv 6, §5.3).
+pub(crate) struct AbortOnUnwind;
+
+impl AbortOnUnwind {
+    /// Ends the commit phase.
+    #[inline]
+    pub(crate) fn defuse(self) {
+        std::mem::forget(self)
+    }
+}
+
+impl Drop for AbortOnUnwind {
+    #[cold]
+    fn drop(&mut self) {
+        // Printing first gives the user a pointer to the cause.
+        eprintln!("artmap: panic inside a commit phase; aborting to avoid publishing a torn node");
+        std::process::abort()
     }
 }
 
 /// 64-byte cache-line aligned wrapper to avoid false sharing.
 #[repr(align(64))]
 #[derive(Debug, Default)]
-pub struct CachePadded<T>(pub T);
+pub(crate) struct CachePadded<T>(pub(crate) T);
 
 impl<T> std::ops::Deref for CachePadded<T> {
     type Target = T;
@@ -177,81 +227,178 @@ impl<T> std::ops::Deref for CachePadded<T> {
     }
 }
 
-impl<T> std::ops::DerefMut for CachePadded<T> {
-    #[inline(always)]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-/// Exponential backoff helper for spinning writers.
-pub struct SpinBackoff {
+/// Exponential backoff for spinning writers and retrying readers.
+///
+/// Uses the `crate::sync` shims, so loom models of a contended `lock()`
+/// yield to the scheduler instead of spinning forever (§16.3).
+pub(crate) struct SpinBackoff {
     step: u32,
-}
-
-impl Default for SpinBackoff {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl SpinBackoff {
     #[inline]
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self { step: 0 }
     }
 
     #[inline]
-    pub fn spin(&mut self) {
-        if self.step <= 16 {
-            let spins = 1 << self.step.min(10);
-            for _ in 0..spins {
-                std::hint::spin_loop();
-            }
+    pub(crate) fn spin(&mut self) {
+        if cfg!(loom) || self.step > 6 {
+            crate::sync::yield_now();
         } else {
-            std::thread::yield_now();
+            for _ in 0..(1u32 << self.step) {
+                crate::sync::spin_loop();
+            }
         }
-        if self.step < 24 {
+        if self.step < 16 {
             self.step += 1;
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_latch_lifecycle() {
+    fn latch_lifecycle() {
         let latch = HybridLatch::new();
-        assert!(!latch.is_obsolete());
-
-        let v0 = latch.read_version().expect("should read initial version");
+        let v0 = latch.read_version().expect("initial version");
         assert!(latch.validate(v0));
 
-        let v_lock = latch.lock().expect("should acquire lock");
-        assert_eq!(v_lock, v0);
+        let w = latch.try_upgrade(v0).expect("upgrade");
+        assert!(w.holds(&latch));
         assert!(
             latch.read_version().is_none(),
-            "read_version must return None while locked"
+            "locked latch has no read version"
         );
-        assert!(!latch.validate(v0), "validation must fail while locked");
-
-        latch.unlock();
-        let v1 = latch.read_version().expect("should read updated version");
+        assert!(!latch.validate(v0), "validation fails while locked");
+        let v1 = w.unlock();
         assert_eq!(v1, v0 + VERSION_STEP);
+        assert_eq!(latch.read_version(), Some(v1));
         assert!(!latch.validate(v0));
-        assert!(latch.validate(v1));
+        assert!(
+            latch.try_upgrade(v0).is_none(),
+            "stale version cannot upgrade"
+        );
 
-        let _ = latch.lock().expect("should acquire lock again");
-        latch.mark_obsolete_and_unlock();
+        let w = latch.lock().expect("lock");
+        w.mark_obsolete();
         assert!(latch.is_obsolete());
         assert!(latch.read_version().is_none());
-        assert!(!latch.validate(v1));
-        assert_eq!(
-            latch.lock(),
-            Err(LockError::Obsolete),
-            "cannot lock obsolete node"
+        assert!(latch.lock().is_none(), "obsolete latch cannot be locked");
+    }
+
+    #[test]
+    fn upgrade_rejects_flagged_versions() {
+        let latch = HybridLatch::new();
+        assert!(latch.try_upgrade(LOCK_BIT).is_none());
+        assert!(latch.try_upgrade(OBSOLETE_BIT).is_none());
+        let w = latch.lock().unwrap();
+        // A stale version that happens to equal the locked word must fail.
+        assert!(latch.try_upgrade(LOCK_BIT).is_none());
+        drop(w);
+    }
+
+    #[test]
+    fn concurrent_mutual_exclusion() {
+        use std::cell::UnsafeCell;
+        use std::sync::{Arc, Barrier};
+
+        struct Shared {
+            latch: HybridLatch,
+            counter: UnsafeCell<usize>,
+        }
+        // SAFETY: `counter` is only accessed while holding `latch`.
+        unsafe impl Sync for Shared {}
+
+        let threads = if cfg!(miri) { 3 } else { 16 };
+        let per = if cfg!(miri) { 50 } else { 20_000 };
+        let s = Arc::new(Shared {
+            latch: HybridLatch::new(),
+            counter: UnsafeCell::new(0),
+        });
+        let barrier = Arc::new(Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let (s, barrier) = (Arc::clone(&s), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..per {
+                        let w = s.latch.lock().unwrap();
+                        // SAFETY: exclusive while `w` is held.
+                        unsafe { *s.counter.get() += 1 };
+                        drop(w);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // SAFETY: all writers joined.
+        assert_eq!(unsafe { *s.counter.get() }, threads * per);
+        assert!(s.latch.read_version().is_some());
+    }
+
+    #[test]
+    fn validation_fails_across_a_concurrent_write() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let latch = Arc::new(HybridLatch::new());
+        let running = Arc::new(AtomicBool::new(true));
+        let (l, r) = (Arc::clone(&latch), Arc::clone(&running));
+        let writer = std::thread::spawn(move || {
+            let mut n = 0;
+            while r.load(std::sync::atomic::Ordering::Relaxed) && n < 50_000 {
+                let w = l.lock().unwrap();
+                std::hint::spin_loop();
+                drop(w);
+                n += 1;
+            }
+        });
+        let (mut ok, mut failed) = (0, 0);
+        for _ in 0..if cfg!(miri) { 200 } else { 100_000 } {
+            if let Some(v) = latch.read_version() {
+                std::hint::spin_loop();
+                if latch.validate(v) {
+                    ok += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+        }
+        running.store(false, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        // Both outcomes are possible; the invariant is that neither panics and
+        // that a stable read validates.
+        assert!(ok + failed > 0 || cfg!(miri));
+    }
+
+    #[test]
+    fn obsolete_is_permanent() {
+        let latch = HybridLatch::new();
+        let v = latch.read_version().unwrap();
+        latch.lock().unwrap().mark_obsolete();
+        assert!(latch.is_obsolete());
+        assert!(latch.lock().is_none());
+        assert!(latch.try_upgrade(v).is_none());
+        assert!(latch.read_version().is_none());
+        assert!(!latch.validate(v));
+    }
+
+    #[test]
+    fn guard_drop_unlocks_on_unwind() {
+        let latch = HybridLatch::new();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _w = latch.lock().unwrap();
+            panic!("prepare phase panic");
+        }));
+        assert!(r.is_err());
+        assert!(
+            latch.read_version().is_some(),
+            "latch released by unwinding"
         );
     }
 }

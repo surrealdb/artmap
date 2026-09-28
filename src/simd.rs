@@ -128,4 +128,25 @@ mod tests {
         assert_eq!(find_child_node16(&keys, 4, b'x'), None);
         assert_eq!(find_child_node16(&keys, 5, b'x'), Some(4));
     }
+
+    #[test]
+    fn simd_matches_linear_search_exhaustively() {
+        let keys = [
+            0x05, 0x12, 0x24, 0x33, 0x48, 0x5a, 0x67, 0x7e, 0x89, 0x9f, 0xab, 0xb0, 0xcd, 0xde,
+            0xef, 0xfc,
+        ];
+        for count in 0..=16 {
+            for byte in 0u8..=255 {
+                assert_eq!(
+                    find_child_node16(&keys, count, byte),
+                    keys[..count].iter().position(|&k| k == byte),
+                    "byte {byte:#04x}, count {count}"
+                );
+                assert_eq!(
+                    find_child_scalar(&keys, count, byte),
+                    keys[..count].iter().position(|&k| k == byte)
+                );
+            }
+        }
+    }
 }

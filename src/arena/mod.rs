@@ -28,6 +28,10 @@
 //! - **Multi-Version Support**: Built-in 64-bit versioning (`insert_versioned`, `get_version_le`)
 //!   supporting atomic version prepend chains in leaves.
 
+// The arena modules still expose their pre-0.6 internals; they are rebuilt
+// on the shared core and sealed by the arena rewrite.
+#![allow(private_interfaces)]
+
 pub mod iter;
 pub mod map;
 pub mod node;

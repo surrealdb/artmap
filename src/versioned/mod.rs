@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # Multi-Version Adaptive Radix Tree (EBR)
+//! # Multi-version adaptive radix tree (EBR)
 //!
-//! Provides [`VersionedArtMap`], an epoch-based concurrent Adaptive Radix Tree (ART)
-//! that stores version prepend chains in leaf nodes for lock-free snapshot reads.
+//! [`VersionedArtMap`] stores a chain of 64-bit versions per key, for MVCC
+//! snapshot reads.
 
-pub mod entry;
-pub mod iter;
-pub mod map;
-pub mod tree;
+pub(crate) mod entry;
+pub(crate) mod iter;
+pub(crate) mod map;
+pub(crate) mod node;
+pub(crate) mod tree;
 
 pub use entry::VersionedEntryRef;
 pub use iter::Range;
 pub use map::VersionedArtMap;
-pub use tree::VersionedTree;
