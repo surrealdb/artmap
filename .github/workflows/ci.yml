@@ -279,7 +279,13 @@ jobs:
         run: >
           cargo miri test --target ${{ matrix.target }} --lib
           --test concurrent_correctness --test model --test unwind
+          --test regressions --test linearizability --test proptest_keys
           --test sim --test versioned_simulation_tests --test versioned_artmap_tests
+
+      - name: Run Miri on the doctests
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-ignore-leaks
+        run: cargo miri test --target ${{ matrix.target }} --doc
 
   miri-arena:
     # The arena suites never pin, so they run leak-checked, with strict
