@@ -170,7 +170,7 @@ impl<K: AsBytes, V> ArenaVersionedArtMap<K, V> {
         // SAFETY: a leaf of this map, valid for `&self`.
         let head = unsafe { leaf.as_ref() }.head();
         let n = find_le::<V>(self.tree.arena(), head, max_version)?;
-        n.value.clone().map(|v| (n.version, v))
+        n.value().cloned().map(|v| (n.version, v))
     }
 
     /// Every version of `key`, newest first; `None` values are tombstones.
@@ -186,7 +186,7 @@ impl<K: AsBytes, V> ArenaVersionedArtMap<K, V> {
         // SAFETY: a leaf of this map, valid for `&self`.
         let head = unsafe { leaf.as_ref() }.head();
         chain::<V>(self.tree.arena(), head)
-            .map(|n| (n.version, n.value.clone()))
+            .map(|n| (n.version, n.value().cloned()))
             .collect()
     }
 

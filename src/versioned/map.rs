@@ -123,7 +123,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
         let leaf = self.tree.raw.get(key)?;
         // SAFETY: protected by `_g`.
         let head = unsafe { leaf.as_ref() }.head();
-        head.value.clone()
+        head.value().cloned()
     }
 
     /// The newest version and value of `key`, if live.
@@ -138,7 +138,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
         let leaf = self.tree.raw.get(key.as_bytes())?;
         // SAFETY: protected by `_g`.
         let head = unsafe { leaf.as_ref() }.head();
-        head.value.clone().map(|v| (head.version, v))
+        head.value().cloned().map(|v| (head.version, v))
     }
 
     /// A handle on the newest live version of `key`, without cloning.
@@ -199,7 +199,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
         let leaf = self.tree.raw.get(key)?;
         // SAFETY: protected by `_g`.
         let n = find_le(unsafe { leaf.as_ref() }.head(), max)?;
-        n.value.clone().map(|v| (n.version, v))
+        n.value().cloned().map(|v| (n.version, v))
     }
 
     /// `true` if the newest version of `key` is live.
@@ -296,7 +296,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
         match self.tree.raw.get(key.as_bytes()) {
             // SAFETY: protected by `_g`.
             Some(l) => chain(unsafe { l.as_ref() }.head())
-                .map(|n| (n.version, n.value.clone()))
+                .map(|n| (n.version, n.value().cloned()))
                 .collect(),
             None => Vec::new(),
         }

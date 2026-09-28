@@ -21,6 +21,7 @@
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
 use crate::arena::storage::ArenaLeaf;
@@ -93,25 +94,50 @@ pub(crate) struct VersionNode<V> {
     next: AtomicU32,
     /// Link of the retired-versions list.
     pub(crate) next_retired: AtomicU32,
+    /// Initialised if and only if `!tombstone`. Immutable after publication.
+    /// A separate flag instead of `Option<V>` saves the discriminant's word
+    /// for values without a niche.
+    value: MaybeUninit<V>,
     superseded: AtomicBool,
-    /// `None` is a tombstone. Immutable after publication.
-    pub(crate) value: Option<V>,
+    /// This version is a deletion and has no value. Immutable.
+    tombstone: bool,
 }
 
 impl<V> VersionNode<V> {
     pub(crate) fn new(version: u64, value: Option<V>) -> Self {
+        let (value, tombstone) = match value {
+            Some(v) => (MaybeUninit::new(v), false),
+            None => (MaybeUninit::uninit(), true),
+        };
         Self {
             version,
             next: AtomicU32::new(0),
             next_retired: AtomicU32::new(0),
-            superseded: AtomicBool::new(false),
             value,
+            superseded: AtomicBool::new(false),
+            tombstone,
         }
     }
 
     #[inline]
     pub(crate) fn is_tombstone(&self) -> bool {
-        self.value.is_none()
+        self.tombstone
+    }
+
+    /// The value, or `None` for a tombstone.
+    #[inline]
+    pub(crate) fn value(&self) -> Option<&V> {
+        // SAFETY: `value` is initialised whenever `tombstone` is false, and
+        // neither changes after publication (Inv 1).
+        (!self.tombstone).then(|| unsafe { self.value.assume_init_ref() })
+    }
+
+    /// Consumes a node that was never published, returning its value.
+    pub(crate) fn into_value(self) -> Option<V> {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: initialised when not a tombstone; `this` is never dropped,
+        // so the value is moved out exactly once.
+        (!this.tombstone).then(|| unsafe { std::ptr::read(this.value.as_ptr()) })
     }
 
     #[inline]
@@ -140,6 +166,15 @@ impl<V> VersionNode<V> {
     #[inline]
     pub(crate) fn mark_superseded(&self, _w: &WriteGuard<'_>) {
         self.superseded.store(true, Ordering::Release);
+    }
+}
+
+impl<V> Drop for VersionNode<V> {
+    fn drop(&mut self) {
+        if !self.tombstone {
+            // SAFETY: initialised (not a tombstone), dropped exactly once here.
+            unsafe { self.value.assume_init_drop() };
+        }
     }
 }
 
@@ -225,5 +260,30 @@ unsafe impl<K, V> ArenaLeaf for VersionedLeaf<K, V> {
         }
         // SAFETY: the key, once.
         unsafe { std::ptr::addr_of_mut!((*this.as_ptr()).key).drop_in_place() };
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::VersionNode;
+
+    /// A tombstone flag instead of `Option<V>`: 32 bytes for a `u64` value,
+    /// not 40.
+    #[test]
+    fn version_nodes_stay_compact() {
+        assert_eq!(std::mem::size_of::<VersionNode<u64>>(), 32);
+    }
+
+    #[test]
+    fn into_value_moves_the_value_out_once() {
+        use std::rc::Rc;
+        let v = Rc::new(1);
+        let n = VersionNode::new(1, Some(Rc::clone(&v)));
+        assert_eq!(n.value().map(|v| **v), Some(1));
+        let out = n.into_value().unwrap();
+        assert_eq!(Rc::strong_count(&v), 2, "moved, not cloned or dropped");
+        drop(out);
+        assert_eq!(Rc::strong_count(&v), 1);
+        assert!(VersionNode::<Rc<u8>>::new(2, None).into_value().is_none());
     }
 }

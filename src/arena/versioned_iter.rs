@@ -101,8 +101,7 @@ impl<'a, K: 'a, V: 'a> ArenaVersionedEntryRef<'a, K, V> {
     #[inline]
     pub fn value(&self) -> &'a V {
         self.node()
-            .value
-            .as_ref()
+            .value()
             .expect("an ArenaVersionedEntryRef never captures a tombstone")
     }
 
@@ -134,7 +133,7 @@ impl<'a, K: 'a, V: 'a> ArenaVersionedEntryRef<'a, K, V> {
         let arena = self.arena;
         chain::<V>(arena, arena.offset_of(self.node)).map(|n| VersionRef {
             version: n.version,
-            value: n.value.as_ref(),
+            value: n.value(),
         })
     }
 
@@ -142,7 +141,7 @@ impl<'a, K: 'a, V: 'a> ArenaVersionedEntryRef<'a, K, V> {
     /// `<= max_version`.
     pub fn get_version_le(&self, max_version: u64) -> Option<(u64, &'a V)> {
         let n = find_le::<V>(self.arena, self.leaf().head(), max_version)?;
-        n.value.as_ref().map(|v| (n.version, v))
+        n.value().map(|v| (n.version, v))
     }
 
     /// A fresh read of the key's newest live version.
