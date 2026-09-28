@@ -88,6 +88,21 @@ pub(crate) fn find_le<V>(head: &VersionNode<V>, max: u64) -> Option<&VersionNode
     None
 }
 
+/// As [`find_le`], but walks and returns raw pointers, keeping the
+/// allocation's provenance: a node found here may be retired (Inv 1).
+fn find_le_ptr<V>(head: *mut VersionNode<V>, max: u64) -> Option<*mut VersionNode<V>> {
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: as for `find_le`.
+        let n = unsafe { &*cur };
+        if n.version <= max {
+            return Some(cur);
+        }
+        cur = n.next();
+    }
+    None
+}
+
 /// Iterates a chain, newest first.
 pub(crate) fn chain<V>(head: &VersionNode<V>) -> impl Iterator<Item = &VersionNode<V>> {
     let mut cur: *const VersionNode<V> = head;
@@ -261,11 +276,13 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
         for _attempt in 0..64 {
             // 1. Without any latch, find T and evaluate the user closure on it.
             let head = leaf.head_ptr();
-            // SAFETY: live.
-            let Some(t) = find_le(unsafe { &*head }, min_version) else {
+            // `t_ptr` comes from the chain links, not from a reference, so that
+            // retiring it later deallocates with the allocation's provenance.
+            let Some(t_ptr) = find_le_ptr(head, min_version) else {
                 return 0;
             };
-            let t_ptr = std::ptr::from_ref(t).cast_mut();
+            // SAFETY: live.
+            let t = unsafe { &*t_ptr };
             let is_head = t_ptr == head;
             let dead = is_head && t.value.as_ref().is_none_or(is_tombstone);
 
@@ -274,9 +291,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
                 unreachable!("chain latches are only obsoleted by Phase 8 unlinks")
             };
             let head_now = leaf.head_ptr();
-            // SAFETY: live.
-            let t_now = find_le(unsafe { &*head_now }, min_version)
-                .map(|n| std::ptr::from_ref(n).cast_mut());
+            let t_now = find_le_ptr(head_now, min_version);
             if t_now != Some(t_ptr) || t.is_superseded() {
                 drop(w);
                 continue;
