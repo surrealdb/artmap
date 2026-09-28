@@ -258,6 +258,23 @@ fn bench_scan(c: &mut Criterion) {
             black_box(n);
         });
     });
+    group.bench_function("100_scan", |b| {
+        // The callback scan: one pin, no per-entry handles.
+        let map = filled_map();
+        let mut rng = seeded(7);
+        let starts: Vec<u64> = (0..4096).map(|_| rng.gen_range(0..N - 100)).collect();
+        let mut i = 0usize;
+        b.iter(|| {
+            let s = starts[i & 4095];
+            i += 1;
+            let mut n = 0u64;
+            map.scan(s.to_be_bytes()..(s + 100).to_be_bytes(), |_, v| {
+                n += *v;
+                true
+            });
+            black_box(n);
+        });
+    });
     group.bench_function("full_iter_10k", |b| {
         let map = filled_map();
         b.iter(|| {

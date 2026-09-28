@@ -168,6 +168,12 @@ fn artmap_matches_btreemap() {
                     assert_eq!(rev, want, "range rev {s:?}..{e:?}, seed {seed}");
                     let alt = alternate(r(), &mut rng, |e| (e.key().clone(), *e.value()));
                     assert_eq!(alt, want, "range alternating, seed {seed}");
+                    let mut scanned = Vec::new();
+                    map.scan::<_, [u8], _>((as_ref_bound(&s), as_ref_bound(&e)), |k, v| {
+                        scanned.push((k.clone(), *v));
+                        true
+                    });
+                    assert_eq!(scanned, want, "scan {s:?}..{e:?}, seed {seed}");
                 }
             }
             assert_eq!(map.len(), model.len());

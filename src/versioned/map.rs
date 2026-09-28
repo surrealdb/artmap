@@ -393,13 +393,17 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
 
     /// Calls `callback(key, value, version)` for the latest live version of
     /// each key in `range`, until it returns `false`.
+    ///
+    /// One pin covers the whole scan, and no per-entry handle is created, so
+    /// this is the cheapest way to visit a range.
     pub fn scan<R, Q, F>(&self, range: R, mut callback: F)
     where
         R: RangeBounds<Q>,
         Q: AsBytes + ?Sized,
         F: FnMut(&K, &V, u64) -> bool,
     {
-        for e in self.range(range) {
+        let guard = self.pin();
+        for e in self.range_with_guard(range, &guard) {
             if !callback(e.key(), e.value(), e.version()) {
                 break;
             }

@@ -430,6 +430,38 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
         )
     }
 
+    /// Calls `callback(key, value)` for each entry in `range`, in key order,
+    /// until it returns `false`.
+    ///
+    /// One pin covers the whole scan, and no per-entry handle is created, so
+    /// this is the cheapest way to visit a range.
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<String, u32>::new();
+    /// for (i, k) in ["a", "b", "c", "d"].into_iter().enumerate() {
+    ///     map.insert(k.to_string(), i as u32);
+    /// }
+    /// let mut seen = Vec::new();
+    /// map.scan("b".."d", |k, v| {
+    ///     seen.push((k.clone(), *v));
+    ///     true
+    /// });
+    /// assert_eq!(seen, [("b".to_string(), 1), ("c".to_string(), 2)]);
+    /// ```
+    pub fn scan<R, Q, F>(&self, range: R, mut callback: F)
+    where
+        R: RangeBounds<Q>,
+        Q: AsBytes + ?Sized,
+        F: FnMut(&K, &V) -> bool,
+    {
+        let guard = self.pin();
+        for e in self.range_with_guard(range, &guard) {
+            if !callback(e.key(), e.value()) {
+                break;
+            }
+        }
+    }
+
     /// An iterator over every entry, in key order.
     pub fn iter(&self) -> Iter<'_, K, V> {
         Range::owned(&self.tree, Bound::Unbounded, Bound::Unbounded)
