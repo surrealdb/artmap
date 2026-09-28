@@ -532,3 +532,52 @@ fn arena_full_at_every_allocation_site_releases_every_latch() {
         assert_eq!(vm.len(), vm.iter().count(), "cap {cap}");
     }
 }
+
+#[test]
+fn contended_inserts_stay_within_max_insert_bytes() {
+    // Threads race to insert keys under the same parents, so upgrades fail
+    // and inserts retry. Retries reuse their prepared allocations, so the
+    // bytes consumed stay within the per-insert bound (plus one TLAB chunk
+    // of slack per thread).
+    const THREADS: usize = 4;
+    const TLAB_SLACK: usize = 16 << 10;
+    let per = n(4000, 60);
+    let m = Arc::new(ArenaArtMap::<Vec<u8>, u64>::with_capacity(64 << 20));
+    let vm = Arc::new(ArenaVersionedArtMap::<Vec<u8>, u64>::with_capacity(
+        64 << 20,
+    ));
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let key = |t: usize, i: usize| format!("shared:{:03}:{t}", i % 300).into_bytes();
+    let key_len = key(0, 0).len();
+    let (before, vbefore) = (m.arena().size(), vm.arena().size());
+    let hs: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let (m, vm, barrier) = (Arc::clone(&m), Arc::clone(&vm), Arc::clone(&barrier));
+            std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..per {
+                    m.insert(key(t, i), i as u64);
+                    vm.insert(key(t, i), i as u64, i as u64);
+                }
+            })
+        })
+        .collect();
+    for h in hs {
+        h.join().unwrap();
+    }
+    let inserts = THREADS * per;
+    let used = m.arena().size() - before;
+    let bound =
+        inserts * ArenaArtMap::<Vec<u8>, u64>::max_insert_bytes(key_len) + THREADS * TLAB_SLACK;
+    assert!(
+        used <= bound,
+        "{used} bytes for {inserts} inserts (bound {bound})"
+    );
+    let vused = vm.arena().size() - vbefore;
+    let vbound = inserts * ArenaVersionedArtMap::<Vec<u8>, u64>::max_insert_bytes(key_len)
+        + THREADS * TLAB_SLACK;
+    assert!(
+        vused <= vbound,
+        "{vused} bytes for {inserts} inserts (bound {vbound})"
+    );
+}

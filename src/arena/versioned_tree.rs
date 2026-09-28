@@ -321,3 +321,35 @@ impl<K: AsBytes, V> ArenaVersionedTree<K, V> {
         Ok(Some((leaf_ptr, head)))
     }
 }
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use crate::arena::tree::FAST_PATH_HITS;
+
+    fn hits() -> usize {
+        FAST_PATH_HITS.with(|n| n.get())
+    }
+
+    /// §12.7: the versioned inserter's fast path hits for sequential new keys
+    /// and every key is placed where a descent finds it.
+    #[test]
+    fn versioned_inserter_fast_path_hits_for_sequential_keys() {
+        let t = ArenaVersionedTree::<Vec<u8>, u64>::new(Arena::with_capacity(8 << 20));
+        let mut cache = InserterCache::new();
+        let before = hits();
+        for i in 0..200u8 {
+            t.insert(vec![b'k', i], 1, Some(i as u64), Some(&mut cache))
+                .ok()
+                .unwrap();
+        }
+        let hit = hits() - before;
+        assert!(
+            hit >= 190,
+            "only {hit} of 200 sequential inserts used the fast path"
+        );
+        for i in 0..200u8 {
+            assert!(t.raw.get(&[b'k', i]).is_some());
+        }
+    }
+}
