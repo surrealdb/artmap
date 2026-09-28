@@ -49,6 +49,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(artmap_hooks)',
     'cfg(artmap_provenance_lints)',
 ] }
+unsafe_op_in_unsafe_fn = "deny"
 
 [[bench]]
 name = "artmap_bench"
@@ -63,6 +64,8 @@ name = "alloc_comparison"
 harness = false
 
 [lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
 allow_attributes = "allow"
 assigning_clones = "warn"
 bool_assert_comparison = "allow"
