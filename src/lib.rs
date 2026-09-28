@@ -82,6 +82,10 @@
 pub mod arena;
 #[cfg(doctest)]
 pub mod compile_fail_tests;
+/// The README's examples, run as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
 mod entry;
 mod guard;
 #[cfg(artmap_hooks)]
