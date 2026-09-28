@@ -353,3 +353,94 @@ fn arena_versioned_panicking_as_bytes() {
     let mut map = Arc::try_unwrap(map).ok().unwrap();
     map.validate_invariants();
 }
+
+static VERSIONED_RE: VersionedArtMap<Vec<u8>, VReValue> = VersionedArtMap::new();
+
+/// A versioned value whose deferred `Drop` re-enters the map, and the key,
+/// it was replaced or pruned in. Values written from a destructor carry
+/// `u64::MAX` and do not re-enter again.
+struct VReValue(u64);
+
+impl Drop for VReValue {
+    fn drop(&mut self) {
+        if self.0 == u64::MAX {
+            return;
+        }
+        let _ = VERSIONED_RE.version_count(&b"hot"[..]);
+        if self.0 % 4 == 0 {
+            VERSIONED_RE.insert(b"hot".to_vec(), 1_000_000 + self.0, VReValue(u64::MAX));
+            VERSIONED_RE.delete(format!("gone-{}", self.0).into_bytes(), 1);
+        }
+    }
+}
+
+#[test]
+fn versioned_reentrant_deferred_drop() {
+    // Same-version replaces, deletes and prunes each detach versions whose
+    // destructors run later, inside other map operations, and write back.
+    let n = if cfg!(miri) { 24 } else { 1500 };
+    for i in 0..n {
+        VERSIONED_RE.insert(b"hot".to_vec(), i, VReValue(i));
+        VERSIONED_RE.insert(b"hot".to_vec(), i, VReValue(i + 1)); // same version
+        if i % 5 == 0 {
+            VERSIONED_RE.delete(b"hot".to_vec(), i + 1);
+        }
+        if i % 7 == 0 {
+            VERSIONED_RE.prune_key(&b"hot"[..], i, |_| false);
+        }
+    }
+    within_timeout(|| {
+        VERSIONED_RE.insert(b"after".to_vec(), 1, VReValue(u64::MAX));
+        VERSIONED_RE.get_entry(&b"after"[..]).is_some()
+    });
+    assert!(VERSIONED_RE.version_count(&b"hot"[..]) > 0);
+    let e = VERSIONED_RE.get_entry(&b"hot"[..]);
+    assert!(e.is_none_or(|e| e.version() > 0));
+}
+
+thread_local! {
+    /// Arms `PanicDrop` on this thread only: deferred destructors can run on
+    /// other tests' threads, which must not panic.
+    static DROP_PANICS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A value whose `Drop` panics when armed on the dropping thread.
+struct PanicDrop(#[allow(dead_code)] u64);
+
+impl Drop for PanicDrop {
+    fn drop(&mut self) {
+        if DROP_PANICS.with(|p| p.replace(false)) && !std::thread::panicking() {
+            panic!("injected drop panic");
+        }
+    }
+}
+
+#[test]
+fn versioned_panicking_drop_after_replace_delete_and_prune() {
+    // `Drop` must not panic (crate docs), but if it does, the map stays
+    // usable: values are dropped after the chain latch is released.
+    let map = Arc::new(VersionedArtMap::<Vec<u8>, PanicDrop>::new());
+    let mut fired = 0;
+    for round in 0..if cfg!(miri) { 3 } else { 50 } {
+        let v = round * 10;
+        map.insert(b"k".to_vec(), v + 1, PanicDrop(1));
+        map.insert(b"k".to_vec(), v + 1, PanicDrop(2)); // same-version replace
+        map.delete(b"k".to_vec(), v + 2);
+        map.insert(b"k".to_vec(), v + 3, PanicDrop(3));
+        map.prune_key(&b"k"[..], v + 3, |_| false);
+        // Run the deferred destructors here, with a panic armed.
+        for _ in 0..if cfg!(miri) { 8 } else { 256 } {
+            DROP_PANICS.with(|p| p.set(true));
+            fired += usize::from(catch_unwind(|| crossbeam_epoch::pin().flush()).is_err());
+        }
+        DROP_PANICS.with(|p| p.set(false));
+        let m = Arc::clone(&map);
+        within_timeout(move || {
+            m.insert(b"sibling".to_vec(), 1, PanicDrop(0));
+            m.insert(b"k".to_vec(), v + 4, PanicDrop(4));
+            assert_eq!(m.get_entry(&b"k"[..]).map(|e| e.version()), Some(v + 4));
+        });
+        assert_eq!(map.len(), 2);
+    }
+    assert!(fired > 0 || cfg!(miri), "no injected drop panic fired");
+}
