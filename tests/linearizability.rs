@@ -133,8 +133,12 @@ fn check<T: Target>(make: impl Fn() -> T, with_clear: bool) {
         let barrier = Arc::new(Barrier::new(threads));
         let hs: Vec<_> = (0..threads)
             .map(|t| {
-                let (map, clock, log, barrier) =
-                    (Arc::clone(&map), Arc::clone(&clock), Arc::clone(&log), Arc::clone(&barrier));
+                let (map, clock, log, barrier) = (
+                    Arc::clone(&map),
+                    Arc::clone(&clock),
+                    Arc::clone(&log),
+                    Arc::clone(&barrier),
+                );
                 std::thread::spawn(move || {
                     let mut rng = StdRng::seed_from_u64(round * 31 + t as u64);
                     let ops: Vec<Op> = (0..per)
@@ -155,7 +159,12 @@ fn check<T: Target>(make: impl Fn() -> T, with_clear: bool) {
                         let call = clock.fetch_add(1, Ordering::SeqCst);
                         let ret = map.run(op);
                         let ret_at = clock.fetch_add(1, Ordering::SeqCst);
-                        mine.push(Event { op, ret, call, ret_at });
+                        mine.push(Event {
+                            op,
+                            ret,
+                            call,
+                            ret_at,
+                        });
                     }
                     log.lock().unwrap().extend(mine);
                 })
@@ -165,7 +174,10 @@ fn check<T: Target>(make: impl Fn() -> T, with_clear: bool) {
             h.join().unwrap();
         }
         let events = log.lock().unwrap().clone();
-        assert!(linearizable(&events), "not linearizable (round {round}): {events:#?}");
+        assert!(
+            linearizable(&events),
+            "not linearizable (round {round}): {events:#?}"
+        );
     }
 }
 
@@ -176,22 +188,50 @@ fn artmap_point_operations_and_clear_are_linearizable() {
 
 #[test]
 fn arena_point_operations_are_linearizable() {
-    check(|| ArenaArtMap::<[u8; 1], u64>::with_capacity(1 << 20), false);
+    check(
+        || ArenaArtMap::<[u8; 1], u64>::with_capacity(1 << 20),
+        false,
+    );
 }
 
 #[test]
 fn the_checker_rejects_a_non_linearizable_history() {
     // A get that returns a value no one ever wrote.
     let events = [
-        Event { op: Op::Insert(0, 1), ret: None, call: 0, ret_at: 1 },
-        Event { op: Op::Get(0), ret: Some(7), call: 2, ret_at: 3 },
+        Event {
+            op: Op::Insert(0, 1),
+            ret: None,
+            call: 0,
+            ret_at: 1,
+        },
+        Event {
+            op: Op::Get(0),
+            ret: Some(7),
+            call: 2,
+            ret_at: 3,
+        },
     ];
     assert!(!linearizable(&events));
     // A stale read after a completed overwrite.
     let events = [
-        Event { op: Op::Insert(0, 1), ret: None, call: 0, ret_at: 1 },
-        Event { op: Op::Insert(0, 2), ret: Some(1), call: 2, ret_at: 3 },
-        Event { op: Op::Get(0), ret: Some(1), call: 4, ret_at: 5 },
+        Event {
+            op: Op::Insert(0, 1),
+            ret: None,
+            call: 0,
+            ret_at: 1,
+        },
+        Event {
+            op: Op::Insert(0, 2),
+            ret: Some(1),
+            call: 2,
+            ret_at: 3,
+        },
+        Event {
+            op: Op::Get(0),
+            ret: Some(1),
+            call: 4,
+            ret_at: 5,
+        },
     ];
     assert!(!linearizable(&events));
 }

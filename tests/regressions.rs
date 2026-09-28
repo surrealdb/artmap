@@ -68,7 +68,10 @@ fn handle_semantics_under_replace() {
     let e = m.get("k").unwrap();
     m.insert("k".into(), "v2".into());
     assert!(e.is_removed());
-    assert!(!e.remove(), "a replaced entry cannot be removed through its handle");
+    assert!(
+        !e.remove(),
+        "a replaced entry cannot be removed through its handle"
+    );
     assert_eq!(*e, "v1");
     assert_eq!(*m.get("k").unwrap(), "v2");
     assert_eq!(m.len(), 1);
@@ -104,7 +107,11 @@ fn removing_during_iteration_skips_nothing() {
     let mut it = m.iter();
     assert_eq!(it.next().unwrap().key(), "a");
     m.remove("a");
-    assert_eq!(it.next().unwrap().key(), "b", "removing 'a' made the scan skip 'b'");
+    assert_eq!(
+        it.next().unwrap().key(),
+        "b",
+        "removing 'a' made the scan skip 'b'"
+    );
     drop(it);
 
     let seen: Vec<String> = m
@@ -148,7 +155,10 @@ fn unbounded_reverse_sees_long_ff_keys_and_zero_start() {
     assert_eq!(rev[1], ff00);
     // `range([0]..)` used to yield nothing.
     let from_zero = m
-        .range::<_, [u8]>((std::ops::Bound::Included(&[0u8][..]), std::ops::Bound::Unbounded))
+        .range::<_, [u8]>((
+            std::ops::Bound::Included(&[0u8][..]),
+            std::ops::Bound::Unbounded,
+        ))
         .count();
     assert_eq!(from_zero, 5);
 }
@@ -178,7 +188,13 @@ fn deep_keys_do_not_overflow_the_stack() {
             m.validate_invariants();
             assert!(m.iter().count() >= 2);
             assert!(m.iter().rev().count() >= 2);
-            assert!(m.range::<_, [u8]>((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(&b[..]))).next_back().is_some());
+            assert!(m
+                .range::<_, [u8]>((
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Excluded(&b[..])
+                ))
+                .next_back()
+                .is_some());
             m.clear();
             assert!(m.is_empty());
             m.insert(a, 1);
@@ -266,11 +282,18 @@ fn versioned_delete_keeps_older_snapshots() {
     m.insert(b"k".to_vec(), 5, 50);
     assert_eq!(m.get_version_le(&b"k"[..], 7), Some((5, 50)));
     assert!(m.delete(b"k".to_vec(), 8));
-    assert_eq!(m.get_version_le(&b"k"[..], 7), Some((5, 50)), "the snapshot at 7 is unchanged");
+    assert_eq!(
+        m.get_version_le(&b"k"[..], 7),
+        Some((5, 50)),
+        "the snapshot at 7 is unchanged"
+    );
     assert_eq!(m.get_version_le(&b"k"[..], 9), None);
     assert_eq!(m.get(&b"k"[..]), None);
     assert_eq!(m.len(), 0);
-    assert_eq!(m.get_all_versions(&b"k"[..]), vec![(8, None), (5, Some(50))]);
+    assert_eq!(
+        m.get_all_versions(&b"k"[..]),
+        vec![(8, None), (5, Some(50))]
+    );
     // Sequential len accounting across remove / reinsert / remove.
     m.insert(b"k".to_vec(), 9, 90);
     assert_eq!(m.len(), 1);
@@ -368,7 +391,11 @@ fn concurrent_prunes_with_different_watermarks() {
             .collect();
         let pruned: usize = hs.into_iter().map(|h| h.join().unwrap()).sum();
         let left = m.version_count(&b"k"[..]);
-        assert_eq!(pruned + left, n(200, 10), "every version counted exactly once");
+        assert_eq!(
+            pruned + left,
+            n(200, 10),
+            "every version counted exactly once"
+        );
     }
 }
 
@@ -467,5 +494,9 @@ fn every_heap_key_and_value_is_dropped_exactly_once() {
     })
     .join()
     .unwrap();
-    assert_eq!(await_drops(&drops, created), created, "leaked or double-dropped");
+    assert_eq!(
+        await_drops(&drops, created),
+        created,
+        "leaked or double-dropped"
+    );
 }
