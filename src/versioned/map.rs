@@ -35,7 +35,8 @@ use crate::versioned::tree::{chain, find_le, VersionedTree};
 /// ## Semantics
 ///
 /// - `len()` is the number of keys whose newest version is live (not a
-///   tombstone). It is exact when no operation is in flight.
+///   tombstone). It is exact when no operation is in flight, and approximate
+///   while several threads write.
 /// - `get_latest`/`get` return `None` when the newest version is a tombstone;
 ///   `get_version_le` returns `None` when the selected version is one.
 ///   Older snapshots are unaffected by later deletes.

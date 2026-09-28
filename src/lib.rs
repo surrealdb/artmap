@@ -62,7 +62,7 @@
 //! Point operations are linearizable. Iterators guarantee that every key
 //! present for the whole scan is yielded exactly once, in order; keys inserted
 //! or removed during the scan may or may not appear. `len()` is exact when no
-//! operation is in flight.
+//! operation is in flight; while several threads write, it is approximate.
 //!
 //! ## Public surface
 //!
@@ -162,8 +162,10 @@ impl<K, V> ArtMap<K, V> {
         Self::new()
     }
 
-    /// The number of entries. Exact when no operation is in flight; during a
-    /// concurrent `clear()` it may briefly exceed the live count.
+    /// The number of entries. Exact when no operation is in flight. While
+    /// writes on several threads (or a `clear()`) are in flight it is
+    /// approximate: the count is striped by thread so that writers do not
+    /// contend on one cache line.
     #[inline]
     pub fn len(&self) -> usize {
         self.tree.len()

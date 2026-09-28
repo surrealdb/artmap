@@ -449,7 +449,9 @@ fn versioned_len_under_remove_and_reinsert() {
                 #[allow(deprecated)]
                 let _ = m.remove(&k);
             }
-            assert!(m.len() <= 4, "len never exceeds the key space");
+            // `len` is striped by thread, so mid-flight reads are approximate
+            // (Inv 12); only the quiescent value below is exact.
+            std::hint::black_box(m.len());
         }
     });
     let live = (0..4).filter(|k| map.get(&key(*k)).is_some()).count();
@@ -524,7 +526,9 @@ fn arena_versioned_len_under_delete_and_reinsert() {
             } else {
                 m.delete(k, v);
             }
-            assert!(m.len() <= 4, "len never exceeds the key space");
+            // `len` is striped by thread, so mid-flight reads are approximate
+            // (Inv 12); only the quiescent value below is exact.
+            std::hint::black_box(m.len());
         }
     });
     let mut live = 0;

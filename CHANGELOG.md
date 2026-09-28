@@ -79,7 +79,7 @@ For the old `insert` behaviour when `V: Clone`, use `insert_cloned(k, v) -> Opti
 ### Changed behaviour
 - Replacing a value is out-of-place. Existing handles keep reading the old value, and report `is_removed()`.
 - Point operations are linearizable. `clear()` is linearizable too, with an exact `len()`.
-- `len()` is exact when no operation is in flight, and never transiently negative.
+- `len()` is exact when no operation is in flight, and never negative. It is striped by thread, so while several threads write it is approximate.
 - Iterators yield every key that is present for the whole scan exactly once, in order, in both directions and for every bound kind.
 - User code (`AsBytes`, `Clone`, `Drop`, closures) never runs under a latch. A panic in user code leaves the map usable.
 - Dropping a map is synchronous and iterative. Deep keys no longer overflow the stack.
