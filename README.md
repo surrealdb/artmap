@@ -31,7 +31,7 @@ There are four map types:
 
 ## Performance
 
-> **These numbers were measured on 0.5.0.** The 0.6 rewrite fixes soundness bugs, and several operations are now slower: overwrites allocate a new leaf rather than updating one in place, version chains take a per-key latch, and the lock-free `Node256` insert path is gone. Re-measured on the same Threadripper, 0.6 against 0.5.0 in one session: point gets are within ±10%; 100-item range scans are 28–30% slower for the arena maps, 67% slower for `ArtMap` and about 3× slower for `VersionedArtMap`; 8-thread writes and mixed workloads are about 5% slower for `ArtMap` and 28–68% slower for the other three maps; heap inserts are 4–10% slower and arena inserts 5–25% faster. `VersionedArtMap` and `ArenaVersionedArtMap` use 20–36% more memory per key. The tables will be regenerated for the release.
+> **These numbers were measured on 0.5.0.** The 0.6 rewrite fixes soundness bugs and changes the performance profile. Re-measured on the same Threadripper, 0.6 is 30–49% faster for 8-thread writes and 14–29% faster for mixed workloads. Point gets are within about 10%, and single-threaded inserts within about 15%. 100-item range scans are slower: about 30% for the arena maps, 72% for `ArtMap` and about 3× for `VersionedArtMap`; `scan(range, callback)` avoids the per-entry handle. The tables will be regenerated for the release.
 
 Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM**, Linux 6.8):
 
