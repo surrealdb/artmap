@@ -155,6 +155,15 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
 
     /// The newest version of `key` that is `<= max_version`, unless it is a
     /// tombstone. The basis of MVCC snapshot reads.
+    ///
+    /// ```
+    /// let map = artmap::VersionedArtMap::<String, u32>::new();
+    /// map.insert("k".to_string(), 10, 1);
+    /// map.insert("k".to_string(), 20, 2);
+    /// assert_eq!(map.get_version_le("k", 15), Some((10, 1)));
+    /// assert_eq!(map.get_version_le("k", 25), Some((20, 2)));
+    /// assert_eq!(map.get_version_le("k", 5), None);
+    /// ```
     #[inline]
     pub fn get_version_le<Q>(&self, key: &Q, max_version: u64) -> Option<(u64, V)>
     where
@@ -232,6 +241,15 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
     /// Records a tombstone at `version` for `key`, creating the key if needed.
     /// Older snapshots are unchanged. Returns `true` if the key's newest
     /// version was live before and is now deleted.
+    ///
+    /// ```
+    /// let map = artmap::VersionedArtMap::<String, u32>::new();
+    /// map.insert("k".to_string(), 1, 7);
+    /// assert!(map.delete("k".to_string(), 2));
+    /// assert_eq!(map.get("k"), None);
+    /// assert_eq!(map.get_version_le("k", 1), Some((1, 7)));
+    /// assert_eq!(map.get_all_versions("k"), vec![(2, None), (1, Some(7))]);
+    /// ```
     pub fn delete(&self, key: K, version: u64) -> bool {
         let g = &pin();
         self.tree.insert(key, version, None, g) < 0
@@ -290,6 +308,16 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
     /// map (with a tombstone) in this release.
     ///
     /// `is_tombstone` runs without any latch held.
+    ///
+    /// ```
+    /// let map = artmap::VersionedArtMap::<String, u32>::new();
+    /// for v in 1..=4 {
+    ///     map.insert("k".to_string(), v, v as u32);
+    /// }
+    /// // No snapshot below version 3 remains: versions 1 and 2 can go.
+    /// assert_eq!(map.prune_key("k", 3, |_| false), 2);
+    /// assert_eq!(map.get_all_versions("k"), vec![(4, Some(4)), (3, Some(3))]);
+    /// ```
     pub fn prune_key<Q, F>(&self, key: &Q, min_version: u64, is_tombstone: F) -> usize
     where
         K: Borrow<Q>,

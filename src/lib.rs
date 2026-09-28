@@ -179,12 +179,27 @@ impl<K, V> ArtMap<K, V> {
 impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
     /// Pins the epoch, for the `*_with_guard` methods. See the crate docs for
     /// what holding a guard implies.
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<[u8; 8], u64>::new();
+    /// map.insert(7u64.to_be_bytes(), 49);
+    /// let guard = map.pin();
+    /// assert_eq!(map.get_with_guard(&7u64.to_be_bytes(), &guard).as_deref(), Some(&49));
+    /// ```
     #[inline]
     pub fn pin(&self) -> Guard<'_> {
         Guard::new()
     }
 
     /// A handle on the entry for `key`.
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<String, u32>::new();
+    /// map.insert("a".to_string(), 1);
+    /// let e = map.get("a").unwrap();
+    /// assert_eq!((e.key().as_str(), *e.value()), ("a", 1));
+    /// assert!(map.get("b").is_none());
+    /// ```
     #[inline]
     pub fn get<Q>(&self, key: &Q) -> Option<EntryRef<'_, K, V>>
     where
@@ -269,6 +284,15 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
     /// marked removed), or `None` if the key was absent.
     ///
     /// Dropping the returned handle immediately costs one unpin.
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<String, u32>::new();
+    /// assert!(map.insert("a".to_string(), 1).is_none());
+    /// let old = map.insert("a".to_string(), 2).unwrap();
+    /// assert_eq!(*old, 1);
+    /// assert!(old.is_removed());
+    /// assert_eq!(map.get_value("a"), Some(2));
+    /// ```
     #[inline]
     pub fn insert(&self, key: K, value: V) -> Option<EntryRef<'_, K, V>> {
         let guard = GuardHandle::owned();
@@ -313,6 +337,12 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
     /// Returns the entry for `key`, inserting `f()` first if it is absent.
     ///
     /// `f` runs without any latch held, and only if the key looked absent.
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<String, u32>::new();
+    /// assert_eq!(*map.get_or_insert_with("a".to_string(), || 1), 1);
+    /// assert_eq!(*map.get_or_insert_with("a".to_string(), || 2), 1);
+    /// ```
     pub fn get_or_insert_with<F>(&self, key: K, f: F) -> EntryRef<'_, K, V>
     where
         F: FnOnce() -> V,
@@ -335,6 +365,14 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
 
     /// Removes the entry for `key`. Returns the removed entry (unlinked and
     /// marked removed).
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<String, u32>::new();
+    /// map.insert("a".to_string(), 1);
+    /// assert_eq!(map.remove("a").as_deref(), Some(&1));
+    /// assert!(map.remove("a").is_none());
+    /// assert!(map.is_empty());
+    /// ```
     #[inline]
     pub fn remove<Q>(&self, key: &Q) -> Option<EntryRef<'_, K, V>>
     where
@@ -353,6 +391,17 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
     }
 
     /// An iterator over the entries in `range`, in key order.
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<String, u32>::new();
+    /// for (i, k) in ["a", "b", "c", "d"].into_iter().enumerate() {
+    ///     map.insert(k.to_string(), i as u32);
+    /// }
+    /// let keys: Vec<String> = map.range("b".."d").map(|e| e.key().clone()).collect();
+    /// assert_eq!(keys, ["b", "c"]);
+    /// let back: Vec<u32> = map.range("b"..).rev().map(|e| *e).collect();
+    /// assert_eq!(back, [3, 2, 1]);
+    /// ```
     pub fn range<R, Q>(&self, range: R) -> Range<'_, K, V>
     where
         R: RangeBounds<Q>,

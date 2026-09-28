@@ -154,6 +154,14 @@ impl<K: AsBytes, V> ArenaArtMap<K, V> {
 
     /// Inserts or replaces, returning the displaced entry, or the key and
     /// value back if the insert does not fit.
+    ///
+    /// ```
+    /// let map = artmap::ArenaArtMap::<String, u32>::with_capacity(1 << 16);
+    /// assert!(map.try_insert("a".to_string(), 1).unwrap().is_none());
+    /// let tiny = artmap::ArenaArtMap::<String, u32>::with_capacity(64);
+    /// let full = tiny.try_insert("a".to_string(), 1).unwrap_err();
+    /// assert_eq!((full.key, full.value), ("a".to_string(), 1));
+    /// ```
     #[inline]
     pub fn try_insert(
         &self,
@@ -180,6 +188,16 @@ impl<K: AsBytes, V> ArenaArtMap<K, V> {
 
     /// An inserter for this map, which caches the last insertion point so
     /// that sequential or clustered keys skip the descent from the root.
+    ///
+    /// ```
+    /// let map = artmap::ArenaArtMap::<String, u32>::with_capacity(1 << 20);
+    /// let mut ins = map.inserter();
+    /// for i in 0..100 {
+    ///     ins.insert(format!("seq:{i:03}"), i);
+    /// }
+    /// assert_eq!(map.len(), 100);
+    /// assert_eq!(map.get("seq:042"), Some(42));
+    /// ```
     #[inline]
     pub fn inserter(&self) -> ArenaInserter<'_, K, V> {
         ArenaInserter {
