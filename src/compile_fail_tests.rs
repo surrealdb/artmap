@@ -175,6 +175,37 @@
 //! drop(e);
 //! ```
 //!
+//! A versioned `&V` cannot outlive the item it was borrowed from, so a
+//! same-version replace cannot free it underneath the caller:
+//!
+//! ```compile_fail,E0716
+//! let m = artmap::VersionedArtMap::<Vec<u8>, u64>::new();
+//! m.insert(vec![1], 1, 1);
+//! let v = m.iter().next().unwrap().value();
+//! m.insert(vec![1], 2, 1);
+//! assert_eq!(*v, 1);
+//! ```
+//!
+//! ```
+//! let m = artmap::VersionedArtMap::<Vec<u8>, u64>::new();
+//! m.insert(vec![1], 1, 1);
+//! let e = m.iter().next().unwrap();
+//! m.insert(vec![1], 2, 1);
+//! assert_eq!(*e.value(), 1);
+//! ```
+//!
+//! `validate_invariants` needs exclusive access, so it cannot race a writer:
+//!
+//! ```compile_fail,E0596
+//! let m = std::sync::Arc::new(artmap::ArtMap::<Vec<u8>, u64>::new());
+//! m.validate_invariants();
+//! ```
+//!
+//! ```
+//! let mut m = std::sync::Arc::new(artmap::ArtMap::<Vec<u8>, u64>::new());
+//! std::sync::Arc::get_mut(&mut m).unwrap().validate_invariants();
+//! ```
+//!
 //! An arena entry cannot outlive its map:
 //!
 //! ```compile_fail,E0597
