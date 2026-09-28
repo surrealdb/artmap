@@ -12,256 +12,63 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # Range Iterators
+//! # Iterators over an [`ArtMap`](crate::ArtMap) (§8.5)
 //!
-//! Provides bidirectional range scanning for [`ArtMap`](crate::ArtMap).
+//! All iterators are double-ended and validated (§10.3): every key present
+//! for the whole scan is yielded exactly once, in order. A key inserted or
+//! removed during the scan may or may not appear. Items are consistent
+//! snapshots of one entry.
+//!
+//! Owned iterators (`iter`, `range`, `keys`, `values`) hold one pin, shared
+//! with every item they yield. The `*_with_guard` iterators borrow the
+//! caller's [`Guard`](crate::Guard) instead and allocate nothing.
 
-use crossbeam_epoch::Guard;
-use std::ops::Bound;
-use std::sync::atomic::Ordering;
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
+
+use std::ops::{Bound, Deref};
+use std::rc::Rc;
 
 use crate::entry::EntryRef;
+use crate::guard::{pin_tagged, GuardHandle};
 use crate::key::AsBytes;
-use crate::node::{
-    next_present_byte, prev_present_byte, Leaf, Node16, Node256, Node4, Node48, NodeHeader,
-    NodeType, TaggedPtr, NODE48_EMPTY,
-};
-use crate::tree::Tree;
+use crate::raw::cursor::{Cursor, KeyBuf};
+use crate::tree::{Storage, Tree};
 
-const MAX_STACK_DEPTH: usize = 16;
-
-#[derive(Clone, Copy)]
-struct CursorFrame {
-    node: *mut NodeHeader,
-    current_pos: usize,
-}
-
-impl CursorFrame {
-    const NULL: Self = Self {
-        node: std::ptr::null_mut(),
-        current_pos: 0,
-    };
-}
-
-/// An inline bounded key representation avoiding heap allocations for keys <= 32 bytes.
-#[derive(Clone, Debug)]
-pub(crate) enum BoundKey {
-    Unbounded,
-    IncludedSmall([u8; 32], u8),
-    IncludedHeap(Box<[u8]>),
-    ExcludedSmall([u8; 32], u8),
-    ExcludedHeap(Box<[u8]>),
-}
-
-impl BoundKey {
-    #[inline]
-    pub fn from_bound<Q: AsBytes + ?Sized>(bound: Bound<&Q>) -> Self {
-        match bound {
-            Bound::Unbounded => BoundKey::Unbounded,
-            Bound::Included(k) => {
-                let bytes = k.as_bytes();
-                if bytes.len() <= 32 {
-                    let mut buf = [0u8; 32];
-                    buf[..bytes.len()].copy_from_slice(bytes);
-                    BoundKey::IncludedSmall(buf, bytes.len() as u8)
-                } else {
-                    BoundKey::IncludedHeap(bytes.into())
-                }
-            }
-            Bound::Excluded(k) => {
-                let bytes = k.as_bytes();
-                if bytes.len() <= 32 {
-                    let mut buf = [0u8; 32];
-                    buf[..bytes.len()].copy_from_slice(bytes);
-                    BoundKey::ExcludedSmall(buf, bytes.len() as u8)
-                } else {
-                    BoundKey::ExcludedHeap(bytes.into())
-                }
-            }
-        }
-    }
-}
-
-/// An iterator over a range of entries in an [`ArtMap`](crate::ArtMap).
-pub struct Range<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
+/// An iterator over a range of entries of an [`ArtMap`](crate::ArtMap), in
+/// ascending key order (or descending, with `rev`).
+///
+/// Every key present for the whole scan is yielded exactly once, in key order
+/// (descending with `rev`). A key inserted or removed during the scan may or
+/// may not appear.
+pub struct Range<'a, K, V> {
     tree: &'a Tree<K, V>,
-    _guard: Guard,
-    start_bound: BoundKey,
-    end_bound: BoundKey,
-    stack: [CursorFrame; MAX_STACK_DEPTH],
-    stack_len: usize,
-    stack_overflow: Vec<CursorFrame>,
-    last_leaf_front: Option<*mut Leaf<K, V>>,
-    last_leaf_back: Option<*mut Leaf<K, V>>,
-    exhausted: bool,
+    guard: GuardHandle<'a>,
+    cursor: Cursor<Storage<K, V>>,
 }
 
-impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Range<'a, K, V> {
-    pub(crate) fn new(tree: &'a Tree<K, V>, start_bound: BoundKey, end_bound: BoundKey) -> Self {
-        let guard = crossbeam_epoch::pin();
+impl<'a, K, V> Range<'a, K, V> {
+    /// An owned iterator: one pin shared by the iterator and its items.
+    pub(crate) fn owned(tree: &'a Tree<K, V>, start: Bound<KeyBuf>, end: Bound<KeyBuf>) -> Self {
+        let (g, id) = pin_tagged();
         Self {
             tree,
-            _guard: guard,
-            start_bound,
-            end_bound,
-            stack: [CursorFrame::NULL; MAX_STACK_DEPTH],
-            stack_len: 0,
-            stack_overflow: Vec::new(),
-            last_leaf_front: None,
-            last_leaf_back: None,
-            exhausted: false,
+            guard: GuardHandle::Shared(Rc::new(g), id),
+            cursor: Cursor::new(start, end),
         }
     }
 
-    #[inline(always)]
-    fn stack_push(&mut self, frame: CursorFrame) {
-        if self.stack_len < MAX_STACK_DEPTH && self.stack_overflow.is_empty() {
-            self.stack[self.stack_len] = frame;
-            self.stack_len += 1;
-        } else {
-            self.stack_overflow.push(frame);
+    /// A borrowed iterator: items borrow the caller's guard.
+    pub(crate) fn borrowed(
+        tree: &'a Tree<K, V>,
+        guard: &'a crossbeam_epoch::Guard,
+        start: Bound<KeyBuf>,
+        end: Bound<KeyBuf>,
+    ) -> Self {
+        Self {
+            tree,
+            guard: GuardHandle::Borrowed(guard),
+            cursor: Cursor::new(start, end),
         }
-    }
-
-    #[inline(always)]
-    fn stack_last_mut(&mut self) -> Option<&mut CursorFrame> {
-        if let Some(f) = self.stack_overflow.last_mut() {
-            Some(f)
-        } else if self.stack_len > 0 {
-            Some(&mut self.stack[self.stack_len - 1])
-        } else {
-            None
-        }
-    }
-
-    #[inline(always)]
-    fn stack_pop(&mut self) -> Option<CursorFrame> {
-        if let Some(f) = self.stack_overflow.pop() {
-            Some(f)
-        } else if self.stack_len > 0 {
-            self.stack_len -= 1;
-            Some(self.stack[self.stack_len])
-        } else {
-            None
-        }
-    }
-
-    #[inline(always)]
-    fn stack_clear(&mut self) {
-        self.stack_len = 0;
-        self.stack_overflow.clear();
-    }
-
-    #[inline(always)]
-    fn set_cursor_front(&mut self, ptr: *mut Leaf<K, V>) {
-        self.last_leaf_front = Some(ptr);
-    }
-
-    #[inline(always)]
-    fn cursor_front(&self) -> Option<&[u8]> {
-        self.last_leaf_front.map(|p| unsafe { (*p).key.as_bytes() })
-    }
-
-    #[inline(always)]
-    fn set_cursor_back(&mut self, ptr: *mut Leaf<K, V>) {
-        self.last_leaf_back = Some(ptr);
-    }
-
-    #[inline(always)]
-    fn cursor_back(&self) -> Option<&[u8]> {
-        self.last_leaf_back.map(|p| unsafe { (*p).key.as_bytes() })
-    }
-
-    #[inline]
-    fn push_and_descend_left(&mut self, mut ptr: TaggedPtr) -> Option<*mut Leaf<K, V>> {
-        while !ptr.is_null() {
-            if ptr.is_leaf() {
-                return Some(ptr.as_leaf_ptr());
-            }
-            let header = ptr.as_inner_ptr();
-            let exact = unsafe { (*header).load_exact_leaf::<K, V>(Ordering::Acquire) };
-            if let Some(leaf_ptr) = exact {
-                self.stack_push(CursorFrame {
-                    node: header,
-                    current_pos: usize::MAX,
-                });
-                return Some(leaf_ptr);
-            }
-
-            match unsafe { next_child_in_node(header, usize::MAX) } {
-                Some((pos, child)) => {
-                    self.stack_push(CursorFrame {
-                        node: header,
-                        current_pos: pos,
-                    });
-                    ptr = child;
-                }
-                None => return None,
-            }
-        }
-        None
-    }
-
-    fn seek_to_key(&mut self, target_key: &[u8]) {
-        self.stack_clear();
-        let root_ptr = TaggedPtr::from_raw(self.tree.raw_root().as_raw());
-        if root_ptr.is_null() || root_ptr.is_leaf() {
-            return;
-        }
-
-        let mut current = root_ptr;
-        let mut depth = 0;
-
-        while !current.is_null() && !current.is_leaf() {
-            let header = current.as_inner_ptr();
-            let (_matched, is_full) = unsafe { (*header).match_prefix(target_key, depth) };
-            if !is_full {
-                return;
-            }
-
-            depth += unsafe { (*header).prefix_len as usize };
-
-            if depth == target_key.len() {
-                self.stack_push(CursorFrame {
-                    node: header,
-                    current_pos: usize::MAX,
-                });
-                return;
-            }
-
-            let next_byte = target_key[depth];
-            match unsafe { child_pos_for_byte(header, next_byte) } {
-                Some((pos, child)) => {
-                    self.stack_push(CursorFrame {
-                        node: header,
-                        current_pos: pos,
-                    });
-                    if child.is_leaf() {
-                        return;
-                    }
-                    current = child;
-                    depth += 1;
-                }
-                None => return,
-            }
-        }
-    }
-
-    #[inline]
-    fn advance_forward(&mut self) -> Option<*mut Leaf<K, V>> {
-        while let Some(frame) = self.stack_last_mut() {
-            let header = frame.node;
-            match unsafe { next_child_in_node(header, frame.current_pos) } {
-                Some((next_pos, child)) => {
-                    frame.current_pos = next_pos;
-                    return self.push_and_descend_left(child);
-                }
-                None => {
-                    self.stack_pop();
-                }
-            }
-        }
-        None
     }
 }
 
@@ -270,585 +77,134 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, 
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.exhausted {
-            return None;
-        }
-
-        loop {
-            let mut leaf_ptr = if self.last_leaf_front.is_none() {
-                let (search_key, include_equal) = match &self.start_bound {
-                    BoundKey::IncludedSmall(b, len) => (&b[..*len as usize], true),
-                    BoundKey::ExcludedSmall(b, len) => (&b[..*len as usize], false),
-                    BoundKey::IncludedHeap(b) => (b.as_ref(), true),
-                    BoundKey::ExcludedHeap(b) => (b.as_ref(), false),
-                    BoundKey::Unbounded => (&[][..], true),
-                };
-
-                let root_ptr = TaggedPtr::from_raw(self.tree.raw_root().as_raw());
-                if root_ptr.is_null() {
-                    self.exhausted = true;
-                    return None;
-                }
-
-                if root_ptr.is_leaf() {
-                    let leaf = unsafe { &*root_ptr.as_leaf_ptr::<K, V>() };
-                    let k = leaf.key.as_bytes();
-                    let cmp = k.cmp(search_key);
-                    if (include_equal && cmp >= std::cmp::Ordering::Equal)
-                        || (!include_equal && cmp == std::cmp::Ordering::Greater)
-                    {
-                        root_ptr.as_leaf_ptr::<K, V>()
-                    } else {
-                        self.exhausted = true;
-                        return None;
-                    }
-                } else if (search_key.is_empty() || (search_key == [0u8] && include_equal))
-                    && include_equal
-                {
-                    match self.push_and_descend_left(root_ptr) {
-                        Some(ptr) => ptr,
-                        None => {
-                            self.exhausted = true;
-                            return None;
-                        }
-                    }
-                } else {
-                    let ptr = match self.tree.find_successor(search_key, include_equal) {
-                        Some(p) => p,
-                        None => {
-                            self.exhausted = true;
-                            return None;
-                        }
-                    };
-                    let leaf = unsafe { &*ptr };
-                    self.seek_to_key(leaf.key.as_bytes());
-                    ptr
-                }
-            } else {
-                match self.advance_forward() {
-                    Some(ptr) => ptr,
-                    None => {
-                        let prev_k = self.cursor_front().unwrap();
-                        let ptr = match self.tree.find_successor(prev_k, false) {
-                            Some(p) => p,
-                            None => {
-                                self.exhausted = true;
-                                return None;
-                            }
-                        };
-                        let leaf = unsafe { &*ptr };
-                        self.seek_to_key(leaf.key.as_bytes());
-                        ptr
-                    }
-                }
-            };
-
-            let mut leaf = unsafe { &*leaf_ptr };
-            let mut k_bytes = leaf.key.as_bytes();
-
-            if let Some(prev_k) = self.cursor_front() {
-                if k_bytes <= prev_k {
-                    match self.tree.find_successor(prev_k, false) {
-                        Some(p) => {
-                            leaf_ptr = p;
-                            leaf = unsafe { &*leaf_ptr };
-                            k_bytes = leaf.key.as_bytes();
-                            self.seek_to_key(k_bytes);
-                        }
-                        None => {
-                            self.exhausted = true;
-                            return None;
-                        }
-                    }
-                }
-            }
-
-            // Check upper range bound
-            match &self.end_bound {
-                BoundKey::IncludedSmall(b, len) => {
-                    if k_bytes > &b[..*len as usize] {
-                        self.exhausted = true;
-                        return None;
-                    }
-                }
-                BoundKey::ExcludedSmall(b, len) => {
-                    if k_bytes >= &b[..*len as usize] {
-                        self.exhausted = true;
-                        return None;
-                    }
-                }
-                BoundKey::IncludedHeap(b) => {
-                    if k_bytes > b.as_ref() {
-                        self.exhausted = true;
-                        return None;
-                    }
-                }
-                BoundKey::ExcludedHeap(b) => {
-                    if k_bytes >= b.as_ref() {
-                        self.exhausted = true;
-                        return None;
-                    }
-                }
-                BoundKey::Unbounded => {}
-            }
-
-            // Check overlap with backward cursor
-            if let Some(back_k) = self.cursor_back() {
-                if k_bytes >= back_k {
-                    self.exhausted = true;
-                    return None;
-                }
-            }
-
-            self.set_cursor_front(leaf_ptr);
-
-            let entry = EntryRef {
-                leaf_ptr,
-                tree: self.tree,
-            };
-            if !entry.is_removed() {
-                return Some(entry);
-            }
-        }
+        let leaf = self.cursor.next(&self.tree.raw)?;
+        Some(EntryRef::new(leaf, self.tree, self.guard.duplicate()))
     }
 }
 
-impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for Range<'a, K, V> {
+impl<K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for Range<'_, K, V> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.exhausted {
-            return None;
-        }
-
-        loop {
-            let (search_key, include_equal) = if let Some(back_k) = self.cursor_back() {
-                (back_k, false)
-            } else {
-                match &self.end_bound {
-                    BoundKey::IncludedSmall(b, len) => (&b[..*len as usize], true),
-                    BoundKey::ExcludedSmall(b, len) => (&b[..*len as usize], false),
-                    BoundKey::IncludedHeap(b) => (b.as_ref(), true),
-                    BoundKey::ExcludedHeap(b) => (b.as_ref(), false),
-                    BoundKey::Unbounded => (&[0xFF; 64][..], true),
-                }
-            };
-
-            let leaf_ptr = self.tree.find_predecessor(search_key, include_equal)?;
-            let leaf = unsafe { &*leaf_ptr };
-            let k_bytes = leaf.key.as_bytes();
-
-            // Check lower range bound
-            match &self.start_bound {
-                BoundKey::IncludedSmall(b, len) => {
-                    if k_bytes < &b[..*len as usize] {
-                        self.exhausted = true;
-                        return None;
-                    }
-                }
-                BoundKey::ExcludedSmall(b, len) => {
-                    if k_bytes <= &b[..*len as usize] {
-                        self.exhausted = true;
-                        return None;
-                    }
-                }
-                BoundKey::IncludedHeap(b) => {
-                    if k_bytes < b.as_ref() {
-                        self.exhausted = true;
-                        return None;
-                    }
-                }
-                BoundKey::ExcludedHeap(b) => {
-                    if k_bytes <= b.as_ref() {
-                        self.exhausted = true;
-                        return None;
-                    }
-                }
-                BoundKey::Unbounded => {}
-            }
-
-            // Check overlap with forward cursor
-            if let Some(front_k) = self.cursor_front() {
-                if k_bytes <= front_k {
-                    self.exhausted = true;
-                    return None;
-                }
-            }
-
-            self.set_cursor_back(leaf_ptr);
-
-            let entry = EntryRef {
-                leaf_ptr,
-                tree: self.tree,
-            };
-            if !entry.is_removed() {
-                return Some(entry);
-            }
-        }
+        let leaf = self.cursor.next_back(&self.tree.raw)?;
+        Some(EntryRef::new(leaf, self.tree, self.guard.duplicate()))
     }
 }
 
-/// An iterator over all entries in an [`ArtMap`](crate::ArtMap).
-pub struct Iter<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
-    inner: Range<'a, K, V>,
-}
+impl<K: AsBytes + Send + 'static, V: Send + 'static> std::iter::FusedIterator for Range<'_, K, V> {}
 
-impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iter<'a, K, V> {
-    pub(crate) fn new(tree: &'a Tree<K, V>) -> Self {
-        Self {
-            inner: Range::new(tree, BoundKey::Unbounded, BoundKey::Unbounded),
-        }
-    }
-}
+/// An iterator over all entries of an [`ArtMap`](crate::ArtMap).
+pub type Iter<'a, K, V> = Range<'a, K, V>;
 
-impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Iter<'a, K, V> {
-    type Item = EntryRef<'a, K, V>;
+/// A key yielded by [`Keys`]: a handle that dereferences to the key.
+pub struct KeyRef<'a, K, V>(EntryRef<'a, K, V>);
 
+impl<'a, K, V> KeyRef<'a, K, V> {
+    /// The underlying entry.
     #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+    pub fn entry(&self) -> &EntryRef<'a, K, V> {
+        &self.0
     }
 }
 
-impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for Iter<'a, K, V> {
+impl<K, V> Deref for KeyRef<'_, K, V> {
+    type Target = K;
     #[inline]
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back()
+    fn deref(&self) -> &K {
+        self.0.key()
     }
 }
 
-/// An iterator over keys in an [`ArtMap`](crate::ArtMap).
-pub struct Keys<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
-    inner: Iter<'a, K, V>,
-}
-
-impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Keys<'a, K, V> {
-    pub(crate) fn new(inner: Iter<'a, K, V>) -> Self {
-        Self { inner }
+impl<K: std::fmt::Debug, V> std::fmt::Debug for KeyRef<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.key().fmt(f)
     }
 }
+
+/// A value yielded by [`Values`]: a handle that dereferences to the value.
+pub struct ValueRef<'a, K, V>(EntryRef<'a, K, V>);
+
+impl<'a, K, V> ValueRef<'a, K, V> {
+    /// The underlying entry.
+    #[inline]
+    pub fn entry(&self) -> &EntryRef<'a, K, V> {
+        &self.0
+    }
+}
+
+impl<K, V> Deref for ValueRef<'_, K, V> {
+    type Target = V;
+    #[inline]
+    fn deref(&self) -> &V {
+        self.0.value()
+    }
+}
+
+impl<K, V: std::fmt::Debug> std::fmt::Debug for ValueRef<'_, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.value().fmt(f)
+    }
+}
+
+/// An iterator over the keys of an [`ArtMap`](crate::ArtMap).
+pub struct Keys<'a, K, V>(pub(crate) Range<'a, K, V>);
 
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Keys<'a, K, V> {
-    type Item = &'a K;
-
+    type Item = KeyRef<'a, K, V>;
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|e| e.key())
+        self.0.next().map(KeyRef)
     }
 }
 
-/// An iterator over values in an [`ArtMap`](crate::ArtMap).
-pub struct Values<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
-    inner: Iter<'a, K, V>,
-}
-
-impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Values<'a, K, V> {
-    pub(crate) fn new(inner: Iter<'a, K, V>) -> Self {
-        Self { inner }
+impl<K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for Keys<'_, K, V> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.next_back().map(KeyRef)
     }
 }
+
+/// An iterator over the values of an [`ArtMap`](crate::ArtMap).
+pub struct Values<'a, K, V>(pub(crate) Range<'a, K, V>);
 
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Values<'a, K, V> {
-    type Item = &'a V;
-
+    type Item = ValueRef<'a, K, V>;
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|e| e.value())
+        self.0.next().map(ValueRef)
     }
 }
 
-#[inline]
-pub(crate) unsafe fn next_child_in_node(
-    header: *mut NodeHeader,
-    current_pos: usize,
-) -> Option<(usize, TaggedPtr)> {
-    let h = &*header;
-    match h.node_type {
-        NodeType::Node4 => {
-            let n = &*(header as *const Node4);
-            let count = n.header.num_children as usize;
-            let next_idx = if current_pos == usize::MAX {
-                0
-            } else {
-                current_pos + 1
-            };
-            if next_idx < count {
-                let child = TaggedPtr::from_raw(n.children[next_idx].load(Ordering::Acquire));
-                if !child.is_null() {
-                    return Some((next_idx, child));
-                }
-            }
-            None
-        }
-        NodeType::Node16 => {
-            let n = &*(header as *const Node16);
-            let count = n.header.num_children as usize;
-            let next_idx = if current_pos == usize::MAX {
-                0
-            } else {
-                current_pos + 1
-            };
-            if next_idx < count {
-                let child = TaggedPtr::from_raw(n.children[next_idx].load(Ordering::Acquire));
-                if !child.is_null() {
-                    return Some((next_idx, child));
-                }
-            }
-            None
-        }
-        NodeType::Node48 => {
-            let n = &*(header as *const Node48);
-            let mut next_byte = if current_pos == usize::MAX {
-                0
-            } else if current_pos < 255 {
-                (current_pos + 1) as u8
-            } else {
-                return None;
-            };
-            while let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
-                let slot = n.child_indices[byte as usize];
-                if slot != NODE48_EMPTY {
-                    let child =
-                        TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
-                    if !child.is_null() {
-                        return Some((byte as usize, child));
-                    }
-                }
-                if byte == 255 {
-                    break;
-                }
-                next_byte = byte + 1;
-            }
-            None
-        }
-        NodeType::Node256 => {
-            let n = &*(header as *const Node256);
-            let mut next_byte = if current_pos == usize::MAX {
-                0
-            } else if current_pos < 255 {
-                (current_pos + 1) as u8
-            } else {
-                return None;
-            };
-            while let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
-                let child = TaggedPtr::from_raw(n.children[byte as usize].load(Ordering::Acquire));
-                if !child.is_null() {
-                    return Some((byte as usize, child));
-                }
-                if byte == 255 {
-                    break;
-                }
-                next_byte = byte + 1;
-            }
-            None
-        }
+impl<K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for Values<'_, K, V> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.next_back().map(ValueRef)
     }
 }
 
-#[inline]
-pub(crate) unsafe fn child_pos_for_byte(
-    header: *mut NodeHeader,
-    needle: u8,
-) -> Option<(usize, TaggedPtr)> {
-    let h = &*header;
-    match h.node_type {
-        NodeType::Node4 => {
-            let n = &*(header as *const Node4);
-            let count = n.header.num_children as usize;
-            for i in 0..count {
-                if n.keys[i] == needle {
-                    let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
-                    if !child.is_null() {
-                        return Some((i, child));
-                    }
-                }
-            }
-            None
-        }
-        NodeType::Node16 => {
-            let n = &*(header as *const Node16);
-            let count = n.header.num_children as usize;
-            for i in 0..count {
-                if n.keys[i] == needle {
-                    let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
-                    if !child.is_null() {
-                        return Some((i, child));
-                    }
-                }
-            }
-            None
-        }
-        NodeType::Node48 => {
-            let n = &*(header as *const Node48);
-            let slot = n.child_indices[needle as usize];
-            if slot != NODE48_EMPTY {
-                let child = TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
-                if !child.is_null() {
-                    return Some((needle as usize, child));
-                }
-            }
-            None
-        }
-        NodeType::Node256 => {
-            let n = &*(header as *const Node256);
-            let child = TaggedPtr::from_raw(n.children[needle as usize].load(Ordering::Acquire));
-            if !child.is_null() {
-                Some((needle as usize, child))
-            } else {
-                None
-            }
-        }
+/// Keys borrowed through a caller's [`Guard`](crate::Guard): bare `&'a K`,
+/// bounded by both the map borrow and the guard borrow.
+pub struct GuardKeys<'a, K, V>(pub(crate) Range<'a, K, V>);
+
+impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for GuardKeys<'a, K, V> {
+    type Item = &'a K;
+    #[inline]
+    fn next(&mut self) -> Option<&'a K> {
+        let leaf = self.0.cursor.next(&self.0.tree.raw)?;
+        // SAFETY: the caller's guard (borrowed for `'a`) and the map borrow
+        // (`'a`) keep the leaf alive and unchanged for `'a` (Inv 1, Inv 2).
+        Some(unsafe { &(*leaf.as_ptr()).key })
     }
 }
 
-pub(crate) unsafe fn first_leaf_in_subtree<K, V>(ptr: TaggedPtr) -> Option<*mut Leaf<K, V>> {
-    if ptr.is_null() {
-        return None;
-    }
-    if ptr.is_leaf() {
-        return Some(ptr.as_leaf_ptr());
-    }
-    let header = &*ptr.as_inner_ptr();
-    if let Some(leaf) = header.load_exact_leaf::<K, V>(Ordering::Acquire) {
-        return Some(leaf);
-    }
+/// Values borrowed through a caller's [`Guard`](crate::Guard): bare `&'a V`.
+pub struct GuardValues<'a, K, V>(pub(crate) Range<'a, K, V>);
 
-    match header.node_type {
-        NodeType::Node4 => {
-            let n = &*(ptr.as_inner_ptr() as *const Node4);
-            for i in 0..n.header.num_children as usize {
-                let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
-                if !child.is_null() {
-                    if let Some(leaf) = first_leaf_in_subtree(child) {
-                        return Some(leaf);
-                    }
-                }
-            }
-            None
-        }
-        NodeType::Node16 => {
-            let n = &*(ptr.as_inner_ptr() as *const Node16);
-            for i in 0..n.header.num_children as usize {
-                let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
-                if !child.is_null() {
-                    if let Some(leaf) = first_leaf_in_subtree(child) {
-                        return Some(leaf);
-                    }
-                }
-            }
-            None
-        }
-        NodeType::Node48 => {
-            let n = &*(ptr.as_inner_ptr() as *const Node48);
-            let mut next_byte = 0u8;
-            while let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
-                let slot = n.child_indices[byte as usize];
-                if slot != NODE48_EMPTY {
-                    let child =
-                        TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
-                    if !child.is_null() {
-                        if let Some(leaf) = first_leaf_in_subtree(child) {
-                            return Some(leaf);
-                        }
-                    }
-                }
-                if byte == 255 {
-                    break;
-                }
-                next_byte = byte + 1;
-            }
-            None
-        }
-        NodeType::Node256 => {
-            let n = &*(ptr.as_inner_ptr() as *const Node256);
-            let mut next_byte = 0u8;
-            while let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
-                let child = TaggedPtr::from_raw(n.children[byte as usize].load(Ordering::Acquire));
-                if !child.is_null() {
-                    if let Some(leaf) = first_leaf_in_subtree(child) {
-                        return Some(leaf);
-                    }
-                }
-                if byte == 255 {
-                    break;
-                }
-                next_byte = byte + 1;
-            }
-            None
-        }
-    }
-}
-
-pub(crate) unsafe fn last_leaf_in_subtree<K, V>(ptr: TaggedPtr) -> Option<*mut Leaf<K, V>> {
-    if ptr.is_null() {
-        return None;
-    }
-    if ptr.is_leaf() {
-        return Some(ptr.as_leaf_ptr());
-    }
-    let header = &*ptr.as_inner_ptr();
-
-    match header.node_type {
-        NodeType::Node4 => {
-            let n = &*(ptr.as_inner_ptr() as *const Node4);
-            for i in (0..n.header.num_children as usize).rev() {
-                let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
-                if !child.is_null() {
-                    if let Some(leaf) = last_leaf_in_subtree(child) {
-                        return Some(leaf);
-                    }
-                }
-            }
-            header.load_exact_leaf::<K, V>(Ordering::Acquire)
-        }
-        NodeType::Node16 => {
-            let n = &*(ptr.as_inner_ptr() as *const Node16);
-            for i in (0..n.header.num_children as usize).rev() {
-                let child = TaggedPtr::from_raw(n.children[i].load(Ordering::Acquire));
-                if !child.is_null() {
-                    if let Some(leaf) = last_leaf_in_subtree(child) {
-                        return Some(leaf);
-                    }
-                }
-            }
-            header.load_exact_leaf::<K, V>(Ordering::Acquire)
-        }
-        NodeType::Node48 => {
-            let n = &*(ptr.as_inner_ptr() as *const Node48);
-            let mut max_b = 255u8;
-            while let Some(byte) = prev_present_byte(&n.child_bitmap, max_b) {
-                let slot = n.child_indices[byte as usize];
-                if slot != NODE48_EMPTY {
-                    let child =
-                        TaggedPtr::from_raw(n.children[slot as usize].load(Ordering::Acquire));
-                    if !child.is_null() {
-                        if let Some(leaf) = last_leaf_in_subtree(child) {
-                            return Some(leaf);
-                        }
-                    }
-                }
-                if byte == 0 {
-                    break;
-                }
-                max_b = byte - 1;
-            }
-            header.load_exact_leaf::<K, V>(Ordering::Acquire)
-        }
-        NodeType::Node256 => {
-            let n = &*(ptr.as_inner_ptr() as *const Node256);
-            let mut max_b = 255u8;
-            while let Some(byte) = prev_present_byte(&n.child_bitmap, max_b) {
-                let child = TaggedPtr::from_raw(n.children[byte as usize].load(Ordering::Acquire));
-                if !child.is_null() {
-                    if let Some(leaf) = last_leaf_in_subtree(child) {
-                        return Some(leaf);
-                    }
-                }
-                if byte == 0 {
-                    break;
-                }
-                max_b = byte - 1;
-            }
-            header.load_exact_leaf::<K, V>(Ordering::Acquire)
-        }
+impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for GuardValues<'a, K, V> {
+    type Item = &'a V;
+    #[inline]
+    fn next(&mut self) -> Option<&'a V> {
+        let leaf = self.0.cursor.next(&self.0.tree.raw)?;
+        // SAFETY: as for `GuardKeys`.
+        Some(unsafe { &(*leaf.as_ptr()).value })
     }
 }

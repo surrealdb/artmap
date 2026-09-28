@@ -12,116 +12,157 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # Versioned Entry Reference
-//!
-//! Provides [`VersionedEntryRef`], an ergonomic reference to a versioned entry in a [`VersionedArtMap`](crate::versioned::VersionedArtMap).
+//! # Versioned entry handles (§11.6)
+
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
 use std::ops::Deref;
-use std::sync::atomic::Ordering;
+use std::ptr::NonNull;
 
-use crate::key::AsBytes;
-use crate::node::VersionedLeaf;
+use crate::guard::GuardHandle;
+use crate::versioned::node::{VersionNode, VersionedLeaf};
+use crate::versioned::tree::{find_le, VersionedTree};
 
-/// A reference to a versioned entry in a [`VersionedArtMap`](crate::versioned::VersionedArtMap).
-pub struct VersionedEntryRef<'a, K: AsBytes + Send + 'static, V: Send + 'static> {
-    pub(crate) leaf_ptr: *mut VersionedLeaf<K, V>,
-    pub(crate) _marker: std::marker::PhantomData<&'a ()>,
+/// A snapshot of one version of one key of a
+/// [`VersionedArtMap`](crate::VersionedArtMap).
+///
+/// The handle captures a single version node when it is created, so
+/// [`value`](Self::value) and [`version`](Self::version) always belong
+/// together, whatever writers do meanwhile. Fresh reads are explicit:
+/// [`latest`](Self::latest) and [`get_version_le`](Self::get_version_le) walk
+/// the current chain.
+///
+/// Bounded by the map borrow and an epoch guard; neither `Send` nor `Sync`.
+pub struct VersionedEntryRef<'a, K, V> {
+    pub(crate) leaf: NonNull<VersionedLeaf<K, V>>,
+    /// Never a tombstone.
+    pub(crate) node: NonNull<VersionNode<V>>,
+    pub(crate) tree: &'a VersionedTree<K, V>,
+    pub(crate) guard: GuardHandle<'a>,
 }
 
-impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Clone for VersionedEntryRef<'a, K, V> {
+impl<'a, K, V> VersionedEntryRef<'a, K, V> {
+    /// A handle on `node`, or `None` if it is a tombstone.
     #[inline]
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Copy for VersionedEntryRef<'a, K, V> {}
-
-impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> VersionedEntryRef<'a, K, V> {
-    /// Returns a reference to the entry's key.
-    #[inline]
-    pub fn key(&self) -> &'a K {
-        unsafe { &(*self.leaf_ptr).key }
-    }
-
-    /// Returns a reference to the head (latest) version's value.
-    #[inline]
-    pub fn value(&self) -> &'a V {
-        unsafe {
-            let head = (*self.leaf_ptr).versions.load(Ordering::Acquire);
-            debug_assert!(!head.is_null());
-            &(*head).value
+    pub(crate) fn new(
+        leaf: NonNull<VersionedLeaf<K, V>>,
+        node: &VersionNode<V>,
+        tree: &'a VersionedTree<K, V>,
+        guard: GuardHandle<'a>,
+    ) -> Option<Self> {
+        if node.is_tombstone() {
+            return None;
         }
+        Some(Self {
+            leaf,
+            node: NonNull::from(node),
+            tree,
+            guard,
+        })
     }
 
-    /// Returns the head entry's monotonic version number.
+    #[inline]
+    fn leaf(&self) -> &VersionedLeaf<K, V> {
+        // SAFETY: Inv 2: the guard and the map borrow keep the leaf alive.
+        unsafe { self.leaf.as_ref() }
+    }
+
+    #[inline]
+    fn node(&self) -> &VersionNode<V> {
+        // SAFETY: Inv 1 and 2: the captured node is immutable and protected by
+        // the guard (heap nodes) or by the leaf (inline slots).
+        unsafe { self.node.as_ref() }
+    }
+
+    /// The entry's key.
+    #[inline]
+    pub fn key(&self) -> &K {
+        &self.leaf().key
+    }
+
+    /// The captured version's value.
+    #[inline]
+    pub fn value(&self) -> &V {
+        self.node()
+            .value
+            .as_ref()
+            .expect("a VersionedEntryRef never captures a tombstone")
+    }
+
+    /// The captured version.
     #[inline]
     pub fn version(&self) -> u64 {
-        unsafe {
-            let head = (*self.leaf_ptr).versions.load(Ordering::Acquire);
-            debug_assert!(!head.is_null());
-            (*head).version
-        }
+        self.node().version
     }
 
-    /// Checks if this head entry has been marked removed.
+    /// `true` if the captured version was deleted when captured. Always
+    /// `false`: handles never capture tombstones.
     #[inline]
     pub fn is_removed(&self) -> bool {
-        unsafe {
-            let head = (*self.leaf_ptr).versions.load(Ordering::Acquire);
-            if head.is_null() {
-                true
-            } else {
-                (*head).removed.load(Ordering::Acquire)
-            }
-        }
+        false
     }
 
-    /// Returns the newest version and value for this key that is $\le$ `max_version`.
-    pub fn get_version_le(&self, max_version: u64) -> Option<(u64, &'a V)> {
-        let mut cur = unsafe { (*self.leaf_ptr).versions.load(Ordering::Acquire) };
-        while !cur.is_null() {
-            let node = unsafe { &*cur };
-            if node.version <= max_version {
-                if node.removed.load(Ordering::Acquire) {
-                    return None;
-                }
-                return Some((node.version, &*node.value));
-            }
-            cur = node.next_version.load(Ordering::Acquire);
-        }
-        None
+    /// `true` once the captured version node has been unlinked from the chain
+    /// (replaced by a same-version insert, deleted by `remove`, or pruned).
+    #[inline]
+    pub fn is_superseded(&self) -> bool {
+        self.node().is_superseded()
+    }
+
+    /// A fresh read of the key's newest live version, sharing this handle's
+    /// protection (no new pin).
+    pub fn latest(&self) -> Option<VersionedEntryRef<'_, K, V>> {
+        let head = self.leaf().head();
+        VersionedEntryRef::new(self.leaf, head, self.tree, self.borrowed())
+    }
+
+    /// A fresh walk of the key's chain for the newest version `<= max_version`.
+    pub fn get_version_le(&self, max_version: u64) -> Option<(u64, &V)> {
+        let n = find_le(self.leaf().head(), max_version)?;
+        n.value.as_ref().map(|v| (n.version, v))
+    }
+
+    #[inline]
+    fn borrowed(&self) -> GuardHandle<'_> {
+        GuardHandle::Borrowed(self.guard.guard())
     }
 }
 
-impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Deref for VersionedEntryRef<'a, K, V> {
+impl<K, V> Clone for VersionedEntryRef<'_, K, V> {
+    /// Shares the protection (see [`EntryRef::clone`](crate::EntryRef)).
+    fn clone(&self) -> Self {
+        Self {
+            leaf: self.leaf,
+            node: self.node,
+            tree: self.tree,
+            guard: self.guard.duplicate(),
+        }
+    }
+}
+
+impl<K, V> Deref for VersionedEntryRef<'_, K, V> {
     type Target = V;
 
     #[inline]
-    fn deref(&self) -> &Self::Target {
+    fn deref(&self) -> &V {
         self.value()
     }
 }
 
-impl<'a, K: AsBytes + Send + 'static + std::fmt::Debug, V: Send + 'static + std::fmt::Debug>
-    std::fmt::Debug for VersionedEntryRef<'a, K, V>
-{
+impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for VersionedEntryRef<'_, K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VersionedEntryRef")
             .field("key", self.key())
             .field("version", &self.version())
             .field("value", self.value())
-            .field("is_removed", &self.is_removed())
             .finish()
     }
 }
 
-impl<'a, K: AsBytes + Send + 'static + PartialEq, V: Send + 'static + PartialEq> PartialEq
-    for VersionedEntryRef<'a, K, V>
-{
+impl<K: PartialEq, V: PartialEq> PartialEq for VersionedEntryRef<'_, K, V> {
     fn eq(&self, other: &Self) -> bool {
         self.key() == other.key()
-            && self.value() == other.value()
             && self.version() == other.version()
+            && self.value() == other.value()
     }
 }

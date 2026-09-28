@@ -58,6 +58,8 @@ fn find_child_x86_sse2(keys: &[u8; 16], num_children: usize, needle: u8) -> Opti
         __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
     };
 
+    // SAFETY: SSE2 is enabled for this build (`target_feature = "sse2"`), and
+    // the unaligned load reads exactly the 16 bytes of `keys`, a local snapshot.
     unsafe {
         let needle_vec = _mm_set1_epi8(needle as i8);
         let keys_vec = _mm_loadu_si128(keys.as_ptr() as *const __m128i);
@@ -81,6 +83,8 @@ fn find_child_neon(keys: &[u8; 16], num_children: usize, needle: u8) -> Option<u
         vceqq_u8, vdupq_n_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8,
     };
 
+    // SAFETY: NEON is enabled for this build (`target_feature = "neon"`), and
+    // `vld1q_u8` reads exactly the 16 bytes of `keys`, a local snapshot.
     unsafe {
         let needle_vec = vdupq_n_u8(needle);
         let keys_vec = vld1q_u8(keys.as_ptr());
@@ -127,5 +131,26 @@ mod tests {
         keys[4] = b'x';
         assert_eq!(find_child_node16(&keys, 4, b'x'), None);
         assert_eq!(find_child_node16(&keys, 5, b'x'), Some(4));
+    }
+
+    #[test]
+    fn simd_matches_linear_search_exhaustively() {
+        let keys = [
+            0x05, 0x12, 0x24, 0x33, 0x48, 0x5a, 0x67, 0x7e, 0x89, 0x9f, 0xab, 0xb0, 0xcd, 0xde,
+            0xef, 0xfc,
+        ];
+        for count in 0..=16 {
+            for byte in 0u8..=255 {
+                assert_eq!(
+                    find_child_node16(&keys, count, byte),
+                    keys[..count].iter().position(|&k| k == byte),
+                    "byte {byte:#04x}, count {count}"
+                );
+                assert_eq!(
+                    find_child_scalar(&keys, count, byte),
+                    keys[..count].iter().position(|&k| k == byte)
+                );
+            }
+        }
     }
 }

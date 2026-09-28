@@ -39,6 +39,9 @@ fn get_seed() -> u64 {
         seed_str
             .parse::<u64>()
             .expect("ARTMAP_SIM_SEED must be a valid 64-bit integer")
+    } else if cfg!(miri) {
+        // Miri's isolation forbids reading the wall clock.
+        0x5EED_A27A
     } else {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -135,8 +138,8 @@ fn test_versioned_artmap_deterministic_simulation() {
     let map = Arc::new(VersionedArtMap::<String, u64>::new());
     let oracle = Arc::new(Mutex::new(VersionOracle::default()));
 
-    const NUM_WORKERS: usize = 4;
-    const OPS_PER_WORKER: usize = 1_500;
+    const NUM_WORKERS: usize = if cfg!(miri) { 2 } else { 4 };
+    const OPS_PER_WORKER: usize = if cfg!(miri) { 50 } else { 1_500 };
 
     let handles: Vec<_> = (0..NUM_WORKERS)
         .map(|worker_id| {
@@ -181,7 +184,11 @@ fn test_versioned_artmap_deterministic_simulation() {
                         assert_eq!(map_count, oracle_count);
 
                         let map_all = map.get_all_versions(&key);
-                        let oracle_all = o.get_all_versions(&key);
+                        let oracle_all: Vec<_> = o
+                            .get_all_versions(&key)
+                            .into_iter()
+                            .map(|(v, x)| (v, Some(x)))
+                            .collect();
                         assert_eq!(map_all, oracle_all);
                     } else {
                         // 15% Prune older versions
@@ -214,8 +221,8 @@ fn test_arena_versioned_artmap_deterministic_simulation() {
     let map = Arc::new(ArenaVersionedArtMap::<String, u64>::new(arena));
     let oracle = Arc::new(Mutex::new(VersionOracle::default()));
 
-    const NUM_WORKERS: usize = 4;
-    const OPS_PER_WORKER: usize = 1_500;
+    const NUM_WORKERS: usize = if cfg!(miri) { 2 } else { 4 };
+    const OPS_PER_WORKER: usize = if cfg!(miri) { 50 } else { 1_500 };
 
     let handles: Vec<_> = (0..NUM_WORKERS)
         .map(|worker_id| {
@@ -255,7 +262,11 @@ fn test_arena_versioned_artmap_deterministic_simulation() {
                         let map_latest = map.get_latest(&key);
                         assert_eq!(map_latest, oracle_latest);
 
-                        let oracle_all = o.get_all_versions(&key);
+                        let oracle_all: Vec<_> = o
+                            .get_all_versions(&key)
+                            .into_iter()
+                            .map(|(v, x)| (v, Some(x)))
+                            .collect();
                         let map_all = map.get_all_versions(&key);
                         assert_eq!(map_all, oracle_all);
                     }

@@ -27,7 +27,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use artmap::arena::{Arena, ArenaArtMap, ArenaInserter, ArenaVersionedArtMap};
+use artmap::arena::{Arena, ArenaArtMap, ArenaVersionedArtMap};
 use artmap::versioned::VersionedArtMap;
 use artmap::ArtMap;
 
@@ -37,7 +37,7 @@ use artmap::ArtMap;
 
 #[test]
 fn test_stress_concurrent_root_growth_and_splits() {
-    let map = Arc::new(ArtMap::<[u8; 8], u64>::new());
+    let mut map = Arc::new(ArtMap::<[u8; 8], u64>::new());
     const NUM_THREADS: usize = 24;
     const KEYS_PER_THREAD: usize = 1_000;
     let barrier = Arc::new(Barrier::new(NUM_THREADS));
@@ -66,7 +66,7 @@ fn test_stress_concurrent_root_growth_and_splits() {
     }
 
     assert_eq!(map.len(), NUM_THREADS * KEYS_PER_THREAD);
-    map.validate_invariants();
+    Arc::get_mut(&mut map).unwrap().validate_invariants();
 }
 
 // ============================================================================
@@ -218,7 +218,7 @@ fn test_stress_concurrent_writes_reads_and_pruning() {
 
 #[test]
 fn test_stress_deep_prefix_compression_branches() {
-    let map = Arc::new(ArtMap::<Vec<u8>, usize>::new());
+    let mut map = Arc::new(ArtMap::<Vec<u8>, usize>::new());
 
     // Generate keys with prefixes of exactly 0, 1, 15, 16 (MAX_PREFIX_LEN), 17, 32 bytes
     let prefix_lengths = [0, 1, 15, 16, 17, 32, 64];
@@ -252,7 +252,7 @@ fn test_stress_deep_prefix_compression_branches() {
         map.len(),
         prefix_lengths.len() * KEYS_PER_PREFIX * NUM_THREADS
     );
-    map.validate_invariants();
+    Arc::get_mut(&mut map).unwrap().validate_invariants();
 }
 
 // ============================================================================
@@ -447,11 +447,11 @@ fn test_stress_arena_inserter_concurrent_cache_resilience() {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                let mut ins = ArenaInserter::new();
+                let mut ins = map.inserter();
                 let start = (t * KEYS_PER_INSERTER) as u64;
                 for i in 0..KEYS_PER_INSERTER as u64 {
                     let k = (start + i).to_be_bytes();
-                    map.insert_with_inserter(k, start + i, &mut ins);
+                    ins.insert(k, start + i);
                 }
             })
         })

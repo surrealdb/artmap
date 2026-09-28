@@ -1,8 +1,9 @@
 [package]
 name = "artmap"
 publish = true
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
+rust-version = "1.86"
 license = "Apache-2.0"
 readme = "README.md"
 description = "A concurrent in-memory Adaptive Radix Tree (ART) featuring optimistic lock coupling."
@@ -13,7 +14,7 @@ keywords = [
     "radix-tree",
     "trie",
     "concurrent",
-    "lock-free",
+    "mvcc",
 ]
 categories = ["data-structures", "concurrency", "database-implementations"]
 
@@ -34,12 +35,21 @@ papaya = "0.2"
 scc = "3.8"
 concread = "0.5"
 vart = "0.10"
+proptest = { version = "1.10", default-features = false, features = ["std"] }
 
-[target.'cfg(loom)'.dev-dependencies]
+# The library itself imports loom under `cfg(loom)` (§16.3), so it is a normal
+# dependency; dev-dependencies are invisible to the lib.
+[target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(loom)',
+    'cfg(crossbeam_loom)',
+    'cfg(artmap_hooks)',
+    'cfg(artmap_provenance_lints)',
+] }
+unsafe_op_in_unsafe_fn = "deny"
 
 [[bench]]
 name = "artmap_bench"
@@ -54,6 +64,8 @@ name = "alloc_comparison"
 harness = false
 
 [lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
 allow_attributes = "allow"
 assigning_clones = "warn"
 bool_assert_comparison = "allow"
@@ -80,3 +92,11 @@ trivially_copy_pass_by_ref = "warn"
 unnecessary_to_owned = "warn"
 unwrap_used = "allow"
 used_underscore_binding = "warn"
+
+[[bench]]
+name = "safety_bench"
+harness = false
+
+[[bench]]
+name = "memory_bench"
+harness = false

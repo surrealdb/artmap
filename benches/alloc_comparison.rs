@@ -47,12 +47,12 @@ fn alloc_arena_artmap_insert(bencher: divan::Bencher<'_, '_>, count: usize) {
 #[divan::bench(args = COUNTS)]
 fn alloc_arena_artmap_with_inserter(bencher: divan::Bencher<'_, '_>, count: usize) {
     let map = ArenaArtMap::<[u8; 8], usize>::with_capacity(32 * 1024 * 1024);
-    let mut ins = artmap::arena::ArenaInserter::new();
+    let mut ins = map.inserter();
     let mut key = 0usize;
 
     bencher.counter(count).bench_local(|| {
         let k = (key as u64).to_be_bytes();
-        let _ = map.insert_with_inserter(k, key, &mut ins);
+        let _ = ins.insert(k, key);
         key += 1;
     });
 }

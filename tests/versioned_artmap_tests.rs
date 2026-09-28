@@ -40,7 +40,9 @@ fn test_versioned_artmap_basic_crud() {
     assert!(!map.contains_key("account:2"));
 
     // Remove
-    assert_eq!(map.remove("account:1"), Some("bal: 120".to_string()));
+    #[allow(deprecated)]
+    let removed = map.remove("account:1").map(|e| e.value().clone());
+    assert_eq!(removed, Some("bal: 120".to_string()));
     assert_eq!(map.get("account:1"), None);
     assert_eq!(map.len(), 0);
 }

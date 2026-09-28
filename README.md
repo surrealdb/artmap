@@ -14,22 +14,24 @@
     <a href="https://github.com/surrealdb/artmap"><img src="https://img.shields.io/badge/license-Apache_License_2.0-00bfff.svg?style=flat-square"></a>
 </p>
 
-`artmap` is a high-performance, concurrent in-memory associative map backed by an **Adaptive Radix Tree (ART)**, featuring **Optimistic Lock Coupling (OLC)**, **Epoch-Based Memory Reclamation (EBR)**, and arena-backed **32-bit offset variants** with $O(1)$ zero-cost reset.
+`artmap` is a concurrent, ordered, in-memory map backed by an **Adaptive Radix Tree (ART)**. It uses **optimistic lock coupling (OLC)**: readers never block and never write to shared memory, and writers latch only the nodes they change. Memory is reclaimed with **epoch-based reclamation (EBR)**, or, for the arena variants, all at once when the map is dropped.
 
-It provides four concurrent map variants:
-- **`artmap::ArtMap`**: An EBR-backed concurrent map with fine-grained per-node latching and deferred memory reclamation via `crossbeam-epoch`.
-- **`artmap::VersionedArtMap`**: An EBR-backed concurrent map with built-in 64-bit MVCC version chains and lock-free snapshot reads (`get_version_le`, `get_latest`), designed for transactional memory engines.
-- **`artmap::ArenaArtMap`**: An ultra-compact arena-backed concurrent map using 32-bit offsets and 24-byte unversioned leaves, featuring **0 per-insert heap allocations** and **$O(1)$ zero-cost arena reset/teardown**.
-- **`artmap::ArenaVersionedArtMap`**: An arena-backed concurrent map using 32-bit offsets with built-in **64-bit MVCC versioning** for transactional database memtables and LSM-tree engines.
+There are four map types:
+- **`artmap::ArtMap`**: a key-value map. Removed and replaced entries are reclaimed through `crossbeam-epoch`.
+- **`artmap::VersionedArtMap`**: a map with a chain of 64-bit MVCC versions per key, snapshot reads (`get_version_le`, `get_latest`), tombstones (`delete`) and pruning (`prune_key`, `prune_all`).
+- **`artmap::ArenaArtMap`**: a key-value map allocated from a fixed-size bump arena with 32-bit offsets. Inserts make no heap allocations, and nothing is freed until the map is dropped.
+- **`artmap::ArenaVersionedArtMap`**: the versioned map on an arena, designed for LSM memtables.
 
 ### Variant Selection Matrix
 
 | Memory Model | Unversioned (General Purpose) | Versioned / MVCC (Storage Engines) |
 | :--- | :--- | :--- |
-| **EBR / Dynamic Heap**<br><sup>(reclaimed via `crossbeam-epoch`)</sup> | **`artmap::ArtMap<K, V>`**<br>• Fine-grained optimistic lock coupling (OLC)<br>• Compact 24 B leaves<br>• Dynamic heap growth & node resizing | **`artmap::VersionedArtMap<K, V>`**<br>• Lock-free snapshot reads (`get_version_le`)<br>• Atomic version prepend chains<br>• **SurrealMX**: replaces `RwLock<Versions>` |
-| **Arena / 32-Bit Offsets**<br><sup>(contiguous arena, 0-alloc)</sup> | **`artmap::ArenaArtMap<K, V>`**<br>• Ultra-compact 24 B leaves, 32-bit child offsets<br>• 0 heap allocations per insert<br>• $O(1)$ zero-cost arena reset & teardown | **`artmap::ArenaVersionedArtMap<K, V>`**<br>• Compact 32-bit offset version chains<br>• 0-alloc sequential inserter cache<br>• **SurrealKV**: Zero-alloc memtable |
+| **EBR / Dynamic Heap**<br><sup>(reclaimed via `crossbeam-epoch`)</sup> | **`artmap::ArtMap<K, V>`**<br>• Optimistic lock coupling (OLC)<br>• Out-of-place replacement: handles stay valid<br>• Dynamic heap growth and node resizing | **`artmap::VersionedArtMap<K, V>`**<br>• Snapshot reads (`get_version_le`)<br>• Per-key chain latch for version writes<br>• Tombstones and pruning |
+| **Arena / 32-Bit Offsets**<br><sup>(fixed-size arena)</sup> | **`artmap::ArenaArtMap<K, V>`**<br>• Compact nodes with 32-bit child offsets<br>• 0 heap allocations per insert<br>• `try_insert` and `max_insert_bytes` for capacity planning | **`artmap::ArenaVersionedArtMap<K, V>`**<br>• 32-bit offset version chains<br>• Sequential inserter cache (`map.inserter()`)<br>• Memtable-oriented: no pruning, freed on drop |
 
 ## Performance
+
+> **These numbers were measured on 0.5.0.** The 0.6 rewrite fixes soundness bugs, and several operations are now slower: overwrites allocate a new leaf rather than updating one in place, version chains take a per-key latch, and the lock-free `Node256` insert path is gone. Re-measured on the same Threadripper, 0.6 against 0.5.0 in one session: point gets are within ±10%; 100-item range scans are 28–30% slower for the arena maps, 67% slower for `ArtMap` and about 3× slower for `VersionedArtMap`; 8-thread writes and mixed workloads are about 5% slower for `ArtMap` and 28–68% slower for the other three maps; heap inserts are 4–10% slower and arena inserts 5–25% faster. `VersionedArtMap` and `ArenaVersionedArtMap` use 20–36% more memory per key. The tables will be regenerated for the release.
 
 Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM**, Linux 6.8):
 
@@ -61,9 +63,9 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 | Data Structure | Concurrent&nbsp;Writes<br><sup>(8&nbsp;Threads,&nbsp;100k&nbsp;Ops)</sup> | Mixed&nbsp;Workload<br><sup>(4R&nbsp;+&nbsp;4W,&nbsp;100k&nbsp;Ops)</sup> | Concurrency&nbsp;Model |
 | :--- | ---: | ---: | :--- |
 | **`artmap::ArtMap`** | **3.85&nbsp;ms**<br><sup>(25.9M/s)</sup> | **2.82&nbsp;ms**<br><sup>(35.4M/s)</sup> | Non-Blocking Reads + OLC Node Latching |
-| **`artmap::VersionedArtMap`** | **4.18&nbsp;ms**<br><sup>(23.9M/s)</sup> | **3.33&nbsp;ms**<br><sup>(30.0M/s)</sup> | Non-Blocking Reads + OLC + Atomic Version Prepend |
-| **`artmap::ArenaArtMap`** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**3.34&nbsp;ms**<br><sup>(29.9M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**2.50&nbsp;ms**<br><sup>(39.9M/s)</sup> | Lock-Free CAS + 32-Bit Offsets + Direct Atomic Bump |
-| **`artmap::ArenaVersionedArtMap`** | **3.34&nbsp;ms**<br><sup>(29.9M/s)</sup> | **2.90&nbsp;ms**<br><sup>(34.4M/s)</sup> | Lock-Free CAS + 32-Bit Offsets + MVCC Prepend |
+| **`artmap::VersionedArtMap`** | **4.18&nbsp;ms**<br><sup>(23.9M/s)</sup> | **3.33&nbsp;ms**<br><sup>(30.0M/s)</sup> | Non-Blocking Reads + OLC + Per-Key Chain Latch |
+| **`artmap::ArenaArtMap`** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**3.34&nbsp;ms**<br><sup>(29.9M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**2.50&nbsp;ms**<br><sup>(39.9M/s)</sup> | OLC Node Latching + 32-Bit Offsets + Atomic Bump Allocation |
+| **`artmap::ArenaVersionedArtMap`** | **3.34&nbsp;ms**<br><sup>(29.9M/s)</sup> | **2.90&nbsp;ms**<br><sup>(34.4M/s)</sup> | OLC Node Latching + 32-Bit Offsets + Per-Key Chain Latch |
 | `arenaskiplist::SkipList` | 40.50&nbsp;ms<br><sup>(2.47M/s)</sup> | 28.28&nbsp;ms<br><sup>(3.54M/s)</sup> | Lock-Free Atomic CAS (Contiguous Arena) |
 | `concread::bptree::BPTree` | 8.63&nbsp;ms<br><sup>(11.6M/s)</sup> | 6.23&nbsp;ms<br><sup>(16.1M/s)</sup> | Lock-Free Reads + Single-Writer CoW (MVCC) |
 | `crossbeam_skiplist::SkipMap` | 10.31&nbsp;ms<br><sup>(9.70M/s)</sup> | 9.69&nbsp;ms<br><sup>(10.3M/s)</sup> | Lock-Free Atomic CAS |
@@ -83,8 +85,8 @@ Benchmarked with 100,000 keys (64-bit integer keys and 64-bit values), measuring
 | :--- | ---: | ---: | ---: | :--- |
 | **`artmap::ArtMap`** | **5.21&nbsp;MB**<br><sup>(52.1 B/item)</sup> | **5.21&nbsp;MB** | **1.0** | $O(N)$ epoch-deferred reclamation |
 | **`artmap::VersionedArtMap`** | **6.73&nbsp;MB**<br><sup>(67.3 B/item)</sup> | **6.73&nbsp;MB** | **1.0** | $O(N)$ epoch-deferred reclamation |
-| **`artmap::ArenaArtMap`** | **4.71&nbsp;MB**<br><sup>(47.1 B/item)</sup> | **8.00&nbsp;MB** | **0** | **$O(1)$ zero-cost reset** (`arena.reset()`) |
-| **`artmap::ArenaVersionedArtMap`** | **5.52&nbsp;MB**<br><sup>(55.2 B/item)</sup> | **10.00&nbsp;MB** | **0** | **$O(1)$ zero-cost reset** (`arena.reset()`) |
+| **`artmap::ArenaArtMap`** | **4.71&nbsp;MB**<br><sup>(47.1 B/item)</sup> | **8.00&nbsp;MB** | **0** | **$O(1)$** when `K` and `V` need no `Drop` |
+| **`artmap::ArenaVersionedArtMap`** | **5.52&nbsp;MB**<br><sup>(55.2 B/item)</sup> | **10.00&nbsp;MB** | **0** | **$O(1)$** when `K` and `V` need no `Drop` |
 | `arenaskiplist::SkipList` | 9.42&nbsp;MB<br><sup>(94.2 B/item)</sup> | 16.00&nbsp;MB | **0** | **$O(1)$ zero-cost reset** |
 | `concread::bptree::BPTree` | 6.37&nbsp;MB<br><sup>(63.7 B/item)</sup> | 6.87&nbsp;MB | ~7.5 | $O(N)$ CoW heap drop |
 | `crossbeam_skiplist::SkipMap` | 3.82&nbsp;MB<br><sup>(38.2 B/item)</sup> | 3.82&nbsp;MB | ~1.0 | $O(N)$ epoch-deferred reclamation |
@@ -98,25 +100,20 @@ Benchmarked with 100,000 keys (64-bit integer keys and 64-bit values), measuring
 
 <sup>* For sequential keys (e.g. monotonically increasing timestamps or auto-incrementing IDs), radix prefix compression reduces `ArenaArtMap`'s net size to **2.98 MB** (29.8 B/item) and `ArenaVersionedArtMap` to **3.79 MB** (37.9 B/item).</sup>
 
-- **High Concurrent Write Scaling**: Through lock-free atomic `Node256` CAS and direct atomic bump allocation, `ArenaArtMap` executes 100,000 multi-threaded writes in **3.34 ms** (29.9M ops/sec), outperforming `crossbeam-skiplist::SkipMap` by **3.09×** (10.31 ms) and `arenaskiplist` by **12.1×** (40.50 ms), while mixed read/write workloads achieve **2.50 ms** (39.9M ops/sec).
-- **12.5× Faster Point Reads**: Radix-based path resolution in `ArenaArtMap` completes random point lookups in **13.9 ns** (72.1M ops/sec), compared to **174.3 ns** for `arenaskiplist` and **144.7 ns** for `crossbeam-skiplist::SkipMap`.
-- **3.63× Faster Range Scans via Bitmapped Traversal**: Bitmapped child acceleration (`TZCNT` / 1-cycle bit-scans on `Node48` and `Node256`) and zero-copy cursors scan 100 contiguous items in **602 ns** (166.0M items/sec), compared to **791 ns** for `arenaskiplist` and **2.19 µs** for `crossbeam-skiplist::SkipMap`.
-- **Sequential Inserter Speedup**: When inserting ordered or localized keys, `ArenaInserter` achieves **25.2 ns/item** (39.7M/sec) with zero tree descent.
-- **Zero Heap Allocations & Instant Teardown**: `ArenaArtMap` guarantees **0 per-insert heap allocations** and instant **$O(1)$ arena teardown/recycling** via `arena.reset()`.
-- **Epoch-Based Memory Safety**: Replaced or unlinked nodes are retired safely via `crossbeam-epoch` without reference-counting overhead on read traversal.
+- **Point reads**: radix path resolution in `ArenaArtMap` completed random point lookups in **13.9 ns**, against **171.9 ns** for `arenaskiplist` and **144.7 ns** for `crossbeam-skiplist::SkipMap`.
+- **Range scans**: bitmapped child navigation on `Node48` and `Node256` scanned 100 contiguous items in **602 ns**, against **793 ns** for `arenaskiplist` and **2.19 µs** for `crossbeam-skiplist::SkipMap`.
+- **Sequential inserts**: `map.inserter()` caches the last insertion point, so ordered or localised keys skip most of the descent.
+- **No per-insert heap allocations** in the arena maps, and an $O(1)$ drop when `K` and `V` need no `Drop`.
 
 ## Features
 
-- **Adaptive Radix Tree Architecture**: Dynamically resizes inner nodes across 4 compact layouts (`Node4` $\leftrightarrow$ `Node16` $\leftrightarrow$ `Node48` $\leftrightarrow$ `Node256`) to maximize CPU L1/L2 cache locality.
-- **Arena-Backed Radix Tree (`ArenaArtMap`)**: Uses 32-bit offsets instead of 64-bit pointers, reducing inner node footprint by ~40% and enabling $O(1)$ zero-cost whole-arena teardown and instant recycling via `arena.reset()`.
-- **Multi-Version Concurrency Control (MVCC)**: Built-in 64-bit monotonic sequence numbers with atomic version prepend chains (`insert_versioned`, `get_version_le`) for lock-free snapshot reads in LSM engines.
-- **SIMD-Accelerated Lookups**: Vectorized child key comparisons on `Node16` using SSE2 on x86_64 and NEON on ARM64.
-- **Prefix Compression**: Collapses single-child paths into shared byte prefixes, dramatically reducing memory usage for structured database keys.
-- **Optimistic Lock Coupling (OLC / ROWEX)**: Readers validate version counters optimistically, operating with zero locks and zero atomic writes.
-- **Zero-Allocation Slice Queries**: Query entries directly with raw byte slices (`&[u8]`) or string slices (`&str`) without allocating wrapper objects.
-- **Bidirectional Range Iterators**: Full `DoubleEndedIterator` support for ordered forward and reverse scans (`map.range(A..B)` and `map.range(A..B).rev()`).
-- **Thread Safety Guaranteed**: Compile-time static assertions ensure `ArtMap`, `VersionedArtMap`, `ArenaArtMap`, and `ArenaVersionedArtMap` implement `Send + Sync`.
-- **Deterministic Simulation Tested (DST)**: Validated continuously by a seeded PRNG fuzzer against an in-memory `BTreeMap` reference oracle with comprehensive structural invariant checking.
+- **Adaptive Radix Tree**: inner nodes resize between four layouts (`Node4`, `Node16`, `Node48` and `Node256`) for cache locality. Prefix compression collapses single-child paths.
+- **Optimistic lock coupling**: readers validate per-node version counters and retry on conflict. They never block and never write to shared memory.
+- **MVCC**: per-key chains of 64-bit versions with snapshot reads, tombstones and pruning.
+- **SIMD `Node16` search**: SSE2 on x86_64 and NEON on aarch64.
+- **Slice lookups**: query with `&[u8]` or `&str` without building a key (`get_by_slice`, `contains_key_slice`).
+- **Double-ended iterators**: forward and reverse scans over any range (`map.range(a..b).rev()`).
+- **Thread safety**: every map is `Send + Sync` when `K` and `V` are `Send + Sync`. Compile-time assertions check this, and compile-fail tests check that handles and iterators are `!Send`.
 
 ## Quick Start
 
@@ -124,7 +121,7 @@ Add `artmap` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-artmap = "0.5"
+artmap = "0.6"
 ```
 
 ```rust
@@ -132,163 +129,226 @@ use artmap::ArtMap;
 use std::sync::Arc;
 use std::thread;
 
-fn main() {
-    let map = Arc::new(ArtMap::<String, i32>::new());
+let map = Arc::new(ArtMap::<String, i32>::new());
 
-    // Spawn concurrent writers
-    let handles: Vec<_> = (0..4).map(|t| {
+// Concurrent writers.
+let handles: Vec<_> = (0..4)
+    .map(|t| {
         let map = Arc::clone(&map);
         thread::spawn(move || {
             for i in 0..1000 {
                 map.insert(format!("users:{:04}", t * 1000 + i), i);
             }
         })
-    }).collect();
-
-    for h in handles {
-        h.join().unwrap();
-    }
-
-    assert_eq!(map.len(), 4000);
-
-    // Non-blocking point lookup
-    assert_eq!(map.get(&"users:0500".to_string()), Some(500));
-
-    // Zero-allocation lookup by raw byte slice
-    assert!(map.contains_key_slice(b"users:0500"));
-
-    // Range scanning
-    let start = "users:0100".to_string();
-    let end = "users:0200".to_string();
-    for (key, val) in map.range(&start..&end) {
-        println!("{}: {}", key, val);
-    }
+    })
+    .collect();
+for h in handles {
+    h.join().unwrap();
 }
+assert_eq!(map.len(), 4000);
+
+// A point lookup returns a handle that dereferences to the value.
+assert_eq!(map.get("users:0500").as_deref(), Some(&500));
+
+// Or copy the value out.
+assert_eq!(map.get_value("users:0500"), Some(500));
+
+// Lookup by raw bytes, without building a `String`.
+assert!(map.contains_key_slice(b"users:0500"));
+
+// Range scans, in key order.
+let mut n = 0;
+for entry in map.range("users:0100".."users:0200") {
+    assert!(entry.key().as_str() >= "users:0100");
+    n += 1;
+}
+assert_eq!(n, 100);
 ```
 
 ## Core Operations
 
-### Zero-Allocation Slice Lookups
+### Handles and guards
 
-Query the map using raw byte slices without allocating key objects:
+`get`, `insert`, `remove` and the iterators return handles (`EntryRef`) that borrow the map and keep an epoch guard alive, so the entry stays valid even if another thread removes or replaces it:
 
 ```rust
 use artmap::ArtMap;
 
-let map = ArtMap::<String, i32>::new();
-map.insert("tenant:100:profile".to_string(), 42);
+let map = ArtMap::<String, String>::new();
+map.insert("k".to_string(), "v1".to_string());
 
-// Check existence and retrieve without creating a String
-if map.contains_key_slice(b"tenant:100:profile") {
-    let value = map.get_by_slice(b"tenant:100:profile");
-    assert_eq!(value, Some(42));
-}
+let old = map.get("k").unwrap();
+// `insert` returns the displaced entry, if there was one.
+let displaced = map.insert("k".to_string(), "v2".to_string()).unwrap();
+assert_eq!(displaced.value(), "v1");
+
+// The old handle still reads its own snapshot, and knows it was replaced.
+assert_eq!(old.value(), "v1");
+assert!(old.is_removed());
+assert_eq!(map.get("k").unwrap().value(), "v2");
 ```
 
-### Concurrent Write & Read Access
+To amortise pinning over many operations, pin once and use the `*_with_guard` methods:
 
-Readers and writers execute concurrently without blocking one another:
+```rust
+use artmap::ArtMap;
+
+// Big-endian bytes keep integer keys in numeric order.
+let map = ArtMap::<[u8; 8], u64>::new();
+for i in 0..100u64 {
+    map.insert(i.to_be_bytes(), i * 2);
+}
+
+let guard = map.pin();
+let mut sum = 0;
+for i in 0..100u64 {
+    if let Some(v) = map.get_with_guard(&i.to_be_bytes(), &guard) {
+        sum += *v;
+    }
+}
+assert_eq!(sum, 9900);
+```
+
+**Holding a handle, iterator or guard stalls memory reclamation process-wide**, for every user of the default `crossbeam-epoch` collector, so do not hold one across I/O. Handles are `!Send`. Across an `.await`, use `get_value`, `with_value`, `EntryRef::to_owned` or `EntryRef::value_cloned`.
+
+### Concurrent reads and writes
 
 ```rust
 use artmap::ArtMap;
 use std::sync::Arc;
 
 let map = Arc::new(ArtMap::<String, i32>::new());
-map.insert("key:1".into(), 100);
+map.insert("key:1".to_string(), 100);
 
 let reader_map = Arc::clone(&map);
 let writer_map = Arc::clone(&map);
 
-// Readers proceed optimistically without locks
-let reader = std::thread::spawn(move || {
-    reader_map.get(&"key:1".to_string())
-});
-
-// Writers lock only the affected node
+// Readers never block.
+let reader = std::thread::spawn(move || reader_map.get_value("key:1"));
+// Writers latch only the nodes they change.
 let writer = std::thread::spawn(move || {
-    writer_map.insert("key:2".into(), 200);
+    writer_map.insert("key:2".to_string(), 200);
 });
 
 assert_eq!(reader.join().unwrap(), Some(100));
 writer.join().unwrap();
+assert_eq!(map.len(), 2);
 ```
 
-### Bidirectional Range Scanning
-
-Iterators traverse keys in sorted lexicographical order:
+### Bidirectional range scans
 
 ```rust
-let start = "prefix:001".to_string();
-let end = "prefix:100".to_string();
+use artmap::ArtMap;
 
-// Forward iteration
-for (k, v) in map.range(&start..&end) {
-    // ...
+let map = ArtMap::<String, u32>::new();
+for i in 0..200u32 {
+    map.insert(format!("prefix:{i:03}"), i);
 }
 
-// Reverse iteration
-for (k, v) in map.range(&start..&end).rev() {
-    // ...
-}
+let forward: Vec<u32> = map.range("prefix:001".."prefix:100").map(|e| *e).collect();
+assert_eq!(forward.len(), 99);
+assert_eq!(forward.first(), Some(&1));
+
+let reverse: Vec<u32> = map.range("prefix:001".."prefix:100").rev().map(|e| *e).collect();
+assert_eq!(reverse.first(), Some(&99));
 ```
 
-### Arena-Backed ART (`ArenaArtMap` & `ArenaVersionedArtMap`)
+Iterators guarantee that every key present for the whole scan is yielded exactly once, in order. Keys inserted or removed during the scan may or may not appear.
 
-For transactional storage engines, database memtables, or workloads requiring instant $O(1)$ teardown without per-node garbage collection:
+### Versioned maps
 
 ```rust
-use artmap::arena::{ArenaArtMap, ArenaVersionedArtMap};
+use artmap::VersionedArtMap;
 
-// Compact unversioned map: 0 heap allocations, 24-byte leaves
+let map = VersionedArtMap::<String, u64>::new();
+map.insert("account:1001".to_string(), 1, 500);
+map.insert("account:1001".to_string(), 2, 750);
+
+// Snapshot reads.
+assert_eq!(map.get_version_le("account:1001", 1), Some((1, 500)));
+assert_eq!(map.get_version_le("account:1001", 2), Some((2, 750)));
+
+// A tombstone at version 3 hides the key from newer snapshots only.
+map.delete("account:1001".to_string(), 3);
+assert_eq!(map.get("account:1001"), None);
+assert_eq!(map.get_version_le("account:1001", 2), Some((2, 750)));
+
+// Drop versions that no snapshot at or above 3 can see.
+map.prune_key("account:1001", 3, |_| false);
+assert_eq!(map.version_count("account:1001"), 1);
+```
+
+### Arena maps
+
+The arena maps allocate every node, leaf and version from one fixed-size arena:
+
+```rust
+use artmap::{ArenaArtMap, ArenaVersionedArtMap};
+
 let map = ArenaArtMap::<String, i32>::with_capacity(16 * 1024 * 1024);
 map.insert("account:1001".to_string(), 500);
 assert_eq!(map.get("account:1001"), Some(500));
 
-// Multi-version (MVCC) map: built-in 64-bit sequence numbers & snapshot reads
-let vmap = ArenaVersionedArtMap::<String, i32>::with_capacity(16 * 1024 * 1024);
-vmap.insert_versioned("account:1001".to_string(), 1, 500);
-vmap.insert_versioned("account:1001".to_string(), 2, 750);
+// `try_insert` returns the key and value instead of panicking when full.
+let tiny = ArenaArtMap::<String, i32>::with_capacity(64);
+let full = tiny.try_insert("k".to_string(), 1).unwrap_err();
+assert_eq!((full.key.as_str(), full.value), ("k", 1));
 
-// Point read with version <= 1 returns 500
+// The worst-case arena bytes one insert can consume, for capacity planning.
+assert!(ArenaArtMap::<String, i32>::max_insert_bytes(16) > 0);
+
+let vmap = ArenaVersionedArtMap::<String, i32>::with_capacity(16 * 1024 * 1024);
+vmap.insert("account:1001".to_string(), 1, 500);
+vmap.insert("account:1001".to_string(), 2, 750);
 assert_eq!(vmap.get_version_le("account:1001", 1), Some((1, 500)));
 
-// Point read with version <= 2 returns 750
-assert_eq!(vmap.get_version_le("account:1001", 2), Some((2, 750)));
-
-// Bidirectional range scan with entry metadata
 for entry in vmap.range("account:1000".."account:2000") {
-    println!("{}: {} (v{})", entry.key(), entry.value(), entry.version());
+    assert_eq!((entry.version(), *entry.value()), (2, 750));
+    // Every version of the key, newest first.
+    let all: Vec<_> = entry.versions().map(|v| (v.version, v.value.copied())).collect();
+    assert_eq!(all, vec![(2, Some(750)), (1, Some(500))]);
 }
+
+// Ordered bulk loads go faster through an inserter.
+let mut ins = map.inserter();
+for i in 0..1000 {
+    ins.insert(format!("seq:{i:05}"), i);
+}
+assert_eq!(map.len(), 1001);
 ```
 
-## Deterministic Simulation Testing (DST)
+The arena's capacity is fixed. Updates and removes do not free arena memory: replaced leaves and versions stay in the arena until the map is dropped. When `K` and `V` need `Drop`, dropping the map runs their destructors; otherwise it is $O(1)$. `Arena::reset` needs exclusive access, so it can only run once no map is using the arena.
 
-`artmap` includes a deterministic simulation testing harness inspired by FoundationDB, TigerBeetle, and `vart`:
+## Memory retention
 
-- **Seeded PRNG**: Every simulation run is parameterized by a 64-bit seed (`ARTMAP_SIM_SEED=<seed>`) to reproduce any failure down to the byte.
-- **Reference Oracle**: Runs state transitions in lockstep against a canonical `BTreeMap` reference oracle.
-- **Continuous Invariant Checking**: Validates prefix compression, node capacity boundaries, child bitmaps, and latch states after every simulated step via `map.validate_invariants()`.
+Removed and replaced **entries** are reclaimed: once no guard can still see them in the EBR maps, or when the map is dropped in the arena maps. **Inner nodes are not yet reclaimed on delete.** A node emptied by removes stays in the tree until `clear()` or drop, so a workload that keeps deleting and inserting keys under ever-new prefixes grows. Delete-side compaction is planned for a release after 0.6.
 
-To run the simulation suite:
+## Verification
+
+- **Miri**, under Tree Borrows: the EBR suites, and the arena suites leak-checked with strict provenance and symbolic alignment checks, on x86_64 and aarch64.
+- **loom** models of the real latch and node protocol, with mutants that must fail: a missing writer fence, a missing validation fence, and missing lock coupling.
+- **ThreadSanitizer and AddressSanitizer** over the race and stress tests.
+- **Model tests** of every map and iterator against `BTreeMap`. Property tests over arbitrary byte keys, and a linearizability checker for point operations and `clear`.
+- **Fault injection**: panicking `AsBytes`, `Clone` and closures, and re-entrant user code, at every call site.
+- **Compile-fail tests** for handle lifetimes, variance, auto traits and the sealed internals.
+- **Seeded sequential oracle fuzzing** (`tests/sim.rs` and `tests/versioned_simulation_tests.rs`). Each run is reproducible with `ARTMAP_SIM_SEED`. This is not deterministic simulation of concurrent schedules: concurrency is covered by loom, the sanitizers and the stress tests.
 
 ```bash
-# Run with a random seed
-cargo test --test sim -- --nocapture
-
-# Run with an exact reproducible seed
 ARTMAP_SIM_SEED=20202 cargo test --test sim -- --nocapture
 ```
 
 ## Benchmarks
 
-Benchmarks compare the four `artmap` data structures (`ArtMap`, `VersionedArtMap`, `ArenaArtMap`, and `ArenaVersionedArtMap`) against `arenaskiplist::SkipList`, `crossbeam-skiplist::SkipMap`, `std::collections::BTreeMap`, `imbl::OrdMap`, and `std::collections::HashMap`:
-
 ```bash
-# Run comparison benchmarks locally
+# Comparison against other ordered and unordered maps
 cargo bench --bench comparison_bench
 
-# Run allocation and memory benchmarks locally
+# Allocation and memory footprint
 cargo bench --bench alloc_comparison
+
+# Safety-plan benchmarks: guards, overwrites, churn, scans, versioned updates
+cargo bench --bench safety_bench
+cargo bench --bench memory_bench
 
 # Run on remote dedicated hardware (AMD Threadripper)
 ./scripts/bench-remote.sh --all

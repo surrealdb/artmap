@@ -12,96 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! # The arena-backed map
+
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
+
 use std::borrow::Borrow;
+use std::marker::PhantomData;
+use std::mem::{align_of, size_of};
 use std::ops::{Bound, RangeBounds};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::arena::iter::Range;
-use crate::arena::tree::ArenaTree;
-use crate::arena::Arena;
+use crate::arena::iter::{ArenaEntryRef, Range};
+use crate::arena::node::Leaf;
+use crate::arena::tree::{ArenaTree, InserterCache};
+use crate::arena::{Arena, ArenaFull};
 use crate::key::AsBytes;
+use crate::raw::cursor::owned_bound;
+use crate::raw::node::{Node16, Node256, Node4, Node48, MAX_PREFIX_LEN};
+use crate::sync::atomic::AtomicU32;
 
-/// An inserter cache optimizing sequential and localized inserts in [`ArenaArtMap`].
+/// A concurrent ordered map allocated from an [`Arena`].
 ///
-/// By caching the parent inner node and depth from the previous insertion, subsequent
-/// keys that share the same parent node skip top-down tree traversal and insert directly
-/// in $O(1)$.
-#[derive(Clone, Copy, Debug)]
-pub struct ArenaInserter {
-    pub(crate) last_parent_offset: u32,
-    pub(crate) last_parent_version: u64,
-    pub(crate) last_depth: usize,
-    pub(crate) last_prefix: [u8; 16],
-    pub(crate) last_prefix_len: usize,
-}
-
-impl Default for ArenaInserter {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ArenaInserter {
-    /// Creates a new `ArenaInserter`.
-    pub const fn new() -> Self {
-        Self {
-            last_parent_offset: 0,
-            last_parent_version: 0,
-            last_depth: 0,
-            last_prefix: [0; 16],
-            last_prefix_len: 0,
-        }
-    }
-
-    /// Resets the cached insertion location.
-    pub fn reset(&mut self) {
-        self.last_parent_offset = 0;
-        self.last_parent_version = 0;
-        self.last_depth = 0;
-        self.last_prefix_len = 0;
-    }
-
-    #[inline]
-    pub fn matches(&self, key_bytes: &[u8]) -> bool {
-        if self.last_parent_offset == 0
-            || self.last_depth == 0
-            || key_bytes.len() <= self.last_depth
-        {
-            return false;
-        }
-        if self.last_depth <= 16 {
-            key_bytes[..self.last_depth] == self.last_prefix[..self.last_depth]
-        } else {
-            false
-        }
-    }
-
-    #[inline]
-    pub fn update(&mut self, offset: u32, version: u64, depth: usize, key_bytes: &[u8]) {
-        self.last_parent_offset = offset;
-        self.last_parent_version = version;
-        self.last_depth = depth;
-        if depth <= 16 {
-            self.last_prefix[..depth].copy_from_slice(&key_bytes[..depth]);
-            self.last_prefix_len = depth;
-        } else {
-            self.last_prefix_len = 0;
-        }
-    }
-}
-
-/// A concurrent associative map backed by an arena-allocated Adaptive Radix Tree.
-///
-/// Uses 32-bit offsets for child pointers instead of 64-bit pointers, reducing inner node
-/// memory consumption by ~40% and enabling $O(1)$ whole-arena teardown when dropped.
-pub struct ArenaArtMap<K: AsBytes + Clone, V: Clone> {
+/// Nodes use 32-bit offsets, so inner nodes are small. Nothing is freed
+/// while the map is alive: removed and replaced entries stay readable through
+/// their handles, and every update consumes arena capacity. See the
+/// [module docs](crate::arena) for the ownership and capacity contracts.
+pub struct ArenaArtMap<K, V> {
     tree: ArenaTree<K, V>,
 }
 
-impl<K: AsBytes + Clone, V: Clone> ArenaArtMap<K, V> {
-    /// Creates a new `ArenaArtMap` backed by the specified [`Arena`].
+impl<K, V> ArenaArtMap<K, V> {
+    /// Creates a map in `arena`.
     #[inline]
     pub fn new(arena: Arc<Arena>) -> Self {
         Self {
@@ -109,155 +50,248 @@ impl<K: AsBytes + Clone, V: Clone> ArenaArtMap<K, V> {
         }
     }
 
-    /// Creates an `ArenaArtMap` with a dedicated new arena of the given capacity.
+    /// Creates a map in a new arena of `capacity` bytes.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        let arena = Arena::with_capacity(capacity);
-        Self {
-            tree: ArenaTree::with_capacity(arena, capacity),
-        }
+        Self::new(Arena::with_capacity(capacity))
     }
 
-    /// Returns a reference to the underlying [`Arena`].
+    /// The map's arena.
     #[inline]
     pub fn arena(&self) -> &Arc<Arena> {
         self.tree.arena()
     }
 
-    /// Returns the number of entries in the map.
+    /// The number of entries.
     #[inline]
     pub fn len(&self) -> usize {
         self.tree.len()
     }
 
-    /// Returns `true` if the map contains no entries.
+    /// `true` if the map has no entries.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.tree.is_empty()
+        self.len() == 0
     }
 
-    pub fn debug_lookup(&self, key_bytes: &[u8]) {
-        self.tree.debug_lookup(key_bytes);
+    /// An upper bound on the arena bytes one insert of a key of `key_len`
+    /// bytes can consume, whatever the tree's shape and however many times the
+    /// insert retries: a leaf, the worst prefix chain for the key, a split
+    /// node, one node of each larger size, and alignment padding.
+    pub const fn max_insert_bytes(key_len: usize) -> usize {
+        let leaf = pad(size_of::<Leaf<K, V>>(), align_of::<Leaf<K, V>>());
+        let node4s = key_len / (MAX_PREFIX_LEN + 1) + 2;
+        leaf + node4s * pad(size_of::<Node4<AtomicU32>>(), 8)
+            + pad(size_of::<Node16<AtomicU32>>(), 8)
+            + pad(size_of::<Node48<AtomicU32>>(), 8)
+            + pad(size_of::<Node256<AtomicU32>>(), 8)
     }
+}
 
-    /// Returns a reference to the value corresponding to the key, if present.
+/// An allocation of `size` bytes with `align` alignment, worst case.
+pub(crate) const fn pad(size: usize, align: usize) -> usize {
+    size + align - 1
+}
+
+impl<K: AsBytes, V> ArenaArtMap<K, V> {
+    /// A clone of the value for `key`.
     #[inline]
     pub fn get<Q>(&self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
+        V: Clone,
     {
-        let leaf_ptr = self.tree.get_leaf(key.as_bytes())?;
-        let leaf = unsafe { &*leaf_ptr };
-        if leaf.removed.load(Ordering::Acquire) {
-            return None;
-        }
-        Some(leaf.value.clone())
+        self.get_entry(key).map(|e| e.value().clone())
     }
 
-    /// Point lookup on raw byte slice.
+    /// A clone of the value for a raw byte key.
     #[inline]
-    pub fn get_slice(&self, key_bytes: &[u8]) -> Option<V> {
-        let leaf_ptr = self.tree.get_leaf(key_bytes)?;
-        let leaf = unsafe { &*leaf_ptr };
-        if leaf.removed.load(Ordering::Acquire) {
-            return None;
-        }
-        Some(leaf.value.clone())
+    pub fn get_slice(&self, key: &[u8]) -> Option<V>
+    where
+        V: Clone,
+    {
+        let leaf = self.tree.raw.get(key)?;
+        // SAFETY: a leaf of this map's tree, valid for `&self`.
+        Some(unsafe { ArenaEntryRef::new(leaf) }.value().clone())
     }
 
-    /// Checks if the key is present in the map.
+    /// A handle on the entry for `key`, without cloning.
+    #[inline]
+    pub fn get_entry<Q>(&self, key: &Q) -> Option<ArenaEntryRef<'_, K, V>>
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        let leaf = self.tree.raw.get(key.as_bytes())?;
+        // SAFETY: a leaf of this map's tree, valid for `&self`.
+        Some(unsafe { ArenaEntryRef::new(leaf) })
+    }
+
+    /// `true` if the map has an entry for `key`.
     #[inline]
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
     {
-        self.get(key).is_some()
+        self.tree.raw.get(key.as_bytes()).is_some()
     }
 
-    /// Inserts a key-value pair into the map. Returns the old value if replaced.
+    /// Inserts or replaces, returning the displaced entry.
+    ///
+    /// # Panics
+    /// If the insert does not fit in the arena. The panic happens after every
+    /// latch is released and the map is unchanged. Use
+    /// [`try_insert`](Self::try_insert) to handle a full arena.
     #[inline]
-    pub fn insert(&self, key: K, value: V) -> Option<V> {
-        self.tree.insert(key, value)
+    pub fn insert(&self, key: K, value: V) -> Option<ArenaEntryRef<'_, K, V>> {
+        match self.try_insert(key, value) {
+            Ok(old) => old,
+            Err(full) => panic!("{full}"),
+        }
     }
 
-    /// Inserts a key-value pair using an [`ArenaInserter`] cache to accelerate sequential or localized writes.
+    /// Inserts or replaces, returning the displaced entry, or the key and
+    /// value back if the insert does not fit.
+    ///
+    /// ```
+    /// let map = artmap::ArenaArtMap::<String, u32>::with_capacity(1 << 16);
+    /// assert!(map.try_insert("a".to_string(), 1).unwrap().is_none());
+    /// let tiny = artmap::ArenaArtMap::<String, u32>::with_capacity(64);
+    /// let full = tiny.try_insert("a".to_string(), 1).unwrap_err();
+    /// assert_eq!((full.key, full.value), ("a".to_string(), 1));
+    /// ```
     #[inline]
-    pub fn insert_with_inserter(
+    pub fn try_insert(
         &self,
         key: K,
         value: V,
-        inserter: &mut ArenaInserter,
-    ) -> Option<V> {
-        self.tree.insert_with_inserter(key, value, inserter)
+    ) -> Result<Option<ArenaEntryRef<'_, K, V>>, ArenaFull<K, V>> {
+        let old = self.tree.insert(key, value, None)?;
+        // SAFETY: the displaced leaf stays valid for the map's life.
+        Ok(old.map(|l| unsafe { ArenaEntryRef::new(l) }))
     }
 
-    /// Removes a key from the map, returning the removed value if present.
+    /// Removes the entry for `key`, returning it. The entry stays readable
+    /// through the handle for the map borrow.
     #[inline]
-    pub fn remove<Q>(&self, key: &Q) -> Option<V>
+    pub fn remove<Q>(&self, key: &Q) -> Option<ArenaEntryRef<'_, K, V>>
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
     {
-        let leaf_ptr = self.tree.get_leaf(key.as_bytes())?;
-        let leaf = unsafe { &*leaf_ptr };
-        if leaf.removed.swap(true, Ordering::AcqRel) {
-            None
-        } else {
-            self.tree.len.fetch_sub(1, Ordering::Relaxed);
-            Some(leaf.value.clone())
+        let leaf = self.tree.remove(key.as_bytes())?;
+        // SAFETY: the removed leaf stays valid for the map's life.
+        Some(unsafe { ArenaEntryRef::new(leaf) })
+    }
+
+    /// An inserter for this map, which caches the last insertion point so
+    /// that sequential or clustered keys skip the descent from the root.
+    ///
+    /// ```
+    /// let map = artmap::ArenaArtMap::<String, u32>::with_capacity(1 << 20);
+    /// let mut ins = map.inserter();
+    /// for i in 0..100 {
+    ///     ins.insert(format!("seq:{i:03}"), i);
+    /// }
+    /// assert_eq!(map.len(), 100);
+    /// assert_eq!(map.get("seq:042"), Some(42));
+    /// ```
+    #[inline]
+    pub fn inserter(&self) -> ArenaInserter<'_, K, V> {
+        ArenaInserter {
+            tree: &self.tree,
+            cache: InserterCache::new(),
+            _not_send: PhantomData,
         }
     }
 
-    /// Returns an iterator over a sub-range of entries.
+    /// An iterator over the entries in `range`, in key order.
     pub fn range<R, Q>(&self, range: R) -> Range<'_, K, V>
     where
         R: RangeBounds<Q>,
         Q: AsBytes + ?Sized,
     {
-        let start = match range.start_bound() {
-            Bound::Included(b) => Bound::Included(b.as_bytes().to_vec()),
-            Bound::Excluded(b) => Bound::Excluded(b.as_bytes().to_vec()),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-        let end = match range.end_bound() {
-            Bound::Included(b) => Bound::Included(b.as_bytes().to_vec()),
-            Bound::Excluded(b) => Bound::Excluded(b.as_bytes().to_vec()),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-
-        Range::new(&self.tree, start, end)
+        Range::new(
+            &self.tree,
+            owned_bound(range.start_bound()),
+            owned_bound(range.end_bound()),
+        )
     }
 
-    /// Returns an iterator visiting all entries in ascending key order.
+    /// An iterator over every entry, in key order.
     pub fn iter(&self) -> Range<'_, K, V> {
-        self.range::<std::ops::RangeFull, [u8]>(..)
+        Range::new(&self.tree, Bound::Unbounded, Bound::Unbounded)
     }
 
-    /// Scans entries in the given key range, invoking `callback` for each entry.
-    ///
-    /// If `callback` returns `false`, scanning terminates early.
+    /// Calls `callback(key, value)` for each entry in `range`, until it
+    /// returns `false`.
     pub fn scan<R, Q, F>(&self, range: R, mut callback: F)
     where
         R: RangeBounds<Q>,
         Q: AsBytes + ?Sized,
         F: FnMut(&K, &V) -> bool,
     {
-        for entry in self.range(range) {
-            if !callback(entry.key(), entry.value()) {
+        for e in self.range(range) {
+            if !callback(e.key(), e.value()) {
                 break;
             }
         }
     }
+
+    /// Checks the structural invariants; panics on a violation.
+    pub fn validate_invariants(&mut self) {
+        self.tree.raw.validate();
+    }
 }
 
-impl<'a, K: AsBytes + Clone, V: Clone> IntoIterator for &'a ArenaArtMap<K, V> {
-    type Item = crate::arena::iter::ArenaEntryRef<'a, K, V>;
+impl<'a, K: AsBytes, V> IntoIterator for &'a ArenaArtMap<K, V> {
+    type Item = ArenaEntryRef<'a, K, V>;
     type IntoIter = Range<'a, K, V>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+/// A map-bound inserter for an [`ArenaArtMap`], created by
+/// [`ArenaArtMap::inserter`].
+///
+/// It caches the node the last insert landed in, with the version its own
+/// unlock produced, and inserts there directly when the next key falls under
+/// it and the node is unchanged; otherwise it takes the normal path. Neither
+/// `Send` nor `Sync`.
+pub struct ArenaInserter<'m, K, V> {
+    tree: &'m ArenaTree<K, V>,
+    cache: InserterCache,
+    /// `&ArenaTree` alone would make the inserter `Send`/`Sync`.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<'m, K: AsBytes, V> ArenaInserter<'m, K, V> {
+    /// As [`ArenaArtMap::insert`].
+    ///
+    /// # Panics
+    /// If the insert does not fit in the arena.
+    #[inline]
+    pub fn insert(&mut self, key: K, value: V) -> Option<ArenaEntryRef<'m, K, V>> {
+        match self.try_insert(key, value) {
+            Ok(old) => old,
+            Err(full) => panic!("{full}"),
+        }
+    }
+
+    /// As [`ArenaArtMap::try_insert`].
+    #[inline]
+    pub fn try_insert(
+        &mut self,
+        key: K,
+        value: V,
+    ) -> Result<Option<ArenaEntryRef<'m, K, V>>, ArenaFull<K, V>> {
+        let old = self.tree.insert(key, value, Some(&mut self.cache))?;
+        // SAFETY: the displaced leaf stays valid for the map's life.
+        Ok(old.map(|l| unsafe { ArenaEntryRef::new(l) }))
     }
 }

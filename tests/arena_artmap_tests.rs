@@ -1,6 +1,10 @@
-use artmap::arena::{Arena, ArenaArtMap, ArenaInserter, ArenaVersionedArtMap};
+use artmap::arena::{Arena, ArenaArtMap, ArenaVersionedArtMap};
 use std::sync::{Arc, Barrier};
 use std::thread;
+
+/// Loop sizes, scaled down under Miri.
+const SEQ: usize = if cfg!(miri) { 100 } else { 5000 };
+const BIG: usize = if cfg!(miri) { 200 } else { 10_000 };
 
 #[test]
 fn test_arena_artmap_basic_crud() {
@@ -23,12 +27,12 @@ fn test_arena_artmap_basic_crud() {
     assert!(!map.contains_key("durian"));
 
     // Update existing key
-    assert_eq!(map.insert("apple".to_string(), 999), Some(100));
+    assert_eq!(map.insert("apple".to_string(), 999).map(|e| *e), Some(100));
     assert_eq!(map.get("apple"), Some(999));
     assert_eq!(map.len(), 3);
 
     // Remove
-    assert_eq!(map.remove("banana"), Some(200));
+    assert_eq!(map.remove("banana").map(|e| *e), Some(200));
     assert_eq!(map.get("banana"), None);
     assert_eq!(map.len(), 2);
 }
@@ -157,8 +161,8 @@ fn test_arena_artmap_concurrent_writes() {
     let arena = Arena::with_capacity(32 * 1024 * 1024);
     let map = Arc::new(ArenaArtMap::<[u8; 8], u64>::new(arena));
 
-    const NUM_THREADS: usize = 8;
-    const PER_THREAD: usize = 5000;
+    const NUM_THREADS: usize = if cfg!(miri) { 2 } else { 8 };
+    const PER_THREAD: usize = if cfg!(miri) { 50 } else { 5000 };
     let barrier = Arc::new(Barrier::new(NUM_THREADS));
 
     let mut handles = Vec::new();
@@ -186,11 +190,12 @@ fn test_arena_artmap_concurrent_writes() {
         let start = t as u64 * PER_THREAD as u64;
         for i in 0..PER_THREAD as u64 {
             let k = (start + i).to_be_bytes();
-            if map.get(&k) != Some(start + i) {
-                println!("MISSING KEY: {} (hex: {:02x?})", start + i, k);
-                map.debug_lookup(&k);
-                panic!("Key missing!");
-            }
+            assert_eq!(
+                map.get(&k),
+                Some(start + i),
+                "key {} ({k:02x?}) missing",
+                start + i
+            );
         }
     }
 }
@@ -247,9 +252,8 @@ fn test_arena_artmap_reset() {
         drop(map);
 
         // Drop map to reclaim unique Arc ownership
-        arena = Arc::try_unwrap(arena_arc)
-            .ok()
-            .expect("exclusive arena Arc ownership");
+        arena =
+            Arc::try_unwrap(arena_arc).unwrap_or_else(|_| panic!("exclusive arena Arc ownership"));
     }
 
     // Reset arena in O(1)
@@ -268,24 +272,24 @@ fn test_arena_artmap_reset() {
 #[test]
 fn test_arena_artmap_inserter() {
     let map = ArenaArtMap::<String, usize>::with_capacity(16 * 1024 * 1024);
-    let mut inserter = ArenaInserter::new();
+    let mut inserter = map.inserter();
 
     // Insert 5000 sequential items with inserter
-    for i in 0..5000 {
-        map.insert_with_inserter(format!("seq:{i:05}"), i, &mut inserter);
+    for i in 0..SEQ {
+        inserter.insert(format!("seq:{i:05}"), i);
     }
-    assert_eq!(map.len(), 5000);
+    assert_eq!(map.len(), SEQ);
 
-    for i in 0..5000 {
+    for i in 0..SEQ {
         assert_eq!(map.get(&format!("seq:{i:05}")), Some(i));
     }
 
-    // Interleaved inserts with inserter
-    inserter.reset();
-    for i in 5000..6000 {
-        map.insert_with_inserter(format!("interleaved:{i:05}"), i * 2, &mut inserter);
+    // Interleaved inserts with a fresh inserter
+    let mut inserter = map.inserter();
+    for i in SEQ..SEQ + SEQ / 5 {
+        inserter.insert(format!("interleaved:{i:05}"), i * 2);
     }
-    assert_eq!(map.len(), 6000);
+    assert_eq!(map.len(), SEQ + SEQ / 5);
 }
 
 #[test]
@@ -364,7 +368,9 @@ fn test_arena_versioned_artmap_range_and_crud() {
     assert_eq!(items[2], ("k3".to_string(), 30, 1));
 
     // Remove
-    assert_eq!(map.remove("k2"), Some(25));
+    #[allow(deprecated)]
+    let removed = map.remove("k2").map(|e| *e);
+    assert_eq!(removed, Some(25));
     assert_eq!(map.get("k2"), None);
     assert_eq!(map.get_latest("k2"), None);
     assert_eq!(map.len(), 2);
@@ -373,11 +379,11 @@ fn test_arena_versioned_artmap_range_and_crud() {
 #[test]
 fn test_arena_versioned_artmap_10k_iteration() {
     let map = ArenaVersionedArtMap::<String, usize>::with_capacity(32 * 1024 * 1024);
-    for i in 0..10_000 {
+    for i in 0..BIG {
         let k = format!("key_{i:08}");
         assert!(map.insert_versioned(k, 1, i));
     }
-    assert_eq!(map.len(), 10_000);
+    assert_eq!(map.len(), BIG);
     let count = map.iter().count();
-    assert_eq!(count, 10_000);
+    assert_eq!(count, BIG);
 }

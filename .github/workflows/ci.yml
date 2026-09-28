@@ -5,6 +5,8 @@ permissions:
 
 on:
   workflow_dispatch:
+  # Called by the release workflow for the tagged commit (publish-gate).
+  workflow_call:
   push:
     branches: [ main, next ]
   pull_request:
@@ -135,8 +137,11 @@ jobs:
       - name: Build
         run: cargo build --target aarch64-linux-android
 
-  dst:
-    name: Deterministic Simulation (DST)
+  oracle-fuzz:
+    # Seeded sequential oracle fuzzing: map and oracle operations run under
+    # one lock, so this checks results, not concurrency (see
+    # tests/concurrent_correctness.rs and the loom models for that).
+    name: Seeded oracle fuzzing
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -148,7 +153,7 @@ jobs:
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Run DST simulation (Multi-seed)
+      - name: Run oracle fuzzing (multi-seed)
         run: |
           for seed in 1001 2002 3003 4004 5005; do
             echo "==> Running DST with seed ${seed}..."
@@ -228,7 +233,9 @@ jobs:
         run: cargo bench --no-run
 
   loom:
-    name: Loom Concurrency Check
+    # Models of the real latch, node and tree code (src/loom_tests.rs), with
+    # mutant self-checks that must be caught (§16.3).
+    name: Loom
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -239,29 +246,268 @@ jobs:
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run loom models
+        run: 'RUSTFLAGS="--cfg loom" cargo test --lib --release loom_tests::'
+
+  miri-tb:
+    # EBR suites under Tree Borrows; the default collector never frees its
+    # Locals, hence -Zmiri-ignore-leaks (§16.1).
+    name: Miri (Tree Borrows, ${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # aarch64 covers the NEON Node16 path.
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install nightly Rust with Miri
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # master
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next' }}
+          toolchain: nightly-2026-09-23
+          components: miri
 
-      - name: Run Loom model checks
-        run: RUSTFLAGS="--cfg loom" cargo test --test loom_tests --release -- --nocapture
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-  miri:
-    name: Miri Undefined Behavior Check
+      - name: Run Miri on the EBR suites
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-ignore-leaks -Zmiri-many-seeds=0..4
+        run: >
+          cargo miri test --target ${{ matrix.target }} --lib
+          --test concurrent_correctness --test model --test unwind
+          --test regressions --test drop_accounting --test panicking_drop
+          --test linearizability --test proptest_keys
+          --test sim --test versioned_simulation_tests --test versioned_artmap_tests
+
+      - name: Run Miri on the doctests
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-ignore-leaks
+        run: cargo miri test --target ${{ matrix.target }} --doc
+
+  miri-arena:
+    # The arena suites never pin, so they run leak-checked, with strict
+    # provenance and symbolic alignment, over several seeds (§16.1).
+    name: Miri (arena, leak-checked)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Install Nightly Rust with Miri
+      - name: Install nightly Rust with Miri
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-09-23
           components: miri
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next' }}
 
-      - name: Run Miri on unsafe primitives
-        run: MIRIFLAGS="-Zmiri-permissive-provenance" cargo miri test --test unsafe_primitives_tests -- --skip concurrent
+      - name: Run Miri on the arena suites
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-many-seeds=0..8
+        run: cargo miri test --test arena_artmap_tests --test arena_regressions
+
+  miri-strict:
+    # Strict provenance for the units that do not touch crossbeam (§16.1).
+    name: Miri (strict provenance units)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install nightly Rust with Miri
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # master
+        with:
+          toolchain: nightly-2026-09-23
+          components: miri
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run Miri with strict provenance
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-strict-provenance
+        run: 'cargo miri test --lib -- raw::node:: raw::slot:: latch:: simd:: arena::'
+
+  provenance-lints:
+    # No integer-to-pointer or lossy pointer casts in artmap code (§16.2).
+    name: Provenance lints
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # master
+        with:
+          toolchain: nightly-2026-09-23
+
+      - name: Check with the provenance lints denied
+        run: RUSTFLAGS="--cfg artmap_provenance_lints" cargo check --lib
+
+  sanitizers:
+    # TSan covers non-atomic accesses (leaf K/V, drop, dealloc); ASan with
+    # LeakSanitizer covers memory errors and leaks (§16.4).
+    name: Sanitizer (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [thread, address]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # master
+        with:
+          toolchain: nightly-2026-09-23
+          components: rust-src
+
+      - name: Run the stress and race tests under the sanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+          RUSTDOCFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+          TSAN_OPTIONS: halt_on_error=1
+          ARTMAP_STRESS_MS: "1000"
+        run: >
+          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --release --lib
+          --test concurrent_correctness --test concurrency_stress_tests
+          --test regressions --test drop_accounting --test linearizability
+          --test arena_regressions --test unwind -- --test-threads=1
+
+  stress-release:
+    name: Release-mode stress
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run the race tests for longer
+        env:
+          ARTMAP_STRESS_MS: "10000"
+        run: cargo test --release --test concurrent_correctness --test concurrency_stress_tests --test arena_regressions
+
+  compile-fail:
+    # rustdoc checks `compile_fail,E....` codes only on nightly.
+    name: Compile-fail doctests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # master
+        with:
+          toolchain: nightly-2026-09-23
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run the doctests
+        run: cargo test --doc
+
+  msrv:
+    # The library only: dev-dependencies need a newer toolchain.
+    name: MSRV (1.86)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # master
+        with:
+          toolchain: "1.86"
+
+      - name: Check the library
+        run: cargo check --lib --all-features
+
+  semver-checks:
+    name: Semver checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check semver
+        uses: obi1kenobi/cargo-semver-checks-action@5b298c9520f7096a4683c0bd981a7ac5a7e249ae # v2
+
+  public-api:
+    # semver-checks catches removals, not re-exposure of sealed internals.
+    name: Public API snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # master
+        with:
+          toolchain: nightly-2026-09-23
+
+      - name: Install cargo-public-api
+        run: cargo install --locked cargo-public-api
+
+      - name: Diff against the committed snapshot
+        run: |
+          cargo public-api --simplified > /tmp/public-api.txt
+          if [ -f public-api.txt ]; then
+            diff -u public-api.txt /tmp/public-api.txt
+          else
+            cat /tmp/public-api.txt
+            echo "::warning::no public-api.txt snapshot committed yet; commit the output above"
+          fi
+
+  cargo-deny:
+    name: Advisories
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check advisories
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
+
+  downstream-canary:
+    # A memtable-style use of the arena API (range, versions(), try_insert,
+    # size accessors), the shape surrealkv depends on.
+    name: Downstream canary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run the memtable example
+        run: cargo run --release --example memtable
+
+  unsafe-hygiene:
+    # §5.2: acquisitions must bind their guard; a dropped guard unlocks.
+    name: Latch-acquisition greps
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Reject unbound latch guards
+        run: |
+          ! grep -rnE 'let _ = .*\.(lock|try_upgrade)\(' src/
+          ! grep -rnE '\.(lock|try_upgrade)\([^)]*\)\.is_(some|none)\(\)' src/

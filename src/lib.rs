@@ -12,44 +12,130 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # artmap: Concurrent Adaptive Radix Tree for Rust
+//! # artmap: concurrent adaptive radix trees
 //!
-//! `artmap` provides a concurrent, in-memory associative map backed by an
-//! **Adaptive Radix Tree (ART)** with **Optimistic Lock Coupling (OLC)** and
-//! **Epoch-Based Memory Reclamation (EBR)**.
+//! Concurrent, ordered, in-memory maps backed by an **Adaptive Radix Tree**
+//! (ART) with **optimistic lock coupling** (OLC):
 //!
-//! ## Design & Features
+//! - [`ArtMap`]: a key-value map with epoch-based reclamation (EBR).
+//! - [`VersionedArtMap`]: a map with a chain of 64-bit MVCC versions per key.
+//! - [`ArenaArtMap`] and [`ArenaVersionedArtMap`]: the same, allocated from a
+//!   bump [`Arena`] and reclaimed only when the map is dropped.
 //!
-//! - **$O(k)$ Lookup Complexity**: Search time depends strictly on the key length in bytes $k$.
-//! - **Adaptive Node Sizes**: Dynamically scales inner node layouts (`Node4` $\leftrightarrow$ `Node16` $\leftrightarrow$ `Node48` $\leftrightarrow$ `Node256`).
-//! - **SIMD-Accelerated Lookups**: Vectorized key comparisons in `Node16` via SSE2 on x86_64 and NEON on ARM64.
-//! - **Prefix Compression**: Collapses non-branching paths into compact inline byte prefixes.
-//! - **Optimistic Lock Coupling (OLC)**: Readers proceed non-blocking without taking locks or issuing atomic writes.
-//! - **Epoch-Based Memory Reclamation**: Memory for unlinked or resized nodes is safely reclaimed via `crossbeam-epoch`.
-//! - **Multi-Writer Scalability**: Fine-grained node locking permits parallel inserts across disjoint prefixes.
+//! Lookups cost $O(k)$ in the key length. Readers never write to shared tree
+//! memory and never block; writers take fine-grained per-node latches, so
+//! writes to disjoint parts of the tree proceed in parallel.
+//!
+//! ## Epoch guards
+//!
+//! The EBR maps protect memory with the process-wide default
+//! `crossbeam-epoch` collector. Handles returned by the maps
+//! ([`EntryRef`], [`VersionedEntryRef`], iterators) keep an epoch guard alive,
+//! and [`Guard`]s from `map.pin()` can be passed to the `*_with_guard`
+//! methods to amortise pinning.
+//!
+//! - **Holding a guard stalls reclamation process-wide**, for every user of the
+//!   default collector. That includes a handle, an iterator, or a [`Guard`]. Do
+//!   not hold one across I/O or long computations.
+//! - **Leaking a handle** with `mem::forget` pins the current thread for the
+//!   rest of its life. This is memory-safe, but reclamation stops for every
+//!   user of the default collector.
+//! - **Async code.** Handles are `!Send`. Across an `.await`, use `get_value`
+//!   or `with_value`, or copy out with [`EntryRef::to_owned`] or
+//!   [`EntryRef::value_cloned`].
+//! - **Deferred destructors** of removed or replaced keys and values run on an
+//!   arbitrary thread, at an arbitrary later time, and may never run (for
+//!   example at process exit). `Drop` of keys and values must not panic.
+//! - Dropping a map is synchronous: it frees every live entry immediately.
+//!
+//! ## Keys
+//!
+//! Keys are ordered by the bytes returned by [`AsBytes`]. `AsBytes` is a safe
+//! trait: implementations should be deterministic, agree with `Borrow`, and
+//! not panic, but artmap never relies on that for memory safety. A
+//! misbehaving implementation may cause wrong results or panics, never
+//! undefined behaviour. `as_bytes` may be called more than once per
+//! operation, concurrently, and on keys that were already removed.
+//!
+//! ## Consistency
+//!
+//! Point operations are linearizable. Iterators guarantee that every key
+//! present for the whole scan is yielded exactly once, in order; keys inserted
+//! or removed during the scan may or may not appear. `len()` is exact when no
+//! operation is in flight.
+//!
+//! ## Public surface
+//!
+//! No safe API resolves an offset or pointer against an arena other than the
+//! map's own, accepts a raw pointer or handle, or returns a reference that
+//! outlives the map borrow (or, for the EBR maps, its guard).
+
+#![cfg_attr(artmap_provenance_lints, feature(strict_provenance_lints))]
+// Renamed to `implicit_provenance_casts` on newer nightlies; the old names forward.
+#![cfg_attr(artmap_provenance_lints, allow(renamed_and_removed_lints))]
+#![cfg_attr(
+    artmap_provenance_lints,
+    deny(fuzzy_provenance_casts, lossy_provenance_casts)
+)]
+#![deny(let_underscore_drop, clippy::let_underscore_must_use)]
 
 pub mod arena;
-pub mod entry;
-pub mod iter;
-pub mod key;
-pub mod latch;
-pub mod node;
-pub mod simd;
-pub mod tree;
+#[cfg(doctest)]
+pub mod compile_fail_tests;
+/// The README's examples, run as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+mod entry;
+mod guard;
+#[cfg(artmap_hooks)]
+#[doc(hidden)]
+pub mod hooks;
+#[cfg(not(artmap_hooks))]
+mod hooks;
+mod iter;
+mod key;
+mod latch;
+#[cfg(all(test, loom))]
+mod loom_tests;
+mod node;
+mod raw;
+mod simd;
+mod sync;
+mod tree;
 pub mod versioned;
 
 use std::borrow::Borrow;
-use std::ops::RangeBounds;
-use std::sync::atomic::Ordering;
+use std::ops::{Bound, RangeBounds};
 
 pub use arena::{Arena, ArenaArtMap, ArenaInserter, ArenaVersionedArtMap};
 pub use entry::EntryRef;
-pub use iter::{Iter, Keys, Range, Values};
+pub use guard::Guard;
+pub use iter::{GuardKeys, GuardValues, Iter, KeyRef, Keys, Range, ValueRef, Values};
 pub use key::AsBytes;
-pub use tree::Tree;
 pub use versioned::{VersionedArtMap, VersionedEntryRef};
 
-/// A concurrent associative map backed by an Adaptive Radix Tree.
+use guard::{pin, GuardHandle};
+use raw::cursor::owned_bound;
+use raw::{Mode, Outcome};
+use tree::Tree;
+
+/// Positive `Send`/`Sync` assertions (§8.9).
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ArtMap<String, u64>>();
+    assert_send_sync::<VersionedArtMap<String, u64>>();
+    assert_send_sync::<ArenaArtMap<String, u64>>();
+    assert_send_sync::<ArenaVersionedArtMap<String, u64>>();
+    assert_send_sync::<Arena>();
+};
+
+/// A concurrent ordered map backed by an adaptive radix tree.
+///
+/// Reads take no latches (they validate optimistically and retry) and are
+/// linearizable; writes take per-node latches. Values are never mutated in
+/// place: an overwrite publishes a new entry and returns the displaced one,
+/// which stays readable through its handle.
 pub struct ArtMap<K, V> {
     tree: Tree<K, V>,
 }
@@ -62,69 +148,96 @@ impl<K, V> Default for ArtMap<K, V> {
 }
 
 impl<K, V> ArtMap<K, V> {
-    /// Creates a new, empty [`ArtMap`].
-    #[inline]
-    pub const fn new() -> Self {
-        Self { tree: Tree::new() }
-    }
-
-    /// Creates a new [`ArtMap`] pre-sized for high-capacity ingestion.
-    #[inline]
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            tree: Tree::with_capacity(capacity),
+    sync::const_fn_unless_loom! {
+        /// Creates an empty map.
+        #[inline]
+        pub fn new() -> Self {
+            Self { tree: Tree::new() }
         }
     }
 
-    /// Returns the number of entries in the map.
+    /// Creates an empty map. The capacity is a hint and currently unused.
+    #[inline]
+    pub fn with_capacity(_capacity: usize) -> Self {
+        Self::new()
+    }
+
+    /// The number of entries. Exact when no operation is in flight; during a
+    /// concurrent `clear()` it may briefly exceed the live count.
     #[inline]
     pub fn len(&self) -> usize {
         self.tree.len()
     }
 
-    /// Returns `true` if the map contains no entries.
+    /// `true` if the map has no entries.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.tree.is_empty()
+        self.len() == 0
     }
 }
 
 impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
-    /// Returns an entry reference corresponding to the key, if present.
+    /// Pins the epoch, for the `*_with_guard` methods. See the crate docs for
+    /// what holding a guard implies.
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<[u8; 8], u64>::new();
+    /// map.insert(7u64.to_be_bytes(), 49);
+    /// let guard = map.pin();
+    /// assert_eq!(map.get_with_guard(&7u64.to_be_bytes(), &guard).as_deref(), Some(&49));
+    /// ```
+    #[inline]
+    pub fn pin(&self) -> Guard<'_> {
+        Guard::new()
+    }
+
+    /// A handle on the entry for `key`.
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<String, u32>::new();
+    /// map.insert("a".to_string(), 1);
+    /// let e = map.get("a").unwrap();
+    /// assert_eq!((e.key().as_str(), *e.value()), ("a", 1));
+    /// assert!(map.get("b").is_none());
+    /// ```
     #[inline]
     pub fn get<Q>(&self, key: &Q) -> Option<EntryRef<'_, K, V>>
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
     {
-        let guard = &crossbeam_epoch::pin();
-        let leaf_ptr = self.tree.get_leaf(key.as_bytes(), guard)?;
-        let leaf = unsafe { &*leaf_ptr };
-        if leaf.removed.load(Ordering::Acquire) {
-            return None;
-        }
-        Some(EntryRef {
-            leaf_ptr,
-            tree: &self.tree,
-        })
+        self.get_by_slice(key.as_bytes())
     }
 
-    /// Returns an entry reference corresponding to a raw byte slice key, if present.
+    /// A handle on the entry for a raw byte key.
     #[inline]
     pub fn get_by_slice(&self, key: &[u8]) -> Option<EntryRef<'_, K, V>> {
-        let guard = &crossbeam_epoch::pin();
-        let leaf_ptr = self.tree.get_leaf(key, guard)?;
-        let leaf = unsafe { &*leaf_ptr };
-        if leaf.removed.load(Ordering::Acquire) {
-            return None;
-        }
-        Some(EntryRef {
-            leaf_ptr,
-            tree: &self.tree,
-        })
+        let guard = GuardHandle::owned();
+        let leaf = self.tree.raw.get(key)?;
+        Some(EntryRef::new(leaf, &self.tree, guard))
     }
 
-    /// Returns a copy of the value corresponding to the key, if present.
+    /// A handle on the entry for `key`, borrowing the caller's guard instead of
+    /// pinning.
+    #[inline]
+    pub fn get_with_guard<'a, Q>(
+        &'a self,
+        key: &Q,
+        guard: &'a Guard<'_>,
+    ) -> Option<EntryRef<'a, K, V>>
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        let leaf = self.tree.raw.get(key.as_bytes())?;
+        Some(EntryRef::new(
+            leaf,
+            &self.tree,
+            GuardHandle::Borrowed(&guard.inner),
+        ))
+    }
+
+    /// A clone of the value for `key`.
     #[inline]
     pub fn get_value<Q>(&self, key: &Q) -> Option<V>
     where
@@ -132,11 +245,10 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
         Q: AsBytes + ?Sized,
         V: Clone,
     {
-        let guard = &crossbeam_epoch::pin();
-        self.tree.get(key.as_bytes(), guard).cloned()
+        self.with_value(key, V::clone)
     }
 
-    /// Accesses the value corresponding to the key via a closure without cloning.
+    /// Calls `f` with the value for `key`, without cloning.
     #[inline]
     pub fn with_value<Q, R, F>(&self, key: &Q, f: F) -> Option<R>
     where
@@ -144,110 +256,221 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
         Q: AsBytes + ?Sized,
         F: FnOnce(&V) -> R,
     {
-        let guard = &crossbeam_epoch::pin();
-        self.tree.get(key.as_bytes(), guard).map(f)
+        let _g = pin();
+        let leaf = self.tree.raw.get(key.as_bytes())?;
+        // SAFETY: protected by `_g` for the duration of `f`; `R` cannot borrow
+        // from `&V` (it is chosen by the caller before the borrow exists).
+        Some(f(&unsafe { leaf.as_ref() }.value))
     }
 
-    /// Returns `true` if the map contains an entry for the specified key.
+    /// `true` if the map has an entry for `key`.
     #[inline]
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
     {
-        let guard = &crossbeam_epoch::pin();
-        self.tree.get(key.as_bytes(), guard).is_some()
+        self.contains_key_slice(key.as_bytes())
     }
 
-    /// Returns `true` if the map contains an entry for the raw byte slice key.
+    /// `true` if the map has an entry for a raw byte key.
     #[inline]
     pub fn contains_key_slice(&self, key: &[u8]) -> bool {
-        let guard = &crossbeam_epoch::pin();
-        self.tree.get(key, guard).is_some()
+        let _g = pin();
+        self.tree.raw.get(key).is_some()
     }
 
-    /// Inserts a key-value pair into the map, returning the previous value if present.
+    /// Inserts or replaces. Returns the displaced entry (already unlinked and
+    /// marked removed), or `None` if the key was absent.
+    ///
+    /// Dropping the returned handle immediately costs one unpin.
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<String, u32>::new();
+    /// assert!(map.insert("a".to_string(), 1).is_none());
+    /// let old = map.insert("a".to_string(), 2).unwrap();
+    /// assert_eq!(*old, 1);
+    /// assert!(old.is_removed());
+    /// assert_eq!(map.get_value("a"), Some(2));
+    /// ```
     #[inline]
-    pub fn insert(&self, key: K, value: V) -> Option<V> {
-        let guard = &crossbeam_epoch::pin();
-        self.tree.insert(key, value, guard)
+    pub fn insert(&self, key: K, value: V) -> Option<EntryRef<'_, K, V>> {
+        let guard = GuardHandle::owned();
+        self.insert_in(key, value, guard)
     }
 
-    /// Inserts a key-value pair using a pre-pinned epoch [`Guard`], avoiding per-operation pinning overhead.
+    /// As [`insert`](Self::insert), borrowing the caller's guard.
     #[inline]
-    pub fn insert_with_guard(&self, key: K, value: V, guard: &crossbeam_epoch::Guard) -> Option<V> {
-        self.tree.insert(key, value, guard)
+    pub fn insert_with_guard<'a>(
+        &'a self,
+        key: K,
+        value: V,
+        guard: &'a Guard<'_>,
+    ) -> Option<EntryRef<'a, K, V>> {
+        self.insert_in(key, value, GuardHandle::Borrowed(&guard.inner))
     }
 
-    /// Inserts a key-value pair if the key is not present, returning an [`EntryRef`].
+    /// As [`insert`](Self::insert), returning a clone of the displaced value
+    /// (cloned after every latch is released).
     #[inline]
+    pub fn insert_cloned(&self, key: K, value: V) -> Option<V>
+    where
+        V: Clone,
+    {
+        self.insert(key, value).map(|old| old.value().clone())
+    }
+
+    #[inline]
+    fn insert_in<'a>(
+        &'a self,
+        key: K,
+        value: V,
+        guard: GuardHandle<'a>,
+    ) -> Option<EntryRef<'a, K, V>> {
+        match self.tree.insert(key, value, Mode::Replace, guard.guard()) {
+            Outcome::Inserted(_) => None,
+            Outcome::Replaced(old) => Some(EntryRef::new(old, &self.tree, guard)),
+            Outcome::Existing(_) => unreachable!("Mode::Replace always publishes"),
+        }
+    }
+
+    /// Returns the entry for `key`, inserting `f()` first if it is absent.
+    ///
+    /// `f` runs without any latch held, and only if the key looked absent.
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<String, u32>::new();
+    /// assert_eq!(*map.get_or_insert_with("a".to_string(), || 1), 1);
+    /// assert_eq!(*map.get_or_insert_with("a".to_string(), || 2), 1);
+    /// ```
     pub fn get_or_insert_with<F>(&self, key: K, f: F) -> EntryRef<'_, K, V>
     where
         F: FnOnce() -> V,
     {
-        let guard = crossbeam_epoch::pin();
-        let leaf_ptr = self.tree.get_or_insert_with(key, f, &guard);
-
-        EntryRef {
-            leaf_ptr,
-            tree: &self.tree,
+        let guard = GuardHandle::owned();
+        // A hint only (Inv 10): the install below decides.
+        if let Some(leaf) = self.tree.raw.get(key.as_bytes()) {
+            return EntryRef::new(leaf, &self.tree, guard);
+        }
+        let value = f();
+        match self
+            .tree
+            .insert(key, value, Mode::InsertIfAbsent, guard.guard())
+        {
+            Outcome::Inserted(leaf) => EntryRef::new(leaf, &self.tree, guard),
+            Outcome::Existing(existing) => EntryRef::new(existing, &self.tree, guard),
+            Outcome::Replaced(_) => unreachable!("InsertIfAbsent never replaces"),
         }
     }
 
-    /// Removes an entry by key, returning the removed value if found.
+    /// Removes the entry for `key`. Returns the removed entry (unlinked and
+    /// marked removed).
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<String, u32>::new();
+    /// map.insert("a".to_string(), 1);
+    /// assert_eq!(map.remove("a").as_deref(), Some(&1));
+    /// assert!(map.remove("a").is_none());
+    /// assert!(map.is_empty());
+    /// ```
     #[inline]
-    pub fn remove<Q>(&self, key: &Q) -> Option<V>
+    pub fn remove<Q>(&self, key: &Q) -> Option<EntryRef<'_, K, V>>
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
     {
-        let guard = &crossbeam_epoch::pin();
-        self.tree.remove(key.as_bytes(), guard)
+        self.remove_by_slice(key.as_bytes())
     }
 
-    /// Removes an entry by raw byte slice key, returning the removed value if found.
+    /// Removes the entry for a raw byte key.
     #[inline]
-    pub fn remove_by_slice(&self, key: &[u8]) -> Option<V> {
-        let guard = &crossbeam_epoch::pin();
-        self.tree.remove(key, guard)
+    pub fn remove_by_slice(&self, key: &[u8]) -> Option<EntryRef<'_, K, V>> {
+        let guard = GuardHandle::owned();
+        let leaf = self.tree.remove(key, guard.guard())?;
+        Some(EntryRef::new(leaf, &self.tree, guard))
     }
 
-    /// Returns an iterator over a sub-range of entries.
+    /// An iterator over the entries in `range`, in key order.
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<String, u32>::new();
+    /// for (i, k) in ["a", "b", "c", "d"].into_iter().enumerate() {
+    ///     map.insert(k.to_string(), i as u32);
+    /// }
+    /// let keys: Vec<String> = map.range("b".."d").map(|e| e.key().clone()).collect();
+    /// assert_eq!(keys, ["b", "c"]);
+    /// let back: Vec<u32> = map.range("b"..).rev().map(|e| *e).collect();
+    /// assert_eq!(back, [3, 2, 1]);
+    /// ```
     pub fn range<R, Q>(&self, range: R) -> Range<'_, K, V>
     where
         R: RangeBounds<Q>,
         Q: AsBytes + ?Sized,
     {
-        let start = crate::iter::BoundKey::from_bound(range.start_bound());
-        let end = crate::iter::BoundKey::from_bound(range.end_bound());
-        Range::new(&self.tree, start, end)
+        Range::owned(
+            &self.tree,
+            owned_bound(range.start_bound()),
+            owned_bound(range.end_bound()),
+        )
     }
 
-    /// Returns an iterator visiting all key-value pairs in lexicographical key order.
+    /// As [`range`](Self::range), borrowing the caller's guard.
+    pub fn range_with_guard<'a, R, Q>(&'a self, range: R, guard: &'a Guard<'_>) -> Range<'a, K, V>
+    where
+        R: RangeBounds<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        Range::borrowed(
+            &self.tree,
+            &guard.inner,
+            owned_bound(range.start_bound()),
+            owned_bound(range.end_bound()),
+        )
+    }
+
+    /// An iterator over every entry, in key order.
     pub fn iter(&self) -> Iter<'_, K, V> {
-        Iter::new(&self.tree)
+        Range::owned(&self.tree, Bound::Unbounded, Bound::Unbounded)
     }
 
-    /// Returns an iterator visiting all keys in lexicographical order.
+    /// As [`iter`](Self::iter), borrowing the caller's guard.
+    pub fn iter_with_guard<'a>(&'a self, guard: &'a Guard<'_>) -> Iter<'a, K, V> {
+        Range::borrowed(&self.tree, &guard.inner, Bound::Unbounded, Bound::Unbounded)
+    }
+
+    /// An iterator over every key, in order.
     pub fn keys(&self) -> Keys<'_, K, V> {
-        Keys::new(self.iter())
+        Keys(self.iter())
     }
 
-    /// Returns an iterator visiting all values in lexicographical key order.
+    /// An iterator over every value, in key order.
     pub fn values(&self) -> Values<'_, K, V> {
-        Values::new(self.iter())
+        Values(self.iter())
     }
 
-    /// Removes all key-value pairs from the map.
-    #[inline]
+    /// Keys as bare references, bounded by the map and the caller's guard.
+    pub fn keys_with_guard<'a>(&'a self, guard: &'a Guard<'_>) -> GuardKeys<'a, K, V> {
+        GuardKeys(self.iter_with_guard(guard))
+    }
+
+    /// Values as bare references, bounded by the map and the caller's guard.
+    pub fn values_with_guard<'a>(&'a self, guard: &'a Guard<'_>) -> GuardValues<'a, K, V> {
+        GuardValues(self.iter_with_guard(guard))
+    }
+
+    /// Removes every entry. Linearizable with respect to point operations:
+    /// the linearization point is the swap of the root. Runs in O(n) on the
+    /// calling thread, holding at most one node latch at a time.
     pub fn clear(&self) {
-        self.tree.clear();
+        let g = pin();
+        self.tree.raw.clear(&g);
     }
 
-    /// Validates all structural invariants of the tree.
-    #[inline]
-    pub fn validate_invariants(&self) {
-        self.tree.validate_invariants();
+    /// Checks the tree's structural invariants and that `len()` equals the
+    /// number of reachable entries. Panics on a violation. Requires exclusive
+    /// access, so it never races with writers.
+    pub fn validate_invariants(&mut self) {
+        self.tree.raw.validate();
     }
 }
 
@@ -261,97 +484,76 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> IntoIterator for &'a Ar
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_artmap_basic_flow() {
-        let map = ArtMap::<String, i32>::new();
+    fn basic_flow() {
+        let mut map = ArtMap::<String, i32>::new();
         assert!(map.is_empty());
-
-        assert_eq!(map.insert("users:100".to_string(), 1), None);
-        assert_eq!(map.insert("users:200".to_string(), 2), None);
-        assert_eq!(map.insert("users:300".to_string(), 3), None);
+        assert!(map.insert("users:100".into(), 1).is_none());
+        assert!(map.insert("users:200".into(), 2).is_none());
+        assert!(map.insert("users:300".into(), 3).is_none());
         assert_eq!(map.len(), 3);
-
         assert_eq!(map.get("users:100").as_deref(), Some(&1));
         assert_eq!(map.get_by_slice(b"users:200").as_deref(), Some(&2));
         assert!(map.contains_key("users:300"));
-        assert!(map.contains_key_slice(b"users:100"));
         assert!(!map.contains_key("users:400"));
-
-        // with_value closure
-        let doubled = map.with_value("users:100", |v| *v * 2);
-        assert_eq!(doubled, Some(2));
-
-        // Update
-        assert_eq!(map.insert("users:100".to_string(), 10), Some(1));
+        assert_eq!(map.with_value("users:100", |v| *v * 2), Some(2));
+        let old = map.insert("users:100".into(), 10).expect("replaced");
+        assert_eq!(*old, 1);
+        assert!(old.is_removed());
+        drop(old);
         assert_eq!(map.get("users:100").as_deref(), Some(&10));
-
-        // Remove
-        assert_eq!(map.remove("users:200"), Some(2));
+        assert_eq!(map.remove("users:200").as_deref(), Some(&2));
         assert!(map.get("users:200").is_none());
         assert_eq!(map.len(), 2);
-
         map.validate_invariants();
     }
 
     #[test]
-    fn test_artmap_range_scan() {
+    fn range_scan() {
         let map = ArtMap::<String, i32>::new();
-        map.insert("k:1".to_string(), 1);
-        map.insert("k:2".to_string(), 2);
-        map.insert("k:3".to_string(), 3);
-        map.insert("k:4".to_string(), 4);
-        map.insert("k:5".to_string(), 5);
-
-        let items: Vec<_> = map
-            .range("k:2".."k:5")
-            .map(|e| (e.key().as_str(), *e.value()))
-            .collect();
-        assert_eq!(items, vec![("k:2", 2), ("k:3", 3), ("k:4", 4)]);
-
-        let rev_items: Vec<_> = map
-            .range("k:2".."k:5")
-            .rev()
-            .map(|e| (e.key().as_str(), *e.value()))
-            .collect();
-        assert_eq!(rev_items, vec![("k:4", 4), ("k:3", 3), ("k:2", 2)]);
+        for i in 1..=5 {
+            map.insert(format!("k:{i}"), i);
+        }
+        let items: Vec<_> = map.range("k:2".."k:5").map(|e| *e.value()).collect();
+        assert_eq!(items, vec![2, 3, 4]);
+        let rev: Vec<_> = map.range("k:2".."k:5").rev().map(|e| *e.value()).collect();
+        assert_eq!(rev, vec![4, 3, 2]);
     }
 
     #[test]
-    fn test_artmap_with_capacity() {
-        let map = ArtMap::<String, i32>::with_capacity(2048);
-        assert!(map.is_empty());
-        assert_eq!(map.len(), 0);
-
-        for i in 0..500 {
-            let k = format!("key:{i:04}");
-            assert_eq!(map.insert(k, i), None);
-        }
-        assert_eq!(map.len(), 500);
-
-        for i in 0..500 {
-            let k = format!("key:{i:04}");
-            assert_eq!(map.get(&k).as_deref(), Some(&i));
-        }
-
-        map.validate_invariants();
-    }
-
-    #[test]
-    fn test_artmap_get_or_insert_with() {
+    fn get_or_insert_with() {
         let map = ArtMap::<String, i32>::new();
         {
-            let entry = map.get_or_insert_with("key".to_string(), || 42);
-            assert_eq!(*entry, 42);
-            assert_eq!(entry.key(), "key");
-            assert_eq!(entry.value(), &42);
-            assert!(!entry.is_removed());
-            assert!(entry.remove());
-            assert!(entry.is_removed());
+            let e = map.get_or_insert_with("key".into(), || 42);
+            assert_eq!(*e, 42);
+            assert_eq!(e.key(), "key");
+            assert!(!e.is_removed());
+            assert!(e.remove());
+            assert!(e.is_removed());
+            assert!(!e.remove());
         }
         assert!(map.get("key").is_none());
+        let e = map.get_or_insert_with("k2".into(), || 1);
+        let e2 = map.get_or_insert_with("k2".into(), || panic!("must not run"));
+        assert_eq!(*e, 1);
+        assert_eq!(*e2, 1);
+    }
+
+    #[test]
+    fn clear_is_exact() {
+        let mut map = ArtMap::<[u8; 8], u64>::new();
+        for i in 0..1000u64 {
+            map.insert(i.to_be_bytes(), i);
+        }
+        map.clear();
+        assert_eq!(map.len(), 0);
+        assert!(map.iter().next().is_none());
+        map.insert(1u64.to_be_bytes(), 1);
+        assert_eq!(map.len(), 1);
+        map.validate_invariants();
     }
 }

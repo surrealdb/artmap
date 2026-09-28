@@ -12,7 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # Deterministic Simulation Test (DST)
+//! # Seeded sequential oracle fuzzing
+//!
+//! Every map operation and its oracle operation run under one global lock,
+//! so this suite checks results against the oracle for a random operation
+//! mix; it does not exercise concurrency. The concurrent correctness suites
+//! are `tests/concurrent_correctness.rs` and the loom models.
 //!
 //! Validates `ArtMap` under randomized concurrent schedules against a canonical
 //! `std::collections::BTreeMap` reference oracle.
@@ -36,6 +41,9 @@ fn get_seed() -> u64 {
         seed_str
             .parse::<u64>()
             .expect("ARTMAP_SIM_SEED must be a valid 64-bit integer")
+    } else if cfg!(miri) {
+        // Miri's isolation forbids reading the wall clock.
+        0x5EED_A27A
     } else {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -67,11 +75,11 @@ fn test_deterministic_simulation() {
     );
 
     let mut rng = StdRng::seed_from_u64(seed);
-    let map = Arc::new(ArtMap::<String, u64>::new());
+    let mut map = Arc::new(ArtMap::<String, u64>::new());
     let oracle = Arc::new(Mutex::new(BTreeMap::<String, u64>::new()));
 
-    const NUM_WORKERS: usize = 4;
-    const OPS_PER_WORKER: usize = 1000;
+    const NUM_WORKERS: usize = if cfg!(miri) { 2 } else { 4 };
+    const OPS_PER_WORKER: usize = if cfg!(miri) { 50 } else { 1000 };
 
     // Worker threads running concurrent randomized operations
     let handles: Vec<_> = (0..NUM_WORKERS)
@@ -92,7 +100,7 @@ fn test_deterministic_simulation() {
                         let val = local_rng.next_u64();
                         let mut o = oracle.lock().unwrap();
                         let oracle_prev = o.insert(key.clone(), val);
-                        let map_prev = map.insert(key, val);
+                        let map_prev = map.insert(key, val).map(|e| *e.value());
                         assert_eq!(
                             map_prev, oracle_prev,
                             "insert previous values must match oracle"
@@ -109,7 +117,7 @@ fn test_deterministic_simulation() {
                         // 15% Remove
                         let mut o = oracle.lock().unwrap();
                         let oracle_removed = o.remove(&key);
-                        let map_removed = map.remove(&key);
+                        let map_removed = map.remove(&key).map(|e| *e.value());
                         assert_eq!(
                             map_removed, oracle_removed,
                             "remove result must match oracle"
@@ -156,7 +164,7 @@ fn test_deterministic_simulation() {
     }
 
     // Invariant check
-    map.validate_invariants();
+    Arc::get_mut(&mut map).unwrap().validate_invariants();
 
     // Range query validation against oracle
     let start_key = "users:account:000100";

@@ -12,1630 +12,353 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+//! # The arena tree behind [`ArenaVersionedArtMap`](crate::ArenaVersionedArtMap)
+//!
+//! The version-chain protocol of §11.4 and §12.7, with arena offsets:
+//! every chain writer holds the leaf's `chain_latch` (terminal, Inv 7) and
+//! finds its position under it; version nodes are allocated *before* the
+//! latch is taken (no arena allocation under it); same-version replacement is
+//! out of place; `len` follows the head's liveness; unlinked version nodes go
+//! on a retired list that `Drop` drains.
+
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
+
+use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::arena::node::{
-    clear_bitmap_bit, find_child, next_present_byte, prev_present_byte, set_bitmap_bit,
-    ArenaVersionNode, Node16, Node256, Node4, Node48, NodeHeader, TaggedOffset, VersionedLeaf,
-};
+use crate::arena::node::{VersionNode, VersionedLeaf};
+use crate::arena::storage::{ArenaLeaf, ArenaStorage};
+use crate::arena::tree::InserterCache;
 use crate::arena::Arena;
 use crate::key::AsBytes;
-use crate::latch::{CachePadded, HybridLatch};
-use crate::node::{NodeType, MAX_PREFIX_LEN, NODE48_EMPTY};
-use crate::simd::find_child_node16;
+use crate::latch::AbortOnUnwind;
+use crate::raw::{Mode, Outcome, RawTree, Unpublished};
+use crate::sync::atomic::{AtomicU32, Ordering};
 
-/// An Adaptive Radix Tree storing multi-version MVCC leaves within an [`Arena`].
-pub struct ArenaVersionedTree<K: AsBytes + Clone, V: Clone> {
-    pub(crate) root: AtomicU32,
-    pub(crate) root_latch: HybridLatch,
-    pub(crate) len: CachePadded<AtomicUsize>,
-    pub(crate) arena: Arc<Arena>,
-    pub(crate) _marker: std::marker::PhantomData<(K, V)>,
+pub(crate) type Storage<K, V> = ArenaStorage<VersionedLeaf<K, V>>;
+
+/// The leaf and the offset of the head version `remove_head` replaced, or
+/// `Err(())` if the tombstone did not fit.
+pub(crate) type RemovedHead<K, V> = Result<Option<(NonNull<VersionedLeaf<K, V>>, u32)>, ()>;
+
+/// The concurrent tree of an `ArenaVersionedArtMap`.
+pub(crate) struct ArenaVersionedTree<K, V> {
+    pub(crate) raw: RawTree<Storage<K, V>>,
+    /// Version nodes unlinked while the map is alive (same-version replaces,
+    /// deprecated removes), dropped in `Drop`.
+    retired_versions: AtomicU32,
 }
 
-unsafe impl<K: AsBytes + Clone + Send, V: Clone + Send> Send for ArenaVersionedTree<K, V> {}
-unsafe impl<K: AsBytes + Clone + Sync, V: Clone + Sync> Sync for ArenaVersionedTree<K, V> {}
+/// The newest node with `version <= max`, walking from `head`.
+pub(crate) fn find_le<'a, V: 'a>(
+    arena: &'a Arena,
+    head: u32,
+    max: u64,
+) -> Option<&'a VersionNode<V>> {
+    let mut off = head;
+    while off != 0 {
+        // SAFETY: chain offsets are version nodes of this arena, valid for the
+        // map's life (the caller holds the map borrow).
+        let n = unsafe { arena.ptr::<VersionNode<V>>(off).as_ref() };
+        if n.version <= max {
+            return Some(n);
+        }
+        off = n.next();
+    }
+    None
+}
 
-impl<K: AsBytes + Clone, V: Clone> ArenaVersionedTree<K, V> {
-    /// Creates a new empty `ArenaVersionedTree` backed by the given [`Arena`].
-    pub fn new(arena: Arc<Arena>) -> Self {
+/// The chain starting at `head`, newest first.
+pub(crate) fn chain<'a, V: 'a>(
+    arena: &'a Arena,
+    head: u32,
+) -> impl Iterator<Item = &'a VersionNode<V>> + 'a {
+    let mut off = head;
+    std::iter::from_fn(move || {
+        if off == 0 {
+            return None;
+        }
+        // SAFETY: as for `find_le`.
+        let n = unsafe { arena.ptr::<VersionNode<V>>(off).as_ref() };
+        off = n.next();
+        Some(n)
+    })
+}
+
+impl<K, V> ArenaVersionedTree<K, V> {
+    pub(crate) fn new(arena: Arc<Arena>) -> Self {
         Self {
-            root: AtomicU32::new(0),
-            root_latch: HybridLatch::new(),
-            len: CachePadded(AtomicUsize::new(0)),
-            arena,
-            _marker: std::marker::PhantomData,
+            raw: RawTree::new_in(ArenaStorage::new(arena)),
+            retired_versions: AtomicU32::new(0),
         }
     }
 
-    /// Creates a new `ArenaVersionedTree` pre-sized for high-capacity ingestion.
-    pub fn with_capacity(arena: Arc<Arena>, _capacity: usize) -> Self {
-        Self::new(arena)
+    #[inline]
+    pub(crate) fn arena(&self) -> &Arc<Arena> {
+        &self.raw.storage.arena
     }
 
-    #[inline(always)]
-    pub fn len(&self) -> usize {
-        self.len.load(Ordering::Relaxed)
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.raw.len()
     }
 
-    #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[inline(always)]
-    pub fn arena(&self) -> &Arc<Arena> {
-        &self.arena
-    }
-
-    #[inline(always)]
-    pub fn raw_root(&self) -> TaggedOffset {
-        TaggedOffset(self.root.load(Ordering::Acquire))
-    }
-
-    /// Point lookup for the newest version at or before `max_version`.
-    pub fn get_version_le(&self, key_bytes: &[u8], max_version: u64) -> Option<(u64, V)> {
-        let leaf_ptr = self.get_leaf(key_bytes)?;
-        let leaf = unsafe { &*leaf_ptr };
-        let mut cur_off = leaf.versions_offset.load(Ordering::Acquire) & !1;
-
-        while cur_off != 0 {
-            let node = unsafe { &*(self.arena.get_pointer(cur_off) as *const ArenaVersionNode<V>) };
-            if node.version <= max_version {
-                if node.removed.load(Ordering::Acquire) {
-                    return None;
-                }
-                return Some((node.version, node.value.clone()));
-            }
-            cur_off = node.next_version_offset.load(Ordering::Acquire) & !1;
-        }
-
-        None
-    }
-
-    /// Point lookup for the newest committed version.
-    pub fn get_latest(&self, key_bytes: &[u8]) -> Option<(u64, V)> {
-        let leaf_ptr = self.get_leaf(key_bytes)?;
-        let leaf = unsafe { &*leaf_ptr };
-        let head_off = leaf.versions_offset.load(Ordering::Acquire) & !1;
-        if head_off == 0 {
-            return None;
-        }
-        let head = unsafe { &*(self.arena.get_pointer(head_off) as *const ArenaVersionNode<V>) };
-        if head.removed.load(Ordering::Acquire) {
-            return None;
-        }
-        Some((head.version, head.value.clone()))
-    }
-
-    /// Returns the number of versions stored for `key`.
-    pub fn version_count(&self, key_bytes: &[u8]) -> usize {
-        let leaf_ptr = match self.get_leaf(key_bytes) {
-            Some(p) => p,
-            None => return 0,
-        };
-        let leaf = unsafe { &*leaf_ptr };
-        let mut cur_off = leaf.versions_offset.load(Ordering::Acquire) & !1;
-        let mut count = 0;
-        while cur_off != 0 {
-            count += 1;
-            let node = unsafe { &*(self.arena.get_pointer(cur_off) as *const ArenaVersionNode<V>) };
-            cur_off = node.next_version_offset.load(Ordering::Acquire) & !1;
-        }
-        count
-    }
-
-    /// Returns all versions stored for `key`, ordered from newest to oldest.
-    pub fn get_all_versions(&self, key_bytes: &[u8]) -> Vec<(u64, V)> {
-        let mut versions = Vec::new();
-        let leaf_ptr = match self.get_leaf(key_bytes) {
-            Some(p) => p,
-            None => return versions,
-        };
-        let leaf = unsafe { &*leaf_ptr };
-        let mut cur_off = leaf.versions_offset.load(Ordering::Acquire) & !1;
-        while cur_off != 0 {
-            let node = unsafe { &*(self.arena.get_pointer(cur_off) as *const ArenaVersionNode<V>) };
-            versions.push((node.version, node.value.clone()));
-            cur_off = node.next_version_offset.load(Ordering::Acquire) & !1;
-        }
-        versions
-    }
-
-    /// Optimistic non-blocking lookup returning the head version leaf pointer.
-    pub fn get_leaf(&self, key_bytes: &[u8]) -> Option<*const VersionedLeaf<K, V>> {
-        'retry: loop {
-            let root_raw = self.root.load(Ordering::Acquire);
-            if root_raw == 0 {
-                return None;
-            }
-            let mut current = TaggedOffset(root_raw);
-            let mut depth = 0;
-            let mut parent_latch: Option<(&HybridLatch, u64)> = None;
-
-            while !current.is_null() {
-                if current.is_leaf() {
-                    if let Some((latch, v)) = parent_latch {
-                        if !latch.validate(v) {
-                            continue 'retry;
-                        }
-                    }
-                    let leaf_ptr =
-                        self.arena.get_pointer(current.leaf_offset()) as *const VersionedLeaf<K, V>;
-                    let leaf = unsafe { &*leaf_ptr };
-                    if leaf.key.as_bytes() == key_bytes {
-                        return Some(leaf_ptr);
-                    } else {
-                        return None;
-                    }
-                }
-
-                let header_ptr =
-                    self.arena.get_pointer_mut(current.inner_offset()) as *mut NodeHeader;
-                let header = unsafe { &*header_ptr };
-
-                let v = match header.latch.read_version() {
-                    Some(ver) => ver,
-                    None => {
-                        std::hint::spin_loop();
-                        continue 'retry;
-                    }
-                };
-
-                let (_matched, is_full) = header.match_prefix(key_bytes, depth);
-                if !is_full {
-                    if !header.latch.validate(v) {
-                        continue 'retry;
-                    }
-                    return None;
-                }
-
-                depth += header.prefix_len as usize;
-
-                if depth == key_bytes.len() {
-                    let exact_raw = header.exact_leaf.load(Ordering::Acquire);
-                    if !header.latch.validate(v) {
-                        continue 'retry;
-                    }
-                    if exact_raw == 0 {
-                        return None;
-                    }
-                    let exact_leaf_ptr = self
-                        .arena
-                        .get_pointer(TaggedOffset(exact_raw).leaf_offset())
-                        as *const VersionedLeaf<K, V>;
-                    let leaf = unsafe { &*exact_leaf_ptr };
-                    if leaf.key.as_bytes() == key_bytes {
-                        return Some(exact_leaf_ptr);
-                    } else {
-                        return None;
-                    }
-                }
-
-                let next_byte = key_bytes[depth];
-                let next_child = unsafe { find_child(header_ptr, next_byte) };
-
-                if !header.latch.validate(v) {
-                    continue 'retry;
-                }
-
-                let child = next_child?;
-                parent_latch = Some((&header.latch, v));
-                current = child;
-                depth += 1;
-            }
-
-            return None;
-        }
-    }
-
-    /// Inserts a versioned key-value pair.
-    pub fn insert(&self, key: K, version: u64, value: V) -> bool {
-        // Fast path: key already exists in tree!
-        // No parent inner node locking, no child pointer replacement, no key cloning!
-        if let Some(leaf_ptr) = self.get_leaf(key.as_bytes()) {
-            let leaf = unsafe { &*leaf_ptr };
-            if leaf.key.as_bytes() == key.as_bytes() {
-                let Some(node_off) = self.alloc_version_node(version, value) else {
-                    return false;
-                };
-                let was_removed = unsafe { self.insert_version_into_leaf(leaf_ptr, node_off) };
-                if was_removed {
-                    self.len.fetch_add(1, Ordering::Relaxed);
-                }
-                return true;
+    /// Pushes an unlinked version node onto the retired list (after unlock).
+    fn retire_version(&self, off: u32) {
+        // SAFETY: a version node of this arena, unlinked by the caller once.
+        let n = unsafe { self.arena().ptr::<VersionNode<V>>(off).as_ref() };
+        let mut head = self.retired_versions.load(Ordering::Relaxed);
+        loop {
+            n.next_retired.store(head, Ordering::Relaxed);
+            match self.retired_versions.compare_exchange_weak(
+                head,
+                off,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(h) => head = h,
             }
         }
-
-        let Some(node_off) = self.alloc_version_node(version, value) else {
-            return false;
-        };
-        let Some(leaf_off) = self.alloc_leaf(key, node_off) else {
-            return false;
-        };
-        let new_leaf_ptr = self.arena.get_pointer_mut(leaf_off) as *mut VersionedLeaf<K, V>;
-        let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
-        let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
-
-        self.insert_internal_cached(key_bytes, new_leaf_ptr, tagged_new_leaf, None)
     }
 
-    /// Inserts a versioned key-value pair using an [`ArenaInserter`](crate::arena::map::ArenaInserter) cache.
-    pub fn insert_with_inserter(
+    /// Allocates an unpublished version node, or hands the value back.
+    fn alloc_version(&self, version: u64, value: Option<V>) -> Result<u32, Option<V>> {
+        match self
+            .raw
+            .storage
+            .alloc_value(VersionNode::new(version, value))
+        {
+            Ok(p) => Ok(self.arena().offset_of(p)),
+            Err((_, n)) => Err(n.value),
+        }
+    }
+}
+
+impl<K, V> Drop for ArenaVersionedTree<K, V> {
+    fn drop(&mut self) {
+        if !VersionedLeaf::<K, V>::NEEDS_DROP {
+            return;
+        }
+        // SAFETY: exclusive access in `drop` (Inv 2): the live leaves and their
+        // chains first, then the retired versions.
+        unsafe { self.raw.destroy() };
+        let mut off = self.retired_versions.load(Ordering::Relaxed);
+        while off != 0 {
+            // SAFETY: each retired offset is a version node pushed once.
+            let n = unsafe { self.arena().ptr::<VersionNode<V>>(off) };
+            // SAFETY: as above.
+            let next = unsafe { n.as_ref() }.next_retired.load(Ordering::Relaxed);
+            // SAFETY: dropped exactly once, here.
+            unsafe { n.drop_in_place() };
+            off = next;
+        }
+    }
+}
+
+impl<K: AsBytes, V> ArenaVersionedTree<K, V> {
+    /// Adds `version` of `key` (a tombstone if `value` is `None`). Returns the
+    /// change in the number of live keys, or the key and value if the arena is
+    /// full (nothing published, no latch held).
+    pub(crate) fn insert(
         &self,
         key: K,
         version: u64,
-        value: V,
-        inserter: &mut crate::arena::map::ArenaInserter,
-    ) -> bool {
-        // Fast path: key already exists in tree!
-        if let Some(leaf_ptr) = self.get_leaf(key.as_bytes()) {
-            let leaf = unsafe { &*leaf_ptr };
-            if leaf.key.as_bytes() == key.as_bytes() {
-                let Some(node_off) = self.alloc_version_node(version, value) else {
-                    return false;
-                };
-                let was_removed = unsafe { self.insert_version_into_leaf(leaf_ptr, node_off) };
-                if was_removed {
-                    self.len.fetch_add(1, Ordering::Relaxed);
-                }
-                return true;
-            }
+        value: Option<V>,
+        cache: Option<&mut InserterCache>,
+    ) -> Result<isize, (K, Option<V>)> {
+        // Fast path: the key exists. The probe on the caller's key is a hint.
+        if let Some(leaf) = self.raw.get(key.as_bytes()) {
+            return match self.alloc_version(version, value) {
+                Ok(node) => Ok(self.apply(leaf, node)),
+                Err(v) => Err((key, v)),
+            };
         }
-
-        let Some(node_off) = self.alloc_version_node(version, value) else {
-            return false;
+        let count = isize::from(value.is_some());
+        let node = match self.alloc_version(version, value) {
+            Ok(node) => node,
+            Err(v) => return Err((key, v)),
         };
-        let Some(leaf_off) = self.alloc_leaf(key, node_off) else {
-            return false;
+        let leaf = match self.raw.storage.alloc_value(VersionedLeaf::new(key, node)) {
+            Ok(l) => l,
+            Err((_, l)) => {
+                // SAFETY: the node was never published: take its value back.
+                let n = unsafe { self.arena().ptr::<VersionNode<V>>(node).read() };
+                return Err((l.key, n.value));
+            }
         };
-        let new_leaf_ptr = self.arena.get_pointer_mut(leaf_off) as *mut VersionedLeaf<K, V>;
-        let tagged_new_leaf = TaggedOffset::from_leaf(leaf_off);
-        let key_bytes = unsafe { (*new_leaf_ptr).key.as_bytes() };
-
-        // Fast path: check if cached parent node can absorb this key directly
-        if inserter.last_parent_offset != 0 && key_bytes.len() > inserter.last_depth {
-            let header_ptr =
-                self.arena.get_pointer_mut(inserter.last_parent_offset) as *mut NodeHeader;
-            let header = unsafe { &mut *header_ptr };
-            let next_byte = key_bytes[inserter.last_depth];
-
-            if header.node_type == NodeType::Node256 {
-                let n256 = unsafe { &*(header_ptr as *const Node256) };
-                if n256.children[next_byte as usize].load(Ordering::Acquire) == 0
-                    && n256.children[next_byte as usize]
-                        .compare_exchange(
-                            0,
-                            tagged_new_leaf.raw(),
-                            Ordering::Release,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                {
-                    set_bitmap_bit(&n256.child_bitmap, next_byte);
-                    if header.latch.validate(inserter.last_parent_version) {
-                        n256.header.inc_num_children();
-                        self.len.fetch_add(1, Ordering::Relaxed);
-                        return true;
-                    } else {
-                        clear_bitmap_bit(&n256.child_bitmap, next_byte);
-                        n256.children[next_byte as usize].store(0, Ordering::Release);
-                    }
-                }
-            } else if header
-                .latch
-                .lock_version(inserter.last_parent_version)
-                .is_ok()
-            {
-                let is_full = is_node_full(header);
-                let child = unsafe { find_child(header_ptr, next_byte) };
-                if !is_full && child.is_none() {
-                    unsafe { self.insert_child_into_node(header_ptr, next_byte, tagged_new_leaf) };
-                    header.latch.unlock();
-                    self.len.fetch_add(1, Ordering::Relaxed);
-                    inserter.last_parent_version = header.latch.read_version().unwrap_or(0);
-                    return true;
-                }
-                header.latch.unlock();
+        // SAFETY: freshly written and exclusively ours.
+        let owner = unsafe { Unpublished::new(&self.raw.storage, leaf) };
+        // SAFETY: `owner` keeps the leaf alive for the call (§9.3).
+        let key_bytes = unsafe { leaf.as_ref() }.key.as_bytes();
+        let mut cache = cache;
+        if let Some(c) = cache.as_deref_mut() {
+            if let Some(r) = c.try_fast(&self.raw, &owner, key_bytes, count) {
+                return Ok(match r {
+                    Outcome::Inserted(_) => count,
+                    _ => unreachable!("the fast path only inserts"),
+                });
             }
-            inserter.reset();
         }
-
-        self.insert_internal_cached(key_bytes, new_leaf_ptr, tagged_new_leaf, Some(inserter))
-    }
-
-    fn alloc_version_node(&self, version: u64, value: V) -> Option<u32> {
-        let size = std::mem::size_of::<ArenaVersionNode<V>>() as u32;
-        let off = self.arena.alloc(size, 8, 0)?;
-        let ptr = self.arena.get_pointer_mut(off) as *mut ArenaVersionNode<V>;
-        unsafe { ArenaVersionNode::init(ptr, version, value) };
-        Some(off)
-    }
-
-    fn alloc_leaf(&self, key: K, versions_offset: u32) -> Option<u32> {
-        let size = std::mem::size_of::<VersionedLeaf<K, V>>() as u32;
-        let off = self.arena.alloc(size, 8, 0)?;
-        let ptr = self.arena.get_pointer_mut(off) as *mut VersionedLeaf<K, V>;
-        unsafe { VersionedLeaf::init(ptr, key, versions_offset) };
-        Some(off)
-    }
-
-    fn alloc_node4(&self, prefix: &[u8]) -> Option<u32> {
-        let size = std::mem::size_of::<Node4>() as u32;
-        let off = self.arena.alloc(size, 8, 0)?;
-        let ptr = self.arena.get_pointer_mut(off) as *mut Node4;
-        unsafe { Node4::init(ptr, prefix) };
-        Some(off)
-    }
-
-    fn alloc_node16(&self, prefix: &[u8]) -> Option<u32> {
-        let size = std::mem::size_of::<Node16>() as u32;
-        let off = self.arena.alloc(size, 8, 0)?;
-        let ptr = self.arena.get_pointer_mut(off) as *mut Node16;
-        unsafe { Node16::init(ptr, prefix) };
-        Some(off)
-    }
-
-    fn alloc_node48(&self, prefix: &[u8]) -> Option<u32> {
-        let size = std::mem::size_of::<Node48>() as u32;
-        let off = self.arena.alloc(size, 8, 0)?;
-        let ptr = self.arena.get_pointer_mut(off) as *mut Node48;
-        unsafe { Node48::init(ptr, prefix) };
-        Some(off)
-    }
-
-    fn alloc_node256(&self, prefix: &[u8]) -> Option<u32> {
-        let size = std::mem::size_of::<Node256>() as u32;
-        let off = self.arena.alloc(size, 8, 0)?;
-        let ptr = self.arena.get_pointer_mut(off) as *mut Node256;
-        unsafe { Node256::init(ptr, prefix) };
-        Some(off)
-    }
-
-    fn insert_internal_cached(
-        &self,
-        key_bytes: &[u8],
-        new_leaf_ptr: *mut VersionedLeaf<K, V>,
-        tagged_new_leaf: TaggedOffset,
-        mut inserter: Option<&mut crate::arena::map::ArenaInserter>,
-    ) -> bool {
-        'retry: loop {
-            let root_raw = self.root.load(Ordering::Acquire);
-
-            // Case 0: Empty tree
-            if root_raw == 0 {
-                if self
-                    .root
-                    .compare_exchange(
-                        0,
-                        tagged_new_leaf.raw(),
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    self.len.fetch_add(1, Ordering::Relaxed);
-                    return true;
+        let mut hint = None;
+        match self.raw.insert_hinted(
+            &owner,
+            key_bytes,
+            Mode::InsertIfAbsent,
+            count,
+            &(),
+            &mut hint,
+        ) {
+            Ok(Outcome::Inserted(_)) => {
+                if let Some(c) = cache {
+                    c.remember(hint, key_bytes);
                 }
-                continue 'retry;
+                Ok(count)
             }
-
-            let root_offset = TaggedOffset(root_raw);
-
-            // Case 1: Root is a single leaf
-            if root_offset.is_leaf() {
-                let _ = self.root_latch.lock();
-                let cur_root = TaggedOffset(self.root.load(Ordering::Relaxed));
-                if !cur_root.is_leaf() {
-                    self.root_latch.unlock();
-                    continue 'retry;
-                }
-
-                let existing_leaf_ptr =
-                    self.arena.get_pointer_mut(cur_root.leaf_offset()) as *mut VersionedLeaf<K, V>;
-                let existing_leaf = unsafe { &mut *existing_leaf_ptr };
-
-                if existing_leaf.key.as_bytes() == key_bytes {
-                    let new_node_off =
-                        unsafe { (*new_leaf_ptr).versions_offset.load(Ordering::Relaxed) };
-                    let was_removed =
-                        unsafe { self.insert_version_into_leaf(existing_leaf_ptr, new_node_off) };
-                    if was_removed {
-                        self.len.fetch_add(1, Ordering::Relaxed);
-                    }
-                    self.root_latch.unlock();
-                    return true;
-                }
-
-                let existing_key = existing_leaf.key.as_bytes();
-                let common_len = longest_common_prefix(existing_key, key_bytes);
-
-                let exact1 = existing_key.len() == common_len;
-                let byte1 = if !exact1 { existing_key[common_len] } else { 0 };
-
-                let exact2 = key_bytes.len() == common_len;
-                let byte2 = if !exact2 { key_bytes[common_len] } else { 0 };
-
-                let Some(new_inner) = self.create_prefix_chain(
-                    &key_bytes[..common_len],
-                    exact1,
-                    byte1,
-                    cur_root,
-                    exact2,
-                    byte2,
-                    tagged_new_leaf,
-                ) else {
-                    self.root_latch.unlock();
-                    return false;
-                };
-                self.root.store(new_inner.raw(), Ordering::Release);
-                self.len.fetch_add(1, Ordering::Relaxed);
-                self.root_latch.unlock();
-                return true;
+            Ok(Outcome::Existing(existing)) => {
+                // Lost the race: move our (unpublished) version node to the
+                // live leaf; `owner` then drops only the husk's key.
+                // SAFETY: never published and exclusively ours.
+                unsafe { leaf.as_ref().detach_head_unpublished() };
+                Ok(self.apply(existing, node))
             }
-
-            // Case 2: Root is an InnerNode
-            let mut parent: Option<*mut NodeHeader> = None;
-            let mut parent_byte = 0u8;
-            let mut current = root_offset;
-            let mut depth = 0;
-
-            'traverse: loop {
-                let header_ptr =
-                    self.arena.get_pointer_mut(current.inner_offset()) as *mut NodeHeader;
-                let header = unsafe { &mut *header_ptr };
-                let v_header = match header.latch.read_version() {
-                    Some(v) => v,
-                    None => {
-                        std::hint::spin_loop();
-                        continue 'retry;
-                    }
-                };
-
-                let (matched, is_full) = header.match_prefix(key_bytes, depth);
-
-                // Prefix mismatch -> prefix split
-                if !is_full {
-                    let parent_ok = match parent {
-                        Some(p) => unsafe { (*p).latch.lock().is_ok() },
-                        None => self.root_latch.lock().is_ok(),
-                    };
-                    if !parent_ok {
-                        continue 'retry;
-                    }
-
-                    if header.latch.lock_version(v_header).is_err() {
-                        match parent {
-                            Some(p) => unsafe { (*p).latch.unlock() },
-                            None => self.root_latch.unlock(),
-                        }
-                        continue 'retry;
-                    }
-
-                    let parent_valid = match parent {
-                        Some(p) => unsafe { find_child(p, parent_byte) == Some(current) },
-                        None => self.root.load(Ordering::Acquire) == current.raw(),
-                    };
-                    if !parent_valid {
-                        header.latch.unlock();
-                        match parent {
-                            Some(p) => unsafe { (*p).latch.unlock() },
-                            None => self.root_latch.unlock(),
-                        }
-                        continue 'retry;
-                    }
-
-                    let cur_prefix_len = (header.prefix_len as usize).min(MAX_PREFIX_LEN);
-                    let mut cur_prefix_buf = [0u8; MAX_PREFIX_LEN];
-                    cur_prefix_buf[..cur_prefix_len].copy_from_slice(header.prefix_slice());
-                    let cur_prefix = &cur_prefix_buf[..cur_prefix_len];
-
-                    let mismatch_char_existing = cur_prefix[matched];
-
-                    let Some(split_node_off) = self.alloc_node4(&cur_prefix[..matched]) else {
-                        header.latch.unlock();
-                        if let Some(p) = parent {
-                            unsafe { (*p).latch.unlock() };
-                        }
-                        return false;
-                    };
-                    let split_node = self.arena.get_pointer_mut(split_node_off) as *mut Node4;
-
-                    let remaining_prefix = &cur_prefix[(matched + 1)..];
-                    let mut new_p = [0u8; MAX_PREFIX_LEN];
-                    let new_p_len = remaining_prefix.len().min(MAX_PREFIX_LEN);
-                    new_p[..new_p_len].copy_from_slice(&remaining_prefix[..new_p_len]);
-                    header.prefix = new_p;
-                    header.prefix_len = remaining_prefix.len() as u16;
-
-                    unsafe {
-                        (*split_node).insert_child(
-                            mismatch_char_existing,
-                            TaggedOffset::from_inner(current.inner_offset()),
-                        );
-
-                        if depth + matched == key_bytes.len() {
-                            (*split_node)
-                                .header
-                                .exact_leaf
-                                .store(tagged_new_leaf.raw(), Ordering::Relaxed);
-                        } else {
-                            let new_char = key_bytes[depth + matched];
-                            (*split_node).insert_child(new_char, tagged_new_leaf);
-                        }
-
-                        let tagged_split = TaggedOffset::from_inner(split_node_off);
-
-                        match parent {
-                            Some(p) => {
-                                self.replace_child(p, parent_byte, tagged_split);
-                                header.latch.unlock();
-                                (*p).latch.unlock();
-                            }
-                            None => {
-                                self.root.store(tagged_split.raw(), Ordering::Release);
-                                header.latch.unlock();
-                                self.root_latch.unlock();
-                            }
-                        }
-
-                        self.len.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if let Some(ref mut ins) = inserter {
-                        ins.reset();
-                    }
-                    return true;
-                }
-
-                let node_depth = depth + header.prefix_len as usize;
-
-                // Exact key match at this inner node
-                if node_depth == key_bytes.len() {
-                    if header.latch.lock_version(v_header).is_err() {
-                        continue 'retry;
-                    }
-
-                    let parent_valid = match parent {
-                        Some(p) => unsafe {
-                            !(*p).latch.is_obsolete() && find_child(p, parent_byte) == Some(current)
-                        },
-                        None => self.root.load(Ordering::Acquire) == current.raw(),
-                    };
-                    if !parent_valid {
-                        header.latch.unlock();
-                        continue 'retry;
-                    }
-
-                    let exact_raw = header.exact_leaf.load(Ordering::Acquire);
-                    if exact_raw != 0 {
-                        let exact_leaf_ptr = self
-                            .arena
-                            .get_pointer(TaggedOffset(exact_raw).leaf_offset())
-                            as *const VersionedLeaf<K, V>;
-                        let existing_leaf = unsafe { &*exact_leaf_ptr };
-                        if existing_leaf.key.as_bytes() == key_bytes {
-                            let new_node_off =
-                                unsafe { (*new_leaf_ptr).versions_offset.load(Ordering::Relaxed) };
-                            let was_removed = unsafe {
-                                self.insert_version_into_leaf(exact_leaf_ptr, new_node_off)
-                            };
-                            if was_removed {
-                                self.len.fetch_add(1, Ordering::Relaxed);
-                            }
-                            header.latch.unlock();
-                            return true;
-                        }
-                    } else {
-                        header
-                            .exact_leaf
-                            .store(tagged_new_leaf.raw(), Ordering::Release);
-                        self.len.fetch_add(1, Ordering::Relaxed);
-                        header.latch.unlock();
-                        return true;
-                    }
-                }
-
-                let next_byte = key_bytes[node_depth];
-                let next_child = unsafe { find_child(header_ptr, next_byte) };
-
-                match next_child {
-                    None => {
-                        // 1A: Node256 lock-free atomic insertion fast-path
-                        if header.node_type == NodeType::Node256 {
-                            let n256 = unsafe { &*(header_ptr as *const Node256) };
-                            if n256.children[next_byte as usize]
-                                .compare_exchange(
-                                    0,
-                                    tagged_new_leaf.raw(),
-                                    Ordering::Release,
-                                    Ordering::Acquire,
-                                )
-                                .is_ok()
-                            {
-                                set_bitmap_bit(&n256.child_bitmap, next_byte);
-                                let parent_valid = match parent {
-                                    Some(p) => unsafe {
-                                        !(*p).latch.is_obsolete()
-                                            && find_child(p, parent_byte) == Some(current)
-                                    },
-                                    None => self.root.load(Ordering::Acquire) == current.raw(),
-                                };
-                                if header.latch.validate(v_header) && parent_valid {
-                                    n256.header.inc_num_children();
-                                    self.len.fetch_add(1, Ordering::Relaxed);
-                                    if let Some(ref mut ins) = inserter {
-                                        ins.last_parent_offset = current.inner_offset();
-                                        ins.last_parent_version =
-                                            header.latch.read_version().unwrap_or(0);
-                                        ins.last_depth = depth;
-                                    }
-                                    return true;
-                                } else {
-                                    clear_bitmap_bit(&n256.child_bitmap, next_byte);
-                                    n256.children[next_byte as usize].store(0, Ordering::Release);
-                                    continue 'retry;
-                                }
-                            }
-                            continue 'retry;
-                        }
-
-                        if is_node_full(header) {
-                            let parent_ok = match parent {
-                                Some(p) => unsafe { (*p).latch.lock().is_ok() },
-                                None => self.root_latch.lock().is_ok(),
-                            };
-                            if !parent_ok {
-                                continue 'retry;
-                            }
-
-                            if header.latch.lock_version(v_header).is_err() {
-                                match parent {
-                                    Some(p) => unsafe { (*p).latch.unlock() },
-                                    None => self.root_latch.unlock(),
-                                }
-                                continue 'retry;
-                            }
-
-                            let parent_valid = match parent {
-                                Some(p) => unsafe {
-                                    !(*p).latch.is_obsolete()
-                                        && find_child(p, parent_byte) == Some(current)
-                                },
-                                None => self.root.load(Ordering::Acquire) == current.raw(),
-                            };
-                            if !parent_valid {
-                                header.latch.unlock();
-                                match parent {
-                                    Some(p) => unsafe { (*p).latch.unlock() },
-                                    None => self.root_latch.unlock(),
-                                }
-                                continue 'retry;
-                            }
-
-                            if unsafe { find_child(header_ptr, next_byte) }.is_some() {
-                                header.latch.unlock();
-                                match parent {
-                                    Some(p) => unsafe { (*p).latch.unlock() },
-                                    None => self.root_latch.unlock(),
-                                }
-                                continue 'retry;
-                            }
-
-                            let Some(new_node_off) = (unsafe { self.grow_node(header_ptr) }) else {
-                                header.latch.unlock();
-                                if let Some(p) = parent {
-                                    unsafe { (*p).latch.unlock() };
-                                }
-                                return false;
-                            };
-                            let new_node_ptr =
-                                self.arena.get_pointer_mut(new_node_off) as *mut NodeHeader;
-                            unsafe {
-                                self.insert_child_into_node(
-                                    new_node_ptr,
-                                    next_byte,
-                                    tagged_new_leaf,
-                                );
-                            }
-                            let tagged_new_node = TaggedOffset::from_inner(new_node_off);
-
-                            match parent {
-                                Some(p) => unsafe {
-                                    self.replace_child(p, parent_byte, tagged_new_node);
-                                    header.latch.mark_obsolete_and_unlock();
-                                    (*p).latch.unlock();
-                                },
-                                None => {
-                                    self.root.store(tagged_new_node.raw(), Ordering::Release);
-                                    header.latch.mark_obsolete_and_unlock();
-                                    self.root_latch.unlock();
-                                }
-                            }
-                            self.len.fetch_add(1, Ordering::Relaxed);
-                            if let Some(ref mut ins) = inserter {
-                                ins.last_parent_offset = new_node_off;
-                                ins.last_parent_version =
-                                    unsafe { (*new_node_ptr).latch.read_version().unwrap_or(0) };
-                                ins.last_depth = depth;
-                            }
-                            return true;
-                        } else {
-                            if header.latch.lock_version(v_header).is_err() {
-                                continue 'retry;
-                            }
-
-                            let parent_valid = match parent {
-                                Some(p) => unsafe {
-                                    !(*p).latch.is_obsolete()
-                                        && find_child(p, parent_byte) == Some(current)
-                                },
-                                None => self.root.load(Ordering::Acquire) == current.raw(),
-                            };
-                            if !parent_valid {
-                                header.latch.unlock();
-                                continue 'retry;
-                            }
-
-                            if is_node_full(header)
-                                || unsafe { find_child(header_ptr, next_byte) }.is_some()
-                            {
-                                header.latch.unlock();
-                                continue 'retry;
-                            }
-
-                            unsafe {
-                                self.insert_child_into_node(header_ptr, next_byte, tagged_new_leaf);
-                            }
-                            header.latch.unlock();
-                            self.len.fetch_add(1, Ordering::Relaxed);
-                            if let Some(ref mut ins) = inserter {
-                                ins.last_parent_offset = current.inner_offset();
-                                ins.last_parent_version = header.latch.read_version().unwrap_or(0);
-                                ins.last_depth = depth;
-                            }
-                            return true;
-                        }
-                    }
-                    Some(child) => {
-                        if child.is_leaf() {
-                            if header.latch.lock_version(v_header).is_err() {
-                                continue 'retry;
-                            }
-
-                            let parent_valid = match parent {
-                                Some(p) => unsafe {
-                                    !(*p).latch.is_obsolete()
-                                        && find_child(p, parent_byte) == Some(current)
-                                },
-                                None => self.root.load(Ordering::Acquire) == current.raw(),
-                            };
-                            if !parent_valid {
-                                header.latch.unlock();
-                                continue 'retry;
-                            }
-
-                            if unsafe { find_child(header_ptr, next_byte) } != Some(child) {
-                                header.latch.unlock();
-                                continue 'retry;
-                            }
-
-                            let existing_leaf_ptr = self.arena.get_pointer_mut(child.leaf_offset())
-                                as *mut VersionedLeaf<K, V>;
-                            let existing_leaf = unsafe { &mut *existing_leaf_ptr };
-
-                            if existing_leaf.key.as_bytes() == key_bytes {
-                                let new_node_off = unsafe {
-                                    (*new_leaf_ptr).versions_offset.load(Ordering::Relaxed)
-                                };
-                                let was_removed = unsafe {
-                                    self.insert_version_into_leaf(existing_leaf_ptr, new_node_off)
-                                };
-                                if was_removed {
-                                    self.len.fetch_add(1, Ordering::Relaxed);
-                                }
-                                header.latch.unlock();
-                                return true;
-                            }
-
-                            let existing_key = existing_leaf.key.as_bytes();
-                            let suffix_existing = &existing_key[(node_depth + 1)..];
-                            let suffix_new = &key_bytes[(node_depth + 1)..];
-                            let common_len = longest_common_prefix(suffix_existing, suffix_new);
-
-                            let exact1 = suffix_existing.len() == common_len;
-                            let byte1 = if !exact1 {
-                                suffix_existing[common_len]
-                            } else {
-                                0
-                            };
-
-                            let exact2 = suffix_new.len() == common_len;
-                            let byte2 = if !exact2 { suffix_new[common_len] } else { 0 };
-
-                            let Some(new_inner) = self.create_prefix_chain(
-                                &suffix_new[..common_len],
-                                exact1,
-                                byte1,
-                                child,
-                                exact2,
-                                byte2,
-                                tagged_new_leaf,
-                            ) else {
-                                header.latch.unlock();
-                                return false;
-                            };
-
-                            unsafe { self.replace_child(header_ptr, next_byte, new_inner) };
-                            self.len.fetch_add(1, Ordering::Relaxed);
-                            header.latch.unlock();
-                            if let Some(ref mut ins) = inserter {
-                                ins.reset();
-                            }
-                            return true;
-                        } else {
-                            if !header.latch.validate(v_header) {
-                                continue 'retry;
-                            }
-                            parent = Some(header_ptr);
-                            parent_byte = next_byte;
-                            current = child;
-                            depth = node_depth + 1;
-                            continue 'traverse;
-                        }
-                    }
-                }
+            Ok(Outcome::Replaced(_)) => unreachable!("InsertIfAbsent never replaces"),
+            Err(_) => {
+                owner.disarm();
+                // SAFETY: neither the leaf nor its version was published; take
+                // the key and value back out and abandon their bytes.
+                let (l, n) =
+                    unsafe { (leaf.read(), self.arena().ptr::<VersionNode<V>>(node).read()) };
+                Err((l.key, n.value))
             }
         }
     }
 
-    unsafe fn replace_child(&self, header: *mut NodeHeader, byte: u8, new_child: TaggedOffset) {
-        match (*header).node_type {
-            NodeType::Node4 => {
-                let n = &mut *(header as *mut Node4);
-                for i in 0..n.header.num_children() as usize {
-                    if n.keys[i] == byte {
-                        n.children[i].store(new_child.raw(), Ordering::Release);
-                        return;
-                    }
-                }
-            }
-            NodeType::Node16 => {
-                let n = &mut *(header as *mut Node16);
-                if let Some(idx) =
-                    find_child_node16(&n.keys, n.header.num_children() as usize, byte)
-                {
-                    n.children[idx].store(new_child.raw(), Ordering::Release);
-                }
-            }
-            NodeType::Node48 => {
-                let n = &mut *(header as *mut Node48);
-                let slot = n.child_indices[byte as usize];
-                if slot != NODE48_EMPTY {
-                    n.children[slot as usize].store(new_child.raw(), Ordering::Release);
-                }
-            }
-            NodeType::Node256 => {
-                let n = &mut *(header as *mut Node256);
-                n.children[byte as usize].store(new_child.raw(), Ordering::Release);
+    /// Links the unpublished version node `node` into a published leaf.
+    fn apply(&self, leaf: NonNull<VersionedLeaf<K, V>>, node: u32) -> isize {
+        let arena = &**self.arena();
+        // SAFETY: arena leaves are valid for the map's life.
+        let leaf = unsafe { leaf.as_ref() };
+        let at = |off: u32| -> Option<&VersionNode<V>> {
+            // SAFETY: chain offsets are version nodes of this arena.
+            (off != 0).then(|| unsafe { arena.ptr::<VersionNode<V>>(off).as_ref() })
+        };
+        // SAFETY: allocated by the caller, unpublished.
+        let new = unsafe { arena.ptr::<VersionNode<V>>(node).as_ref() };
+        let version = new.version;
+        let lock = || {
+            let Some(w) = leaf.chain_latch.lock() else {
+                unreachable!("arena chain latches are never obsoleted")
+            };
+            w
+        };
+        #[cfg(loom)]
+        let unlatched = crate::latch::mutants::CHAIN_POSITION_UNLATCHED.with(|m| m.get());
+        #[cfg(not(loom))]
+        let unlatched = false;
+        let early = (!unlatched).then(lock);
+        // Positions are found under the latch.
+        let head = leaf.head();
+        let old_live = at(head).is_some_and(|h| !h.is_tombstone());
+        let mut prev = 0u32;
+        let mut cur = head;
+        while let Some(n) = at(cur).filter(|n| n.version > version) {
+            prev = cur;
+            cur = n.next();
+        }
+        let w = early.unwrap_or_else(lock);
+        let replaced = at(cur).is_some_and(|n| n.version == version);
+        new.init_next(match (replaced, at(cur)) {
+            (true, Some(c)) => c.next(),
+            _ => cur,
+        });
+        let bomb = AbortOnUnwind;
+        match at(prev) {
+            None => leaf.set_head(&w, node),
+            Some(p) => p.set_next(&w, node),
+        }
+        if replaced {
+            if let Some(c) = at(cur) {
+                c.mark_superseded(&w);
             }
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn create_prefix_chain(
-        &self,
-        prefix: &[u8],
-        exact1: bool,
-        byte1: u8,
-        child1: TaggedOffset,
-        exact2: bool,
-        byte2: u8,
-        child2: TaggedOffset,
-    ) -> Option<TaggedOffset> {
-        if prefix.len() <= MAX_PREFIX_LEN {
-            let n4_off = self.alloc_node4(prefix)?;
-            let n4 = self.arena.get_pointer_mut(n4_off) as *mut Node4;
-            unsafe {
-                if exact1 {
-                    (*n4)
-                        .header
-                        .exact_leaf
-                        .store(child1.raw(), Ordering::Relaxed);
-                } else {
-                    (*n4).insert_child(byte1, child1);
-                }
-                if exact2 {
-                    (*n4)
-                        .header
-                        .exact_leaf
-                        .store(child2.raw(), Ordering::Relaxed);
-                } else {
-                    (*n4).insert_child(byte2, child2);
-                }
-            }
-            Some(TaggedOffset::from_inner(n4_off))
-        } else {
-            let head_prefix = &prefix[..MAX_PREFIX_LEN];
-            let rest_prefix = &prefix[MAX_PREFIX_LEN + 1..];
-            let connector_byte = prefix[MAX_PREFIX_LEN];
-
-            let child_chain = self.create_prefix_chain(
-                rest_prefix,
-                exact1,
-                byte1,
-                child1,
-                exact2,
-                byte2,
-                child2,
-            )?;
-
-            let n4_off = self.alloc_node4(head_prefix)?;
-            let n4 = self.arena.get_pointer_mut(n4_off) as *mut Node4;
-            unsafe {
-                (*n4).insert_child(connector_byte, child_chain);
-            }
-            Some(TaggedOffset::from_inner(n4_off))
+        let new_live = at(leaf.head()).is_some_and(|h| !h.is_tombstone());
+        let delta = isize::from(new_live) - isize::from(old_live);
+        self.raw.len_add(delta);
+        bomb.defuse();
+        drop(w);
+        if replaced {
+            self.retire_version(cur);
         }
+        delta
     }
 
-    #[inline]
-    unsafe fn insert_child_into_node(
-        &self,
-        header: *mut NodeHeader,
-        byte: u8,
-        child: TaggedOffset,
-    ) {
-        match (*header).node_type {
-            NodeType::Node4 => (*(header as *mut Node4)).insert_child(byte, child),
-            NodeType::Node16 => (*(header as *mut Node16)).insert_child(byte, child),
-            NodeType::Node48 => (*(header as *mut Node48)).insert_child(byte, child),
-            NodeType::Node256 => (*(header as *mut Node256)).insert_child(byte, child),
-        }
-    }
-
-    unsafe fn grow_node(&self, header: *mut NodeHeader) -> Option<u32> {
-        match (*header).node_type {
-            NodeType::Node4 => {
-                let old = &*(header as *const Node4);
-                let n16_off = self.alloc_node16(old.header.prefix_slice())?;
-                let n16 = self.arena.get_pointer_mut(n16_off) as *mut Node16;
-                (*n16).header.exact_leaf.store(
-                    old.header.exact_leaf.load(Ordering::Relaxed),
-                    Ordering::Relaxed,
-                );
-                for i in 0..old.header.num_children() as usize {
-                    let child = TaggedOffset(old.children[i].load(Ordering::Relaxed));
-                    (*n16).insert_child(old.keys[i], child);
-                }
-                Some(n16_off)
-            }
-            NodeType::Node16 => {
-                let old = &*(header as *const Node16);
-                let n48_off = self.alloc_node48(old.header.prefix_slice())?;
-                let n48 = self.arena.get_pointer_mut(n48_off) as *mut Node48;
-                (*n48).header.exact_leaf.store(
-                    old.header.exact_leaf.load(Ordering::Relaxed),
-                    Ordering::Relaxed,
-                );
-                for i in 0..old.header.num_children() as usize {
-                    let child = TaggedOffset(old.children[i].load(Ordering::Relaxed));
-                    (*n48).insert_child(old.keys[i], child);
-                }
-                Some(n48_off)
-            }
-            NodeType::Node48 => {
-                let old = &*(header as *const Node48);
-                let n256_off = self.alloc_node256(old.header.prefix_slice())?;
-                let n256 = self.arena.get_pointer_mut(n256_off) as *mut Node256;
-                (*n256).header.exact_leaf.store(
-                    old.header.exact_leaf.load(Ordering::Relaxed),
-                    Ordering::Relaxed,
-                );
-                let mut min_byte = 0u8;
-                while let Some(byte) = next_present_byte(&old.child_bitmap, min_byte) {
-                    let slot = old.child_indices[byte as usize];
-                    let child = TaggedOffset(old.children[slot as usize].load(Ordering::Relaxed));
-                    (*n256).insert_child(byte, child);
-                    if byte == 255 {
-                        break;
-                    }
-                    min_byte = byte + 1;
-                }
-                Some(n256_off)
-            }
-            NodeType::Node256 => unreachable!("Node256 is maximum node type"),
-        }
-    }
-
-    pub(crate) fn find_successor(
-        &self,
-        search_key: &[u8],
-        include_equal: bool,
-    ) -> Option<*const VersionedLeaf<K, V>> {
-        'retry: loop {
-            let root_raw = self.root.load(Ordering::Acquire);
-            if root_raw == 0 {
-                return None;
-            }
-            let root_offset = TaggedOffset(root_raw);
-
-            match unsafe { self.find_successor_in_node(root_offset, search_key, 0, include_equal) }
-            {
-                Ok(leaf) => return leaf,
-                Err(()) => {
-                    std::hint::spin_loop();
-                    continue 'retry;
-                }
-            }
-        }
-    }
-
-    unsafe fn find_successor_in_node(
-        &self,
-        offset: TaggedOffset,
-        search_key: &[u8],
-        depth: usize,
-        include_equal: bool,
-    ) -> Result<Option<*const VersionedLeaf<K, V>>, ()> {
-        if offset.is_null() {
+    /// The deprecated unversioned remove (§11.5): a same-version tombstone in
+    /// place of a live head. Returns the leaf and the replaced head.
+    pub(crate) fn remove_head(&self, key: &[u8]) -> RemovedHead<K, V> {
+        let Some(leaf_ptr) = self.raw.get(key) else {
+            return Ok(None);
+        };
+        // Allocated before the latch; its version is set before publication.
+        let tomb = self.alloc_version(0, None).map_err(|_| ())?;
+        let arena = &**self.arena();
+        // SAFETY: arena leaves are valid for the map's life.
+        let leaf = unsafe { leaf_ptr.as_ref() };
+        let Some(w) = leaf.chain_latch.lock() else {
+            unreachable!("arena chain latches are never obsoleted")
+        };
+        let head = leaf.head();
+        // SAFETY: a version node of this arena.
+        let h = unsafe { arena.ptr::<VersionNode<V>>(head).as_ref() };
+        if h.is_tombstone() {
+            // The unused tombstone is abandoned in place; it owns nothing.
             return Ok(None);
         }
-        if offset.is_leaf() {
-            let leaf_ptr =
-                self.arena.get_pointer(offset.leaf_offset()) as *const VersionedLeaf<K, V>;
-            let leaf = &*leaf_ptr;
-            let k = leaf.key.as_bytes();
-            let cmp = k.cmp(search_key);
-            if (include_equal && cmp >= std::cmp::Ordering::Equal)
-                || (!include_equal && cmp == std::cmp::Ordering::Greater)
-            {
-                return Ok(Some(leaf_ptr));
-            } else {
-                return Ok(None);
-            }
+        // SAFETY: unpublished; exclusively ours until `set_head`.
+        unsafe {
+            let t = arena.ptr::<VersionNode<V>>(tomb).as_ptr();
+            (*t).version = h.version;
+            (*t).init_next(h.next());
         }
-
-        let header_ptr = self.arena.get_pointer(offset.inner_offset()) as *const NodeHeader;
-        let header = &*header_ptr;
-        let v = match header.latch.read_version() {
-            Some(v) => v,
-            None => return Err(()),
-        };
-
-        let remaining_key = if depth < search_key.len() {
-            &search_key[depth..]
-        } else {
-            &[]
-        };
-        let prefix = header.prefix_slice();
-
-        if prefix > remaining_key {
-            if !header.latch.validate(v) {
-                return Err(());
-            }
-            return Ok(crate::arena::versioned_iter::first_leaf_in_subtree(
-                self, offset,
-            ));
-        } else if prefix < remaining_key && !remaining_key.starts_with(prefix) {
-            if !header.latch.validate(v) {
-                return Err(());
-            }
-            return Ok(None);
-        }
-
-        let new_depth = depth + header.prefix_len as usize;
-
-        if new_depth == search_key.len() {
-            if include_equal {
-                let exact_raw = header.exact_leaf.load(Ordering::Acquire);
-                if exact_raw != 0 {
-                    if !header.latch.validate(v) {
-                        return Err(());
-                    }
-                    let leaf_ptr = self
-                        .arena
-                        .get_pointer(TaggedOffset(exact_raw).leaf_offset())
-                        as *const VersionedLeaf<K, V>;
-                    return Ok(Some(leaf_ptr));
-                }
-            }
-
-            if let Some(leaf) = self.find_first_child_leaf(header_ptr, 0) {
-                if !header.latch.validate(v) {
-                    return Err(());
-                }
-                return Ok(Some(leaf));
-            }
-
-            if !header.latch.validate(v) {
-                return Err(());
-            }
-            return Ok(None);
-        }
-
-        let next_byte = search_key[new_depth];
-
-        if let Some(child) = find_child(header_ptr as *mut _, next_byte) {
-            let res =
-                self.find_successor_in_node(child, search_key, new_depth + 1, include_equal)?;
-            if res.is_some() {
-                if !header.latch.validate(v) {
-                    return Err(());
-                }
-                return Ok(res);
-            }
-        }
-
-        if (next_byte as usize) < 255 {
-            if let Some(leaf) = self.find_first_child_leaf(header_ptr, next_byte + 1) {
-                if !header.latch.validate(v) {
-                    return Err(());
-                }
-                return Ok(Some(leaf));
-            }
-        }
-
-        if !header.latch.validate(v) {
-            return Err(());
-        }
-        Ok(None)
-    }
-
-    unsafe fn find_first_child_leaf(
-        &self,
-        header: *const NodeHeader,
-        min_byte: u8,
-    ) -> Option<*const VersionedLeaf<K, V>> {
-        let n_type = (*header).node_type;
-        match n_type {
-            NodeType::Node4 => {
-                let n = &*(header as *const Node4);
-                let count = n.header.num_children() as usize;
-                for i in 0..count {
-                    if n.keys[i] >= min_byte {
-                        let raw = n.children[i].load(Ordering::Acquire);
-                        if raw != 0 {
-                            if let Some(leaf) = crate::arena::versioned_iter::first_leaf_in_subtree(
-                                self,
-                                TaggedOffset(raw),
-                            ) {
-                                return Some(leaf);
-                            }
-                        }
-                    }
-                }
-                None
-            }
-            NodeType::Node16 => {
-                let n = &*(header as *const Node16);
-                let count = n.header.num_children() as usize;
-                for i in 0..count {
-                    if n.keys[i] >= min_byte {
-                        let raw = n.children[i].load(Ordering::Acquire);
-                        if raw != 0 {
-                            if let Some(leaf) = crate::arena::versioned_iter::first_leaf_in_subtree(
-                                self,
-                                TaggedOffset(raw),
-                            ) {
-                                return Some(leaf);
-                            }
-                        }
-                    }
-                }
-                None
-            }
-            NodeType::Node48 => {
-                let n = &*(header as *const Node48);
-                let mut b = min_byte;
-                while let Some(byte) = next_present_byte(&n.child_bitmap, b) {
-                    let slot = n.child_indices[byte as usize];
-                    if slot != NODE48_EMPTY {
-                        let raw = n.children[slot as usize].load(Ordering::Acquire);
-                        if raw != 0 {
-                            if let Some(leaf) = crate::arena::versioned_iter::first_leaf_in_subtree(
-                                self,
-                                TaggedOffset(raw),
-                            ) {
-                                return Some(leaf);
-                            }
-                        }
-                    }
-                    if byte == 255 {
-                        break;
-                    }
-                    b = byte + 1;
-                }
-                None
-            }
-            NodeType::Node256 => {
-                let n = &*(header as *const Node256);
-                let mut b = min_byte;
-                while let Some(byte) = next_present_byte(&n.child_bitmap, b) {
-                    let raw = n.children[byte as usize].load(Ordering::Acquire);
-                    if raw != 0 {
-                        if let Some(leaf) = crate::arena::versioned_iter::first_leaf_in_subtree(
-                            self,
-                            TaggedOffset(raw),
-                        ) {
-                            return Some(leaf);
-                        }
-                    }
-                    if byte == 255 {
-                        break;
-                    }
-                    b = byte + 1;
-                }
-                None
-            }
-        }
-    }
-
-    pub(crate) fn last_leaf(&self) -> Option<*const VersionedLeaf<K, V>> {
-        let root_raw = self.root.load(Ordering::Acquire);
-        if root_raw == 0 {
-            return None;
-        }
-        unsafe { crate::arena::versioned_iter::last_leaf_in_subtree(self, TaggedOffset(root_raw)) }
-    }
-
-    pub(crate) fn find_predecessor(
-        &self,
-        search_key: &[u8],
-        include_equal: bool,
-    ) -> Option<*const VersionedLeaf<K, V>> {
-        'retry: loop {
-            let root_raw = self.root.load(Ordering::Acquire);
-            if root_raw == 0 {
-                return None;
-            }
-            let root_offset = TaggedOffset(root_raw);
-
-            match unsafe {
-                self.find_predecessor_in_node(root_offset, search_key, 0, include_equal)
-            } {
-                Ok(leaf) => return leaf,
-                Err(()) => {
-                    std::hint::spin_loop();
-                    continue 'retry;
-                }
-            }
-        }
-    }
-
-    unsafe fn find_predecessor_in_node(
-        &self,
-        offset: TaggedOffset,
-        search_key: &[u8],
-        depth: usize,
-        include_equal: bool,
-    ) -> Result<Option<*const VersionedLeaf<K, V>>, ()> {
-        if offset.is_null() {
-            return Ok(None);
-        }
-        if offset.is_leaf() {
-            let leaf_ptr =
-                self.arena.get_pointer(offset.leaf_offset()) as *const VersionedLeaf<K, V>;
-            let leaf = &*leaf_ptr;
-            let k = leaf.key.as_bytes();
-            let cmp = k.cmp(search_key);
-            if (include_equal && cmp <= std::cmp::Ordering::Equal)
-                || (!include_equal && cmp == std::cmp::Ordering::Less)
-            {
-                return Ok(Some(leaf_ptr));
-            } else {
-                return Ok(None);
-            }
-        }
-
-        let header_ptr = self.arena.get_pointer(offset.inner_offset()) as *const NodeHeader;
-        let header = &*header_ptr;
-        let v = match header.latch.read_version() {
-            Some(v) => v,
-            None => return Err(()),
-        };
-
-        let remaining_key = if depth < search_key.len() {
-            &search_key[depth..]
-        } else {
-            &[]
-        };
-        let prefix = header.prefix_slice();
-
-        if prefix < remaining_key && !remaining_key.starts_with(prefix) {
-            if !header.latch.validate(v) {
-                return Err(());
-            }
-            return Ok(crate::arena::versioned_iter::last_leaf_in_subtree(
-                self, offset,
-            ));
-        } else if prefix > remaining_key {
-            if !header.latch.validate(v) {
-                return Err(());
-            }
-            return Ok(None);
-        }
-
-        let new_depth = depth + header.prefix_len as usize;
-
-        if new_depth >= search_key.len() {
-            if include_equal {
-                let exact_raw = header.exact_leaf.load(Ordering::Acquire);
-                if exact_raw != 0 {
-                    if !header.latch.validate(v) {
-                        return Err(());
-                    }
-                    let leaf_ptr = self
-                        .arena
-                        .get_pointer(TaggedOffset(exact_raw).leaf_offset())
-                        as *const VersionedLeaf<K, V>;
-                    return Ok(Some(leaf_ptr));
-                }
-            }
-            if !header.latch.validate(v) {
-                return Err(());
-            }
-            return Ok(None);
-        }
-
-        let next_byte = search_key[new_depth];
-
-        if let Some(child) = find_child(header_ptr as *mut _, next_byte) {
-            let res =
-                self.find_predecessor_in_node(child, search_key, new_depth + 1, include_equal)?;
-            if res.is_some() {
-                if !header.latch.validate(v) {
-                    return Err(());
-                }
-                return Ok(res);
-            }
-        }
-
-        if next_byte > 0 {
-            if let Some(leaf) = self.find_last_child_leaf(header_ptr, next_byte - 1) {
-                if !header.latch.validate(v) {
-                    return Err(());
-                }
-                return Ok(Some(leaf));
-            }
-        }
-
-        let exact_raw = header.exact_leaf.load(Ordering::Acquire);
-        if exact_raw != 0 {
-            if !header.latch.validate(v) {
-                return Err(());
-            }
-            let leaf_ptr = self
-                .arena
-                .get_pointer(TaggedOffset(exact_raw).leaf_offset())
-                as *const VersionedLeaf<K, V>;
-            return Ok(Some(leaf_ptr));
-        }
-
-        if !header.latch.validate(v) {
-            return Err(());
-        }
-        Ok(None)
-    }
-
-    unsafe fn find_last_child_leaf(
-        &self,
-        header: *const NodeHeader,
-        max_byte: u8,
-    ) -> Option<*const VersionedLeaf<K, V>> {
-        let n_type = (*header).node_type;
-        match n_type {
-            NodeType::Node4 => {
-                let n = &*(header as *const Node4);
-                for i in (0..n.header.num_children() as usize).rev() {
-                    if n.keys[i] <= max_byte {
-                        let raw = n.children[i].load(Ordering::Acquire);
-                        if raw != 0 {
-                            if let Some(leaf) = crate::arena::versioned_iter::last_leaf_in_subtree(
-                                self,
-                                TaggedOffset(raw),
-                            ) {
-                                return Some(leaf);
-                            }
-                        }
-                    }
-                }
-                None
-            }
-            NodeType::Node16 => {
-                let n = &*(header as *const Node16);
-                for i in (0..n.header.num_children() as usize).rev() {
-                    if n.keys[i] <= max_byte {
-                        let raw = n.children[i].load(Ordering::Acquire);
-                        if raw != 0 {
-                            if let Some(leaf) = crate::arena::versioned_iter::last_leaf_in_subtree(
-                                self,
-                                TaggedOffset(raw),
-                            ) {
-                                return Some(leaf);
-                            }
-                        }
-                    }
-                }
-                None
-            }
-            NodeType::Node48 => {
-                let n = &*(header as *const Node48);
-                let mut b = max_byte;
-                while let Some(byte) = prev_present_byte(&n.child_bitmap, b) {
-                    let slot = n.child_indices[byte as usize];
-                    if slot != NODE48_EMPTY {
-                        let raw = n.children[slot as usize].load(Ordering::Acquire);
-                        if raw != 0 {
-                            if let Some(leaf) = crate::arena::versioned_iter::last_leaf_in_subtree(
-                                self,
-                                TaggedOffset(raw),
-                            ) {
-                                return Some(leaf);
-                            }
-                        }
-                    }
-                    if byte == 0 {
-                        break;
-                    }
-                    b = byte - 1;
-                }
-                None
-            }
-            NodeType::Node256 => {
-                let n = &*(header as *const Node256);
-                let mut b = max_byte;
-                while let Some(byte) = prev_present_byte(&n.child_bitmap, b) {
-                    let raw = n.children[byte as usize].load(Ordering::Acquire);
-                    if raw != 0 {
-                        if let Some(leaf) = crate::arena::versioned_iter::last_leaf_in_subtree(
-                            self,
-                            TaggedOffset(raw),
-                        ) {
-                            return Some(leaf);
-                        }
-                    }
-                    if byte == 0 {
-                        break;
-                    }
-                    b = byte - 1;
-                }
-                None
-            }
-        }
-    }
-
-    #[inline]
-    unsafe fn insert_version_into_leaf(
-        &self,
-        leaf_ptr: *const VersionedLeaf<K, V>,
-        new_node_offset: u32,
-    ) -> bool {
-        let clean_new = new_node_offset & !1;
-        let new_node = &mut *(self.arena.get_pointer_mut(clean_new) as *mut ArenaVersionNode<V>);
-        let new_ver = new_node.version;
-        let versions_atomic = unsafe { &(*leaf_ptr).versions_offset };
-        let mut was_removed = false;
-
-        let mut cur_head = versions_atomic.load(Ordering::Acquire);
-        loop {
-            if cur_head == 0 {
-                new_node.next_version_offset.store(0, Ordering::Relaxed);
-                match versions_atomic.compare_exchange_weak(
-                    0,
-                    clean_new,
-                    Ordering::Release,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => return was_removed,
-                    Err(actual) => cur_head = actual,
-                }
-            } else {
-                let head_node =
-                    &*(self.arena.get_pointer(cur_head & !1) as *const ArenaVersionNode<V>);
-                if new_ver > head_node.version {
-                    if head_node.removed.load(Ordering::Acquire) {
-                        was_removed = true;
-                    }
-                    new_node
-                        .next_version_offset
-                        .store(cur_head & !1, Ordering::Relaxed);
-                    match versions_atomic.compare_exchange_weak(
-                        cur_head,
-                        clean_new,
-                        Ordering::Release,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => return was_removed,
-                        Err(actual) => cur_head = actual,
-                    }
-                } else if new_ver == head_node.version {
-                    // Replace head with updated value for same version
-                    let next = head_node.next_version_offset.load(Ordering::Acquire);
-                    new_node
-                        .next_version_offset
-                        .store(next & !1, Ordering::Relaxed);
-                    match versions_atomic.compare_exchange_weak(
-                        cur_head,
-                        clean_new,
-                        Ordering::Release,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => return false,
-                        Err(actual) => cur_head = actual,
-                    }
-                } else {
-                    let mut prev = head_node as *const ArenaVersionNode<V>;
-                    loop {
-                        let next_off = (*prev).next_version_offset.load(Ordering::Acquire);
-                        if next_off == 0 {
-                            new_node.next_version_offset.store(0, Ordering::Relaxed);
-                            match (*prev).next_version_offset.compare_exchange_weak(
-                                0,
-                                clean_new,
-                                Ordering::Release,
-                                Ordering::Acquire,
-                            ) {
-                                Ok(_) => return false,
-                                Err(_) => continue,
-                            }
-                        }
-                        let next_node =
-                            &*(self.arena.get_pointer(next_off & !1) as *const ArenaVersionNode<V>);
-                        if next_node.version < new_ver {
-                            new_node
-                                .next_version_offset
-                                .store(next_off & !1, Ordering::Relaxed);
-                            match (*prev).next_version_offset.compare_exchange_weak(
-                                next_off,
-                                clean_new,
-                                Ordering::Release,
-                                Ordering::Acquire,
-                            ) {
-                                Ok(_) => return false,
-                                Err(_) => continue,
-                            }
-                        } else if next_node.version == new_ver {
-                            // Replace duplicate middle version
-                            let next_next = next_node.next_version_offset.load(Ordering::Acquire);
-                            new_node
-                                .next_version_offset
-                                .store(next_next & !1, Ordering::Relaxed);
-                            match (*prev).next_version_offset.compare_exchange_weak(
-                                next_off,
-                                clean_new,
-                                Ordering::Release,
-                                Ordering::Acquire,
-                            ) {
-                                Ok(_) => return false,
-                                Err(_) => continue,
-                            }
-                        } else {
-                            prev = next_node;
-                        }
-                    }
-                }
-            }
-        }
+        let bomb = AbortOnUnwind;
+        leaf.set_head(&w, tomb);
+        h.mark_superseded(&w);
+        self.raw.len_add(-1);
+        bomb.defuse();
+        drop(w);
+        self.retire_version(head);
+        Ok(Some((leaf_ptr, head)))
     }
 }
 
-#[inline(always)]
-fn is_node_full(header: &NodeHeader) -> bool {
-    match header.node_type {
-        NodeType::Node4 => header.num_children() >= 4,
-        NodeType::Node16 => header.num_children() >= 16,
-        NodeType::Node48 => header.num_children() >= 48,
-        NodeType::Node256 => false,
-    }
-}
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use crate::arena::tree::FAST_PATH_HITS;
 
-#[inline(always)]
-fn longest_common_prefix(a: &[u8], b: &[u8]) -> usize {
-    let len = a.len().min(b.len());
-    let mut i = 0;
-    while i < len && a[i] == b[i] {
-        i += 1;
+    fn hits() -> usize {
+        FAST_PATH_HITS.with(|n| n.get())
     }
-    i
+
+    /// §12.7: the versioned inserter's fast path hits for sequential new keys
+    /// and every key is placed where a descent finds it.
+    #[test]
+    fn versioned_inserter_fast_path_hits_for_sequential_keys() {
+        let t = ArenaVersionedTree::<Vec<u8>, u64>::new(Arena::with_capacity(8 << 20));
+        let mut cache = InserterCache::new();
+        let before = hits();
+        for i in 0..200u8 {
+            t.insert(vec![b'k', i], 1, Some(i as u64), Some(&mut cache))
+                .ok()
+                .unwrap();
+        }
+        let hit = hits() - before;
+        assert!(
+            hit >= 190,
+            "only {hit} of 200 sequential inserts used the fast path"
+        );
+        for i in 0..200u8 {
+            assert!(t.raw.get(&[b'k', i]).is_some());
+        }
+    }
 }

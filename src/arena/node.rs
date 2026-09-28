@@ -12,467 +12,218 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+//! # Arena leaf and version types (§12.2)
+//!
+//! All immutable once published (Inv 1), except for the `removed` and
+//! `superseded` flags, the version-chain links (written by the chain-latch
+//! holder), and the retired-list links (written before retirement).
 
-use crate::latch::HybridLatch;
-use crate::node::{NodeType, MAX_PREFIX_LEN, NODE48_EMPTY};
-use crate::simd::find_child_node16;
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
-/// Tag bit distinguishing a Leaf offset from an Inner Node offset.
-pub const TAG_LEAF: u32 = 0b01;
+use std::marker::PhantomData;
+use std::ptr::NonNull;
 
-/// A 32-bit tagged arena offset pointing to either a Leaf or an Inner Node.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-#[repr(transparent)]
-pub struct TaggedOffset(pub u32);
+use crate::arena::storage::ArenaLeaf;
+use crate::arena::Arena;
+use crate::key::AsBytes;
+use crate::latch::{HybridLatch, WriteGuard};
+use crate::raw::LeafNode;
+use crate::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-impl TaggedOffset {
-    pub const NULL: Self = Self(0);
-
-    #[inline(always)]
-    pub fn from_leaf(offset: u32) -> Self {
-        debug_assert_eq!(offset & TAG_LEAF, 0, "offset must be 8-byte aligned");
-        Self(offset | TAG_LEAF)
-    }
-
-    #[inline(always)]
-    pub fn from_inner(offset: u32) -> Self {
-        debug_assert_eq!(offset & TAG_LEAF, 0, "offset must be 8-byte aligned");
-        Self(offset)
-    }
-
-    #[inline(always)]
-    pub fn is_null(self) -> bool {
-        self.0 == 0
-    }
-
-    #[inline(always)]
-    pub fn is_leaf(self) -> bool {
-        (self.0 & TAG_LEAF) != 0
-    }
-
-    #[inline(always)]
-    pub fn leaf_offset(self) -> u32 {
-        debug_assert!(self.is_leaf());
-        self.0 & !TAG_LEAF
-    }
-
-    #[inline(always)]
-    pub fn inner_offset(self) -> u32 {
-        debug_assert!(!self.is_leaf());
-        self.0
-    }
-
-    #[inline(always)]
-    pub fn raw(self) -> u32 {
-        self.0
-    }
-}
-
-/// Compact unversioned leaf node allocated within an [`Arena`].
+/// A leaf of an [`ArenaArtMap`](crate::ArenaArtMap).
 #[repr(C, align(8))]
-pub struct Leaf<K, V> {
-    pub removed: AtomicBool,
-    pub _pad: [u8; 7],
-    pub key: K,
-    pub value: V,
+pub(crate) struct Leaf<K, V> {
+    /// Set by the thread that unlinks or supersedes the leaf.
+    pub(crate) removed: AtomicBool,
+    next_retired: AtomicU32,
+    pub(crate) key: K,
+    pub(crate) value: V,
 }
 
 impl<K, V> Leaf<K, V> {
-    #[inline]
-    #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn init(ptr: *mut Self, key: K, value: V) {
-        unsafe {
-            std::ptr::write(
-                ptr,
-                Self {
-                    removed: AtomicBool::new(false),
-                    _pad: [0; 7],
-                    key,
-                    value,
-                },
-            );
+    pub(crate) fn new(key: K, value: V) -> Self {
+        Self {
+            removed: AtomicBool::new(false),
+            next_retired: AtomicU32::new(0),
+            key,
+            value,
         }
+    }
+
+    #[inline]
+    pub(crate) fn is_removed(&self) -> bool {
+        self.removed.load(Ordering::Acquire)
     }
 }
 
-/// A version entry in an arena MVCC version chain.
-#[repr(C, align(8))]
-pub struct ArenaVersionNode<V> {
-    pub removed: AtomicBool,
-    pub _pad: [u8; 3],
-    /// 32-bit offset to next older version in arena, or 0 if none.
-    pub next_version_offset: AtomicU32,
-    pub version: u64,
-    pub value: V,
-}
+impl<K: AsBytes, V> LeafNode for Leaf<K, V> {
+    #[inline(always)]
+    fn key_bytes(&self) -> &[u8] {
+        self.key.as_bytes()
+    }
 
-impl<V> ArenaVersionNode<V> {
     #[inline]
-    #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn init(ptr: *mut Self, version: u64, value: V) {
-        unsafe {
-            std::ptr::write(
-                ptr,
-                Self {
-                    removed: AtomicBool::new(false),
-                    _pad: [0; 3],
-                    next_version_offset: AtomicU32::new(0),
-                    version,
-                    value,
-                },
-            );
-        }
+    fn mark_removed(&self) {
+        self.removed.store(true, Ordering::Release);
     }
 }
 
-/// Multi-version (MVCC) leaf anchor allocated within an [`Arena`].
+// SAFETY: the link is only used by the retired list, and `drop_in_arena`
+// drops the key and value once.
+unsafe impl<K, V> ArenaLeaf for Leaf<K, V> {
+    const NEEDS_DROP: bool = std::mem::needs_drop::<K>() || std::mem::needs_drop::<V>();
+
+    #[inline]
+    fn next_retired(&self) -> &AtomicU32 {
+        &self.next_retired
+    }
+
+    unsafe fn drop_in_arena(this: NonNull<Self>, _arena: &Arena) {
+        // SAFETY: exclusive access, called once; the bytes stay in the arena.
+        unsafe { this.drop_in_place() }
+    }
+}
+
+/// One version of a key in an [`ArenaVersionedArtMap`](crate::ArenaVersionedArtMap).
 #[repr(C, align(8))]
-pub struct VersionedLeaf<K, V> {
-    pub key: K,
-    /// 32-bit offset to newest ArenaVersionNode in arena.
-    pub versions_offset: AtomicU32,
-    pub _marker: std::marker::PhantomData<V>,
+pub(crate) struct VersionNode<V> {
+    pub(crate) version: u64,
+    /// Offset of the next older version, or 0. Written by the chain-latch
+    /// holder (`Release`); loaded with `Acquire`.
+    next: AtomicU32,
+    /// Link of the retired-versions list.
+    pub(crate) next_retired: AtomicU32,
+    superseded: AtomicBool,
+    /// `None` is a tombstone. Immutable after publication.
+    pub(crate) value: Option<V>,
+}
+
+impl<V> VersionNode<V> {
+    pub(crate) fn new(version: u64, value: Option<V>) -> Self {
+        Self {
+            version,
+            next: AtomicU32::new(0),
+            next_retired: AtomicU32::new(0),
+            superseded: AtomicBool::new(false),
+            value,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_tombstone(&self) -> bool {
+        self.value.is_none()
+    }
+
+    #[inline]
+    pub(crate) fn next(&self) -> u32 {
+        self.next.load(Ordering::Acquire)
+    }
+
+    /// Builder: the node is not yet published.
+    #[inline]
+    pub(crate) fn init_next(&self, next: u32) {
+        self.next.store(next, Ordering::Relaxed);
+    }
+
+    /// W3: caller holds the owning leaf's chain latch (`_w`).
+    #[inline]
+    pub(crate) fn set_next(&self, _w: &WriteGuard<'_>, next: u32) {
+        self.next.store(next, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn is_superseded(&self) -> bool {
+        self.superseded.load(Ordering::Acquire)
+    }
+
+    /// Caller holds the chain latch and has unlinked the node.
+    #[inline]
+    pub(crate) fn mark_superseded(&self, _w: &WriteGuard<'_>) {
+        self.superseded.store(true, Ordering::Release);
+    }
+}
+
+/// A key and its version chain, newest first.
+#[repr(C, align(8))]
+pub(crate) struct VersionedLeaf<K, V> {
+    next_retired: AtomicU32,
+    /// Offset of the newest version. Never 0 once published.
+    head: AtomicU32,
+    /// Serialises every chain writer; terminal in the lock order (Inv 7).
+    pub(crate) chain_latch: HybridLatch,
+    pub(crate) key: K,
+    _values: PhantomData<V>,
 }
 
 impl<K, V> VersionedLeaf<K, V> {
-    #[inline]
-    #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn init(ptr: *mut Self, key: K, versions_offset: u32) {
-        unsafe {
-            std::ptr::write(
-                ptr,
-                Self {
-                    key,
-                    versions_offset: AtomicU32::new(versions_offset),
-                    _marker: std::marker::PhantomData,
-                },
-            );
+    pub(crate) fn new(key: K, head: u32) -> Self {
+        Self {
+            next_retired: AtomicU32::new(0),
+            head: AtomicU32::new(head),
+            chain_latch: HybridLatch::new(),
+            key,
+            _values: PhantomData,
         }
     }
 
     #[inline]
-    pub fn is_removed(&self, arena: &crate::arena::Arena) -> bool {
-        let head_off = self.versions_offset.load(Ordering::Acquire) & !1;
-        if head_off == 0 {
-            true
-        } else {
-            let node = unsafe { &*(arena.get_pointer(head_off) as *const ArenaVersionNode<V>) };
-            node.removed.load(Ordering::Acquire)
-        }
+    pub(crate) fn head(&self) -> u32 {
+        self.head.load(Ordering::Acquire)
     }
-}
 
-/// Common header for all arena inner nodes, occupying 40 bytes.
-#[repr(C, align(8))]
-pub struct NodeHeader {
-    pub latch: HybridLatch,
-    pub node_type: NodeType,
-    pub num_children: AtomicU16,
-    pub prefix_len: u16,
-    pub prefix: [u8; MAX_PREFIX_LEN],
-    pub _pad: u8,
-    /// 32-bit TaggedOffset pointing to an exact leaf matching this prefix.
-    pub exact_leaf: AtomicU32,
-}
-
-const _: () = assert!(std::mem::size_of::<NodeHeader>() == 40);
-
-impl NodeHeader {
+    /// W3: caller holds the chain latch.
     #[inline]
-    #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn init(ptr: *mut Self, node_type: NodeType, prefix: &[u8]) {
-        let mut p = [0u8; MAX_PREFIX_LEN];
-        let p_len = prefix.len().min(MAX_PREFIX_LEN);
-        p[..p_len].copy_from_slice(&prefix[..p_len]);
-
-        unsafe {
-            std::ptr::write(
-                ptr,
-                Self {
-                    latch: HybridLatch::new(),
-                    node_type,
-                    num_children: AtomicU16::new(0),
-                    prefix_len: prefix.len() as u16,
-                    prefix: p,
-                    _pad: 0,
-                    exact_leaf: AtomicU32::new(0),
-                },
-            );
-        }
+    pub(crate) fn set_head(&self, w: &WriteGuard<'_>, head: u32) {
+        debug_assert!(w.holds(&self.chain_latch));
+        self.head.store(head, Ordering::Release);
     }
 
+    /// Detaches the version chain of a never-published leaf, so that dropping
+    /// the husk drops only its key.
+    ///
+    /// # Safety
+    /// The leaf was never published and is exclusively owned by the caller.
+    #[inline]
+    pub(crate) unsafe fn detach_head_unpublished(&self) {
+        self.head.store(0, Ordering::Relaxed);
+    }
+}
+
+impl<K: AsBytes, V> LeafNode for VersionedLeaf<K, V> {
     #[inline(always)]
-    pub fn num_children(&self) -> u16 {
-        self.num_children.load(Ordering::Relaxed)
+    fn key_bytes(&self) -> &[u8] {
+        self.key.as_bytes()
     }
 
-    #[inline(always)]
-    pub fn inc_num_children(&self) -> u16 {
-        self.num_children.fetch_add(1, Ordering::Relaxed)
+    /// Versioned leaves are never unlinked; tombstones express deletion.
+    #[inline]
+    fn mark_removed(&self) {}
+}
+
+// SAFETY: the link is only used by the retired list; `drop_in_arena` drops
+// the key and every version of the live chain once. Versions unlinked while
+// the map was alive are on the tree's own retired-versions list instead.
+unsafe impl<K, V> ArenaLeaf for VersionedLeaf<K, V> {
+    const NEEDS_DROP: bool = std::mem::needs_drop::<K>() || std::mem::needs_drop::<V>();
+
+    #[inline]
+    fn next_retired(&self) -> &AtomicU32 {
+        &self.next_retired
     }
 
-    #[inline(always)]
-    pub fn dec_num_children(&self) -> u16 {
-        self.num_children.fetch_sub(1, Ordering::Relaxed)
-    }
-
-    #[inline(always)]
-    pub fn prefix_slice(&self) -> &[u8] {
-        let len = (self.prefix_len as usize).min(MAX_PREFIX_LEN);
-        &self.prefix[..len]
-    }
-
-    #[inline(always)]
-    pub fn match_prefix(&self, key: &[u8], depth: usize) -> (usize, bool) {
-        if self.prefix_len == 0 {
-            return (0, true);
+    unsafe fn drop_in_arena(this: NonNull<Self>, arena: &Arena) {
+        // SAFETY: exclusive access, called once.
+        let mut off = unsafe { this.as_ref() }.head.load(Ordering::Relaxed);
+        while off != 0 {
+            // SAFETY: a version node of this arena in the live chain.
+            let n = unsafe { arena.ptr::<VersionNode<V>>(off) };
+            // SAFETY: as above.
+            let next = unsafe { n.as_ref() }.next.load(Ordering::Relaxed);
+            // SAFETY: each live version is dropped exactly once, here.
+            unsafe { n.drop_in_place() };
+            off = next;
         }
-        let remaining = if depth < key.len() {
-            &key[depth..]
-        } else {
-            &[]
-        };
-        let prefix = self.prefix_slice();
-        let max_cmp = prefix.len().min(remaining.len());
-        let mut matched = 0;
-        while matched < max_cmp && prefix[matched] == remaining[matched] {
-            matched += 1;
-        }
-        let complete = matched == self.prefix_len as usize;
-        (matched, complete)
-    }
-}
-
-/// Node with up to 4 children (fits in a single 64-byte cache line).
-#[repr(C, align(8))]
-pub struct Node4 {
-    pub header: NodeHeader,
-    pub keys: [u8; 4],
-    pub children: [AtomicU32; 4],
-    pub _pad: [u8; 4],
-}
-
-const _: () = assert!(std::mem::size_of::<Node4>() == 64);
-
-impl Node4 {
-    #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn init(ptr: *mut Self, prefix: &[u8]) {
-        NodeHeader::init(&mut (*ptr).header, NodeType::Node4, prefix);
-        (*ptr).keys = [0; 4];
-        (*ptr).children = [const { AtomicU32::new(0) }; 4];
-    }
-
-    pub fn insert_child(&mut self, key: u8, child: TaggedOffset) {
-        let count = self.header.num_children() as usize;
-        debug_assert!(count < 4);
-        let pos = self.keys[..count].partition_point(|&k| k < key);
-        for i in (pos..count).rev() {
-            self.keys[i + 1] = self.keys[i];
-            let val = self.children[i].load(Ordering::Relaxed);
-            self.children[i + 1].store(val, Ordering::Relaxed);
-        }
-        self.keys[pos] = key;
-        self.children[pos].store(child.raw(), Ordering::Release);
-        self.header.inc_num_children();
-    }
-}
-
-/// Node with up to 16 children (120 bytes, children fit in 64 bytes).
-#[repr(C, align(8))]
-pub struct Node16 {
-    pub header: NodeHeader,
-    pub keys: [u8; 16],
-    pub children: [AtomicU32; 16],
-}
-
-impl Node16 {
-    #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn init(ptr: *mut Self, prefix: &[u8]) {
-        NodeHeader::init(&mut (*ptr).header, NodeType::Node16, prefix);
-        (*ptr).keys = [0; 16];
-        (*ptr).children = [const { AtomicU32::new(0) }; 16];
-    }
-
-    pub fn insert_child(&mut self, key: u8, child: TaggedOffset) {
-        let count = self.header.num_children() as usize;
-        debug_assert!(count < 16);
-        let pos = self.keys[..count].partition_point(|&k| k < key);
-        for i in (pos..count).rev() {
-            self.keys[i + 1] = self.keys[i];
-            let val = self.children[i].load(Ordering::Relaxed);
-            self.children[i + 1].store(val, Ordering::Relaxed);
-        }
-        self.keys[pos] = key;
-        self.children[pos].store(child.raw(), Ordering::Release);
-        self.header.inc_num_children();
-    }
-}
-
-/// Node with up to 48 children (520 bytes, with 256-bit presence bitmap).
-#[repr(C, align(8))]
-pub struct Node48 {
-    pub header: NodeHeader,
-    pub child_indices: [u8; 256],
-    pub child_bitmap: [AtomicU64; 4],
-    pub children: [AtomicU32; 48],
-}
-
-const _: () = assert!(std::mem::size_of::<Node48>() == 520);
-
-impl Node48 {
-    #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn init(ptr: *mut Self, prefix: &[u8]) {
-        NodeHeader::init(&mut (*ptr).header, NodeType::Node48, prefix);
-        (*ptr).child_indices = [NODE48_EMPTY; 256];
-        (*ptr).child_bitmap = [const { AtomicU64::new(0) }; 4];
-        (*ptr).children = [const { AtomicU32::new(0) }; 48];
-    }
-
-    pub fn insert_child(&mut self, key: u8, child: TaggedOffset) {
-        let count = self.header.num_children() as usize;
-        debug_assert!(count < 48);
-        let slot = (0..48)
-            .find(|&i| self.children[i].load(Ordering::Relaxed) == 0)
-            .expect("Node48 has room");
-        self.children[slot].store(child.raw(), Ordering::Release);
-        self.child_indices[key as usize] = slot as u8;
-        set_bitmap_bit(&self.child_bitmap, key);
-        self.header.inc_num_children();
-    }
-}
-
-/// Node with up to 256 children (1,096 bytes, with 256-bit presence bitmap).
-#[repr(C, align(8))]
-pub struct Node256 {
-    pub header: NodeHeader,
-    pub child_bitmap: [AtomicU64; 4],
-    pub children: [AtomicU32; 256],
-}
-
-const _: () = assert!(std::mem::size_of::<Node256>() == 1096);
-
-impl Node256 {
-    #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn init(ptr: *mut Self, prefix: &[u8]) {
-        NodeHeader::init(&mut (*ptr).header, NodeType::Node256, prefix);
-        (*ptr).child_bitmap = [const { AtomicU64::new(0) }; 4];
-        (*ptr).children = [const { AtomicU32::new(0) }; 256];
-    }
-
-    pub fn insert_child(&mut self, key: u8, child: TaggedOffset) {
-        self.children[key as usize].store(child.raw(), Ordering::Release);
-        set_bitmap_bit(&self.child_bitmap, key);
-        self.header.inc_num_children();
-    }
-}
-
-#[inline(always)]
-pub fn set_bitmap_bit(bitmap: &[AtomicU64; 4], byte: u8) {
-    let word = (byte / 64) as usize;
-    let bit = byte % 64;
-    bitmap[word].fetch_or(1u64 << bit, Ordering::Release);
-}
-
-#[inline(always)]
-pub fn clear_bitmap_bit(bitmap: &[AtomicU64; 4], byte: u8) {
-    let word = (byte / 64) as usize;
-    let bit = byte % 64;
-    bitmap[word].fetch_and(!(1u64 << bit), Ordering::Release);
-}
-
-#[inline(always)]
-#[allow(clippy::needless_range_loop)]
-pub fn next_present_byte(bitmap: &[AtomicU64; 4], min_byte: u8) -> Option<u8> {
-    let start_word = (min_byte / 64) as usize;
-    let start_bit = min_byte % 64;
-
-    for word_idx in start_word..4 {
-        let mut word = bitmap[word_idx].load(Ordering::Acquire);
-        if word_idx == start_word {
-            word &= !0u64 << start_bit;
-        }
-        if word != 0 {
-            let bit = word.trailing_zeros();
-            return Some((word_idx * 64 + bit as usize) as u8);
-        }
-    }
-    None
-}
-
-#[inline(always)]
-pub fn prev_present_byte(bitmap: &[AtomicU64; 4], max_byte: u8) -> Option<u8> {
-    let end_word = (max_byte / 64) as usize;
-    let end_bit = max_byte % 64;
-
-    for word_idx in (0..=end_word).rev() {
-        let mut word = bitmap[word_idx].load(Ordering::Acquire);
-        if word_idx == end_word && end_bit < 63 {
-            word &= (1u64 << (end_bit + 1)) - 1;
-        }
-        if word != 0 {
-            let bit = 63 - word.leading_zeros();
-            return Some((word_idx * 64 + bit as usize) as u8);
-        }
-    }
-    None
-}
-
-#[allow(clippy::missing_safety_doc)]
-pub unsafe fn find_child(header: *mut NodeHeader, byte: u8) -> Option<TaggedOffset> {
-    let n_type = (*header).node_type;
-    match n_type {
-        NodeType::Node4 => {
-            let n = &*(header as *const Node4);
-            let count = n.header.num_children() as usize;
-            for i in 0..count {
-                if n.keys[i] == byte {
-                    let raw = n.children[i].load(Ordering::Acquire);
-                    return if raw == 0 {
-                        None
-                    } else {
-                        Some(TaggedOffset(raw))
-                    };
-                }
-            }
-            None
-        }
-        NodeType::Node16 => {
-            let n = &*(header as *const Node16);
-            let count = n.header.num_children() as usize;
-            if let Some(idx) = find_child_node16(&n.keys, count, byte) {
-                let raw = n.children[idx].load(Ordering::Acquire);
-                if raw == 0 {
-                    None
-                } else {
-                    Some(TaggedOffset(raw))
-                }
-            } else {
-                None
-            }
-        }
-        NodeType::Node48 => {
-            let n = &*(header as *const Node48);
-            let slot = n.child_indices[byte as usize];
-            if slot == NODE48_EMPTY {
-                None
-            } else {
-                let raw = n.children[slot as usize].load(Ordering::Acquire);
-                if raw == 0 {
-                    None
-                } else {
-                    Some(TaggedOffset(raw))
-                }
-            }
-        }
-        NodeType::Node256 => {
-            let n = &*(header as *const Node256);
-            let raw = n.children[byte as usize].load(Ordering::Acquire);
-            if raw == 0 {
-                None
-            } else {
-                Some(TaggedOffset(raw))
-            }
-        }
+        // SAFETY: the key, once.
+        unsafe { std::ptr::addr_of_mut!((*this.as_ptr()).key).drop_in_place() };
     }
 }

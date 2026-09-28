@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use arenaskiplist::{Arena as SkiplistArena, SkipList};
-use artmap::arena::{ArenaArtMap, ArenaInserter, ArenaVersionedArtMap};
+use artmap::arena::{ArenaArtMap, ArenaVersionedArtMap};
 use artmap::versioned::VersionedArtMap;
 use artmap::ArtMap;
 use concread::bptree::BptreeMap;
@@ -99,11 +99,11 @@ fn bench_insert(c: &mut Criterion) {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
                 let map = ArenaArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
-                let mut ins = artmap::arena::ArenaInserter::new();
+                let mut ins = map.inserter();
                 let start = Instant::now();
                 for key in 0..BATCH {
                     let k = key.to_be_bytes();
-                    let _ = map.insert_with_inserter(k, key, &mut ins);
+                    let _ = ins.insert(k, key);
                 }
                 total += start.elapsed();
             }
@@ -134,11 +134,11 @@ fn bench_insert(c: &mut Criterion) {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
                 let map = ArenaVersionedArtMap::<[u8; 8], u64>::with_capacity(64 * 1024 * 1024);
-                let mut ins = ArenaInserter::new();
+                let mut ins = map.inserter();
                 let start = Instant::now();
                 for key in 0..BATCH {
                     let k = key.to_be_bytes();
-                    let _ = map.insert_with_inserter(k, 1, key, &mut ins);
+                    let _ = ins.insert(k, 1, key);
                 }
                 total += start.elapsed();
             }
