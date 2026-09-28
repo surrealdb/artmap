@@ -64,7 +64,8 @@ For the old `insert` behaviour when `V: Clone`, use `insert_cloned(k, v) -> Opti
 - `artmap::Guard<'m>` and `pin()` on `ArtMap` and `VersionedArtMap`.
 - `ArtMap`:
   - `get_with_guard`, `range_with_guard`, `iter_with_guard`, `keys_with_guard` and `values_with_guard`;
-  - `get_value` and `with_value`, which copy out or borrow in a closure without keeping a handle.
+  - `get_value` and `with_value`, which copy out or borrow in a closure without keeping a handle;
+  - `scan(range, |k, v| ...)`, which visits a range under one pin with no per-entry handle.
 - `EntryRef`:
   - `to_owned` and `value_cloned`;
   - `is_removed`;
