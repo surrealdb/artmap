@@ -1321,7 +1321,9 @@ unsafe fn validate_node_invariants<K: AsBytes, V>(ptr: TaggedPtr, current_prefix
         let k = leaf.key.as_bytes();
         assert!(
             k.starts_with(current_prefix),
-            "leaf key must start with accumulated prefix"
+            "leaf key must start with accumulated prefix: k={:?}, prefix={:?}",
+            k,
+            current_prefix
         );
         return 1;
     }
