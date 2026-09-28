@@ -14,7 +14,7 @@ keywords = [
     "radix-tree",
     "trie",
     "concurrent",
-    "lock-free",
+    "mvcc",
 ]
 categories = ["data-structures", "concurrency", "database-implementations"]
 
