@@ -235,6 +235,23 @@ mod tests {
         writer.join().unwrap();
     }
 
+    /// [gap-unwind-contract-fix-interaction-4] Growth retired the old node
+    /// inside `grow_node` and again after unlinking: a double retire.
+    #[test]
+    fn each_grown_node_is_retired_exactly_once() {
+        use crate::raw::heap::RETIRED_NODES;
+        let t = Tree::<Vec<u8>, u64>::new();
+        let g = &crate::guard::pin();
+        t.insert(vec![0, 0], 0, Mode::Replace, g);
+        t.insert(vec![0, 1], 1, Mode::Replace, g);
+        let before = RETIRED_NODES.with(|c| c.get());
+        // One parent grows Node4 -> 16 -> 48 -> 256: three replaced nodes.
+        for b in 2..=255u8 {
+            t.insert(vec![0, b], b as u64, Mode::Replace, g);
+        }
+        assert_eq!(RETIRED_NODES.with(|c| c.get()) - before, 3);
+    }
+
     #[test]
     fn long_shared_prefixes_build_chains() {
         let mut t = Tree::<Vec<u8>, usize>::new();

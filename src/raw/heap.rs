@@ -122,6 +122,8 @@ unsafe impl<L: LeafNode + Send + 'static> Storage for HeapStorage<L> {
     type Guard = crossbeam_epoch::Guard;
 
     unsafe fn retire_node(&self, n: NonNull<NodeHeader<A>>, guard: &crossbeam_epoch::Guard) {
+        #[cfg(test)]
+        RETIRED_NODES.with(|c| c.set(c.get() + 1));
         // SAFETY: the caller guarantees `n` is unlinked, obsolete and retired
         // once; it is a Box allocation of its `node_type`. Inner nodes have no
         // destructor that follows child pointers.
@@ -140,4 +142,10 @@ unsafe impl<L: LeafNode + Send + 'static> Storage for HeapStorage<L> {
         // leaves are Box allocations.
         retire(guard, unsafe { Retired::from_non_null(l) });
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Inner nodes retired on this thread, for the retirement-count test.
+    pub(crate) static RETIRED_NODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
