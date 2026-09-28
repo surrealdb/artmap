@@ -19,7 +19,7 @@ keywords = [
 categories = ["data-structures", "concurrency", "database-implementations"]
 
 [dependencies]
-byteslice = "0.1"
+byteslice = "0.2"
 crossbeam-epoch = "0.9"
 
 [dev-dependencies]
@@ -34,7 +34,7 @@ dashmap = "6.1"
 papaya = "0.2"
 scc = "3.8"
 concread = "0.5"
-vart = "0.10"
+vart = "0.11"
 proptest = { version = "1.10", default-features = false, features = ["std"] }
 
 # The library itself imports loom under `cfg(loom)` (§16.3), so it is a normal

@@ -280,7 +280,7 @@ jobs:
           cargo miri test --target ${{ matrix.target }} --lib
           --test concurrent_correctness --test model --test unwind
           --test regressions --test drop_accounting --test panicking_drop
-          --test linearizability --test proptest_keys
+          --test linearizability --test proptest_keys --test byteslice_keys
           --test sim --test versioned_simulation_tests --test versioned_artmap_tests
 
       - name: Run Miri on the doctests
