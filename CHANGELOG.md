@@ -15,6 +15,8 @@
 
 These cannot be fixed without the API changes below. Upgrade to 0.6.
 
+0.6 also moves to `byteslice` 0.2. In `byteslice` 0.1.0, cloning or slicing a view from `ByteSlice::with_borrowed` could outlive the borrowed buffer, or write to and free memory the caller owns.
+
 ### Breaking changes
 
 **Every map**
@@ -22,6 +24,7 @@ These cannot be fixed without the API changes below. Upgrade to 0.6.
 - The internals are sealed. `artmap::tree`, `artmap::node`, `artmap::latch`, `artmap::simd`, `artmap::versioned::tree` and the `arena::{node, tree, versioned_tree}` modules are private, and `artmap::Tree` is no longer exported.
 - `validate_invariants` takes `&mut self`, so it cannot race a writer. Call it through `Arc::get_mut` after joining your threads.
 - The MSRV is Rust 1.86.
+- `AsBytes` is implemented for `byteslice` 0.2's `ByteSlice`, not 0.1's. `ByteSlice` keys need `byteslice = "0.2"`.
 
 **`ArtMap`**
 
@@ -96,4 +99,3 @@ See `benches/comparison_bench.rs`, `benches/safety_bench.rs` and `benches/memory
 
 ### Known limitations
 - Inner nodes emptied by removes are not reclaimed until `clear()` or drop. Delete-side compaction is planned after 0.6.
-- `byteslice` 0.1.0 is a public dependency (`impl AsBytes for ByteSlice`) with known soundness issues in borrowed views. Fixing it in `byteslice` 0.1.1 is tracked separately.

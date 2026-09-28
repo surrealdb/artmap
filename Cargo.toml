@@ -19,7 +19,7 @@ keywords = [
 categories = ["data-structures", "concurrency", "database-implementations"]
 
 [dependencies]
-byteslice = "0.1"
+byteslice = "0.2"
 crossbeam-epoch = "0.9"
 
 [dev-dependencies]
