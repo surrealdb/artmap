@@ -406,3 +406,142 @@ fn clear_against_remover_never_underflows() {
         assert_eq!(quiescent_check(t), 0);
     });
 }
+
+// ---------------------------------------------------------------------------
+// Version chains (§11.4, §12.7), on the arena map: the heap chain runs the
+// same protocol, with EBR in place of the arena's retired list.
+
+type VMap = crate::arena::ArenaVersionedArtMap<Vec<u8>, u64>;
+
+/// A map holding `k` at version 2 (in the leaf's inline slot).
+fn vmap() -> Arc<VMap> {
+    let m = VMap::with_capacity(1 << 16);
+    m.insert(b"k".to_vec(), 2, 20);
+    Arc::new(m)
+}
+
+fn two_prepends_model() {
+    model(|| {
+        let m = vmap();
+        let (a, b) = (Arc::clone(&m), Arc::clone(&m));
+        par(
+            move || {
+                a.insert(b"k".to_vec(), 3, 30);
+            },
+            move || {
+                b.insert(b"k".to_vec(), 4, 40);
+            },
+        );
+        assert_eq!(
+            m.get_all_versions(&b"k"[..]),
+            vec![(4, Some(40)), (3, Some(30)), (2, Some(20))],
+            "no version is lost"
+        );
+        assert_eq!(m.len(), 1);
+    });
+}
+
+#[test]
+fn chain_two_prepends() {
+    two_prepends_model();
+}
+
+#[test]
+fn chain_mutant_with_unlatched_positions() {
+    assert_mutant_fails(
+        &crate::latch::mutants::CHAIN_POSITION_UNLATCHED,
+        two_prepends_model,
+    );
+}
+
+#[test]
+fn chain_prepend_against_out_of_order_insert() {
+    model(|| {
+        let m = vmap();
+        let (a, b) = (Arc::clone(&m), Arc::clone(&m));
+        par(
+            move || {
+                a.insert(b"k".to_vec(), 3, 30);
+            },
+            move || {
+                b.insert(b"k".to_vec(), 1, 10);
+            },
+        );
+        assert_eq!(
+            m.get_all_versions(&b"k"[..]),
+            vec![(3, Some(30)), (2, Some(20)), (1, Some(10))]
+        );
+        assert_eq!(m.len(), 1);
+    });
+}
+
+#[test]
+fn chain_same_version_replace_against_delete() {
+    model(|| {
+        let m = vmap();
+        let (a, b) = (Arc::clone(&m), Arc::clone(&m));
+        par(
+            move || {
+                a.insert(b"k".to_vec(), 2, 21);
+            },
+            move || {
+                b.delete(b"k".to_vec(), 3);
+            },
+        );
+        assert_eq!(
+            m.get_all_versions(&b"k"[..]),
+            vec![(3, None), (2, Some(21))]
+        );
+        assert_eq!(m.len(), 0, "the tombstone head makes the key absent");
+    });
+}
+
+// Prune (§11.4) exists only on the heap map. Its epoch guards come from
+// `crossbeam-epoch`, which loom does not instrument; the chain itself is
+// loom-visible, and nothing is freed while the model's threads are pinned.
+
+type HMap = crate::VersionedArtMap<Vec<u8>, u64>;
+
+#[test]
+fn chain_prune_tombstone_replacement_against_older_insert() {
+    model(|| {
+        // The head is a user tombstone (value 0) at version 2.
+        let m = Arc::new(HMap::new());
+        m.insert(b"k".to_vec(), 2, 0);
+        let (a, b) = (Arc::clone(&m), Arc::clone(&m));
+        par(
+            move || {
+                a.prune_key(&b"k"[..], u64::MAX, |v| *v == 0);
+            },
+            move || {
+                b.insert(b"k".to_vec(), 1, 10);
+            },
+        );
+        let all = m.get_all_versions(&b"k"[..]);
+        assert_eq!(all[0], (2, None), "the head became a built-in tombstone");
+        assert!(all.windows(2).all(|w| w[0].0 > w[1].0), "sorted: {all:?}");
+        assert!(all.len() <= 2);
+        assert_eq!(m.len(), 0);
+    });
+}
+
+#[test]
+fn chain_prune_detach_against_same_version_head_replace() {
+    model(|| {
+        let m = Arc::new(HMap::new());
+        m.insert(b"k".to_vec(), 1, 10);
+        m.insert(b"k".to_vec(), 2, 20);
+        let (a, b) = (Arc::clone(&m), Arc::clone(&m));
+        par(
+            move || {
+                a.prune_key(&b"k"[..], 2, |_| false);
+            },
+            move || {
+                b.insert(b"k".to_vec(), 2, 21);
+            },
+        );
+        let all = m.get_all_versions(&b"k"[..]);
+        assert_eq!(all, vec![(2, Some(21))], "the replace wins; v1 is pruned");
+        assert_eq!(m.len(), 1);
+    });
+}

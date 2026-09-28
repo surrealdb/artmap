@@ -246,9 +246,17 @@ impl<K: AsBytes, V> ArenaVersionedTree<K, V> {
         // SAFETY: allocated by the caller, unpublished.
         let new = unsafe { arena.ptr::<VersionNode<V>>(node).as_ref() };
         let version = new.version;
-        let Some(w) = leaf.chain_latch.lock() else {
-            unreachable!("arena chain latches are never obsoleted")
+        let lock = || {
+            let Some(w) = leaf.chain_latch.lock() else {
+                unreachable!("arena chain latches are never obsoleted")
+            };
+            w
         };
+        #[cfg(loom)]
+        let unlatched = crate::latch::mutants::CHAIN_POSITION_UNLATCHED.with(|m| m.get());
+        #[cfg(not(loom))]
+        let unlatched = false;
+        let early = (!unlatched).then(lock);
         // Positions are found under the latch.
         let head = leaf.head();
         let old_live = at(head).is_some_and(|h| !h.is_tombstone());
@@ -258,6 +266,7 @@ impl<K: AsBytes, V> ArenaVersionedTree<K, V> {
             prev = cur;
             cur = n.next();
         }
+        let w = early.unwrap_or_else(lock);
         let replaced = at(cur).is_some_and(|n| n.version == version);
         new.init_next(match (replaced, at(cur)) {
             (true, Some(c)) => c.next(),

@@ -45,6 +45,8 @@ pub(crate) mod mutants {
         pub(crate) static SKIP_W1_FENCE: Cell<bool> = const { Cell::new(false) };
         pub(crate) static SKIP_R5_FENCE: Cell<bool> = const { Cell::new(false) };
         pub(crate) static SKIP_R4_COUPLING: Cell<bool> = const { Cell::new(false) };
+        /// Finds a version-chain position before taking `chain_latch` (§11.4).
+        pub(crate) static CHAIN_POSITION_UNLATCHED: Cell<bool> = const { Cell::new(false) };
     }
 }
 
