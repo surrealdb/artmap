@@ -21,7 +21,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use artmap::{ArtMap, VersionedArtMap};
+use artmap::{ArenaArtMap, ArtMap, VersionedArtMap};
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -367,6 +367,18 @@ fn bench_versioned(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_arena_create(c: &mut Criterion) {
+    // Creating an arena must not cost O(capacity): memtables create one per
+    // flush. Pages are zeroed lazily by the OS.
+    let mut group = c.benchmark_group("arena_create");
+    for mib in [64usize, 256] {
+        group.bench_function(format!("{mib}_mib"), |b| {
+            b.iter(|| black_box(ArenaArtMap::<[u8; 8], u64>::with_capacity(mib << 20)))
+        });
+    }
+    group.finish();
+}
+
 fn config() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_millis(500))
@@ -377,6 +389,7 @@ fn config() -> Criterion {
 criterion_group! {
     name = benches;
     config = config();
-    targets = bench_gets, bench_overwrite, bench_churn, bench_scan, bench_hot_node256, bench_versioned
+    targets = bench_gets, bench_overwrite, bench_churn, bench_scan, bench_hot_node256, bench_versioned,
+        bench_arena_create
 }
 criterion_main!(benches);
