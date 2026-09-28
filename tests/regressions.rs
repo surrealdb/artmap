@@ -17,7 +17,7 @@
 
 use std::any::Any;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
 use artmap::{ArtMap, AsBytes, VersionedArtMap};
@@ -36,17 +36,6 @@ fn flush_epochs() {
     for _ in 0..n(4096, 256) {
         m.pin().repin();
     }
-}
-
-/// Waits (bounded) until `drops` reaches `want`, advancing the epoch. Garbage
-/// sits in a thread's local bag until the bag fills or the thread exits, so
-/// callers retire from a worker thread.
-fn await_drops(drops: &AtomicUsize, want: usize) -> usize {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while drops.load(Ordering::Relaxed) < want && std::time::Instant::now() < deadline {
-        crossbeam_epoch::pin().flush();
-    }
-    drops.load(Ordering::Relaxed)
 }
 
 #[test]
@@ -333,42 +322,6 @@ fn versioned_entries_are_snapshots() {
     writer.join().unwrap();
 }
 
-/// A value that counts its drops.
-struct Counted(Arc<AtomicUsize>);
-
-impl Drop for Counted {
-    fn drop(&mut self) {
-        self.0.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-#[test]
-fn prune_retires_every_detached_version_exactly_once() {
-    // [gap-heap-versioned-parity-3, versioned-4] Nodes flagged by remove()
-    // leaked once detached, and prune over-counted.
-    let drops = Arc::new(AtomicUsize::new(0));
-    let d = Arc::clone(&drops);
-    std::thread::spawn(move || {
-        let m = VersionedArtMap::<Vec<u8>, Counted>::new();
-        m.insert(b"k".to_vec(), 1, Counted(Arc::clone(&d)));
-        #[allow(deprecated)]
-        let _ = m.remove(&b"k"[..]);
-        for v in 2..10 {
-            m.insert(b"k".to_vec(), v, Counted(Arc::clone(&d)));
-        }
-        let pruned = m.prune_key(&b"k"[..], 9, |_| false);
-        assert_eq!(pruned, 8, "every older version is detached");
-        assert_eq!(m.version_count(&b"k"[..]), 1);
-        // A user tombstone at the head becomes a built-in tombstone.
-        assert_eq!(m.prune_key(&b"k"[..], 9, |_| true), 1);
-        assert_eq!(m.len(), 0);
-    })
-    .join()
-    .unwrap();
-    // Nine values were created; every one is dropped exactly once.
-    assert_eq!(await_drops(&drops, 9), 9, "leaked or double-dropped");
-}
-
 #[test]
 fn concurrent_prunes_with_different_watermarks() {
     // [v2:coverage-gaps#4] Two overlapping prunes double-retired nodes once
@@ -445,60 +398,6 @@ fn cloning_a_handle_in_a_thread_local_destructor_never_uafs() {
     });
     std::thread::spawn(|| GUARD.with(|_| ())).join().unwrap();
     remover.join().unwrap();
-}
-
-#[test]
-fn every_heap_key_and_value_is_dropped_exactly_once() {
-    // Phase 3 exit: all heap ArtMap K/V are dropped after map drop plus flush.
-    #[derive(Clone)]
-    struct K(Vec<u8>, Arc<AtomicUsize>);
-    impl Drop for K {
-        fn drop(&mut self) {
-            self.1.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    impl AsBytes for K {
-        fn as_bytes(&self) -> &[u8] {
-            &self.0
-        }
-    }
-    impl std::borrow::Borrow<[u8]> for K {
-        fn borrow(&self) -> &[u8] {
-            &self.0
-        }
-    }
-    let drops = Arc::new(AtomicUsize::new(0));
-    let d = Arc::clone(&drops);
-    let created = std::thread::spawn(move || {
-        let mut created = 0;
-        let m = ArtMap::<K, Counted>::new();
-        for i in 0..n(2000, 60) {
-            let k = format!("k{:03}", i % 97).into_bytes();
-            let _ = m.insert(K(k.clone(), Arc::clone(&d)), Counted(Arc::clone(&d)));
-            created += 2;
-            if i % 5 == 0 {
-                let _ = m.remove(&k[..]);
-            }
-            if i % 7 == 0 {
-                // An existing key discards the key passed in; an absent one
-                // also builds a value.
-                let built = Cell::new(false);
-                let _ = m.get_or_insert_with(K(k, Arc::clone(&d)), || {
-                    built.set(true);
-                    Counted(Arc::clone(&d))
-                });
-                created += 1 + usize::from(built.get());
-            }
-        }
-        created
-    })
-    .join()
-    .unwrap();
-    assert_eq!(
-        await_drops(&drops, created),
-        created,
-        "leaked or double-dropped"
-    );
 }
 
 #[test]

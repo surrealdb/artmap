@@ -279,7 +279,8 @@ jobs:
         run: >
           cargo miri test --target ${{ matrix.target }} --lib
           --test concurrent_correctness --test model --test unwind
-          --test regressions --test linearizability --test proptest_keys
+          --test regressions --test drop_accounting --test panicking_drop
+          --test linearizability --test proptest_keys
           --test sim --test versioned_simulation_tests --test versioned_artmap_tests
 
       - name: Run Miri on the doctests
@@ -376,7 +377,7 @@ jobs:
         run: >
           cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --release --lib
           --test concurrent_correctness --test concurrency_stress_tests
-          --test regressions --test linearizability
+          --test regressions --test drop_accounting --test linearizability
           --test arena_regressions --test unwind -- --test-threads=1
 
   stress-release:
