@@ -436,8 +436,6 @@ jobs:
   semver-checks:
     name: Semver checks
     runs-on: ubuntu-latest
-    # 0.6 is intentionally breaking; this reports until the version bump.
-    continue-on-error: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
