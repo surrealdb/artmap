@@ -3,6 +3,7 @@ name = "artmap"
 publish = true
 version = "0.5.0"
 edition = "2021"
+rust-version = "1.86"
 license = "Apache-2.0"
 readme = "README.md"
 description = "A concurrent in-memory Adaptive Radix Tree (ART) featuring optimistic lock coupling."
@@ -35,11 +36,18 @@ scc = "3.8"
 concread = "0.5"
 vart = "0.10"
 
-[target.'cfg(loom)'.dev-dependencies]
+# The library itself imports loom under `cfg(loom)` (§16.3), so it is a normal
+# dependency; dev-dependencies are invisible to the lib.
+[target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(loom)',
+    'cfg(crossbeam_loom)',
+    'cfg(artmap_hooks)',
+    'cfg(artmap_provenance_lints)',
+] }
 
 [[bench]]
 name = "artmap_bench"
@@ -80,3 +88,11 @@ trivially_copy_pass_by_ref = "warn"
 unnecessary_to_owned = "warn"
 unwrap_used = "allow"
 used_underscore_binding = "warn"
+
+[[bench]]
+name = "safety_bench"
+harness = false
+
+[[bench]]
+name = "memory_bench"
+harness = false
