@@ -12,68 +12,82 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # Range Iterators for ArenaArtMap
-//!
-//! Provides zero-allocation bidirectional range scanning for [`ArenaArtMap`](crate::arena::ArenaArtMap).
+//! # Entries and iterators of an [`ArenaArtMap`](crate::ArenaArtMap)
+
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
 use std::marker::PhantomData;
 use std::ops::{Bound, Deref};
-use std::sync::atomic::Ordering;
+use std::ptr::NonNull;
 
-use crate::arena::node::{
-    next_present_byte, prev_present_byte, Leaf, Node16, Node256, Node4, Node48, NodeHeader,
-    TaggedOffset,
-};
-use crate::arena::tree::ArenaTree;
+use crate::arena::node::Leaf;
+use crate::arena::tree::{ArenaTree, Storage};
 use crate::key::AsBytes;
-use crate::node::{NodeType, NODE48_EMPTY};
-use crate::simd::find_child_node16;
+use crate::raw::cursor::{Cursor, KeyBuf};
 
-const MAX_STACK_DEPTH: usize = 16;
-
-#[derive(Clone, Copy)]
-struct CursorFrame {
-    node_offset: u32,
-    current_pos: usize,
+/// An entry of an [`ArenaArtMap`](crate::ArenaArtMap), valid and unchanged for
+/// the whole map borrow (arena memory is never reused while the map is alive).
+///
+/// Neither `Send` nor `Sync`.
+pub struct ArenaEntryRef<'a, K, V> {
+    leaf: NonNull<Leaf<K, V>>,
+    _map: PhantomData<&'a ArenaTree<K, V>>,
 }
 
-impl CursorFrame {
-    const NULL: Self = Self {
-        node_offset: 0,
-        current_pos: 0,
-    };
+impl<K, V> Clone for ArenaEntryRef<'_, K, V> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
-/// An ergonomic reference to an entry in an [`ArenaArtMap`](crate::arena::ArenaArtMap).
-#[derive(Clone, Copy)]
-pub struct ArenaEntryRef<'a, K: AsBytes + Clone, V: Clone> {
-    pub(crate) leaf_ptr: *const Leaf<K, V>,
-    pub(crate) _marker: PhantomData<&'a ()>,
-}
+impl<K, V> Copy for ArenaEntryRef<'_, K, V> {}
 
-impl<'a, K: AsBytes + Clone, V: Clone> ArenaEntryRef<'a, K, V> {
-    /// Returns a reference to the entry's key.
+impl<'a, K, V> ArenaEntryRef<'a, K, V> {
+    /// # Safety
+    /// `leaf` is a leaf of the tree borrowed for `'a`.
+    #[inline]
+    pub(crate) unsafe fn new(leaf: NonNull<Leaf<K, V>>) -> Self {
+        Self {
+            leaf,
+            _map: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn leaf(self) -> &'a Leaf<K, V> {
+        // SAFETY: Inv 1 and Inv 2: arena leaves are immutable once published
+        // and live, unchanged, for the whole map borrow `'a`.
+        unsafe { self.leaf.as_ref() }
+    }
+
+    /// The entry's key, valid for the map borrow.
     #[inline]
     pub fn key(&self) -> &'a K {
-        unsafe { &(*self.leaf_ptr).key }
+        &self.leaf().key
     }
 
-    /// Returns a reference to the entry's value.
+    /// The entry's value, valid for the map borrow.
     #[inline]
     pub fn value(&self) -> &'a V {
-        unsafe { &(*self.leaf_ptr).value }
+        &self.leaf().value
     }
 
-    /// Checks if this entry has been removed from the map.
+    /// `true` once the entry was removed or replaced in the map.
     #[inline]
     pub fn is_removed(&self) -> bool {
-        unsafe { (*self.leaf_ptr).removed.load(Ordering::Acquire) }
+        self.leaf().is_removed()
     }
 }
 
-impl<'a, K: AsBytes + Clone + std::fmt::Debug, V: Clone + std::fmt::Debug> std::fmt::Debug
-    for ArenaEntryRef<'a, K, V>
-{
+impl<K, V> Deref for ArenaEntryRef<'_, K, V> {
+    type Target = V;
+    #[inline]
+    fn deref(&self) -> &V {
+        self.value()
+    }
+}
+
+impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for ArenaEntryRef<'_, K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArenaEntryRef")
             .field("key", self.key())
@@ -83,678 +97,48 @@ impl<'a, K: AsBytes + Clone + std::fmt::Debug, V: Clone + std::fmt::Debug> std::
     }
 }
 
-impl<'a, K: AsBytes + Clone + PartialEq, V: Clone + PartialEq> PartialEq
-    for ArenaEntryRef<'a, K, V>
-{
+impl<K: PartialEq, V: PartialEq> PartialEq for ArenaEntryRef<'_, K, V> {
     fn eq(&self, other: &Self) -> bool {
         self.key() == other.key() && self.value() == other.value()
     }
 }
 
-impl<'a, K: AsBytes + Clone + Eq, V: Clone + Eq> Eq for ArenaEntryRef<'a, K, V> {}
+impl<K: Eq, V: Eq> Eq for ArenaEntryRef<'_, K, V> {}
 
-impl<'a, K: AsBytes + Clone, V: Clone> Deref for ArenaEntryRef<'a, K, V> {
-    type Target = V;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.value()
-    }
-}
-
-/// An iterator over a range of entries in an [`ArenaArtMap`](crate::arena::ArenaArtMap).
-pub struct Range<'a, K: AsBytes + Clone, V: Clone> {
+/// An iterator over a range of an [`ArenaArtMap`](crate::ArenaArtMap), with
+/// the validated-scan guarantee of the other maps' iterators.
+pub struct Range<'a, K, V> {
     tree: &'a ArenaTree<K, V>,
-    start_bound: Bound<Vec<u8>>,
-    end_bound: Bound<Vec<u8>>,
-    stack: [CursorFrame; MAX_STACK_DEPTH],
-    stack_len: usize,
-    stack_overflow: Vec<CursorFrame>,
-    last_leaf_front: Option<*const Leaf<K, V>>,
-    last_leaf_back: Option<*const Leaf<K, V>>,
-    exhausted: bool,
+    cursor: Cursor<Storage<K, V>>,
 }
 
-impl<'a, K: AsBytes + Clone, V: Clone> Range<'a, K, V> {
-    pub(crate) fn new(
-        tree: &'a ArenaTree<K, V>,
-        start_bound: Bound<Vec<u8>>,
-        end_bound: Bound<Vec<u8>>,
-    ) -> Self {
+impl<'a, K, V> Range<'a, K, V> {
+    pub(crate) fn new(tree: &'a ArenaTree<K, V>, start: Bound<KeyBuf>, end: Bound<KeyBuf>) -> Self {
         Self {
             tree,
-            start_bound,
-            end_bound,
-            stack: [CursorFrame::NULL; MAX_STACK_DEPTH],
-            stack_len: 0,
-            stack_overflow: Vec::new(),
-            last_leaf_front: None,
-            last_leaf_back: None,
-            exhausted: false,
+            cursor: Cursor::new(start, end),
         }
-    }
-
-    #[inline]
-    fn stack_push(&mut self, frame: CursorFrame) {
-        if self.stack_len < MAX_STACK_DEPTH && self.stack_overflow.is_empty() {
-            self.stack[self.stack_len] = frame;
-            self.stack_len += 1;
-        } else {
-            self.stack_overflow.push(frame);
-        }
-    }
-
-    #[inline]
-    fn stack_last_mut(&mut self) -> Option<&mut CursorFrame> {
-        if let Some(f) = self.stack_overflow.last_mut() {
-            Some(f)
-        } else if self.stack_len > 0 {
-            Some(&mut self.stack[self.stack_len - 1])
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn stack_pop(&mut self) -> Option<CursorFrame> {
-        if let Some(f) = self.stack_overflow.pop() {
-            Some(f)
-        } else if self.stack_len > 0 {
-            self.stack_len -= 1;
-            Some(self.stack[self.stack_len])
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn stack_clear(&mut self) {
-        self.stack_len = 0;
-        self.stack_overflow.clear();
-    }
-
-    #[inline(always)]
-    fn cursor_front(&self) -> Option<&[u8]> {
-        self.last_leaf_front
-            .map(|ptr| unsafe { (*ptr).key.as_bytes() })
-    }
-
-    #[inline(always)]
-    fn cursor_back(&self) -> Option<&[u8]> {
-        self.last_leaf_back
-            .map(|ptr| unsafe { (*ptr).key.as_bytes() })
-    }
-
-    #[inline(always)]
-    fn set_cursor_front(&mut self, ptr: *const Leaf<K, V>) {
-        self.last_leaf_front = Some(ptr);
-    }
-
-    #[inline(always)]
-    fn set_cursor_back(&mut self, ptr: *const Leaf<K, V>) {
-        self.last_leaf_back = Some(ptr);
-    }
-
-    fn push_and_descend_left(&mut self, mut offset: TaggedOffset) -> Option<*const Leaf<K, V>> {
-        while !offset.is_null() {
-            if offset.is_leaf() {
-                return Some(self.tree.arena.get_pointer(offset.leaf_offset()) as *const Leaf<K, V>);
-            }
-            let node_offset = offset.inner_offset();
-            let header_ptr = self.tree.arena.get_pointer(node_offset) as *const NodeHeader;
-            let exact = unsafe { (*header_ptr).exact_leaf.load(Ordering::Acquire) };
-            if exact != 0 {
-                self.stack_push(CursorFrame {
-                    node_offset,
-                    current_pos: usize::MAX,
-                });
-                return Some(
-                    self.tree
-                        .arena
-                        .get_pointer(TaggedOffset(exact).leaf_offset())
-                        as *const Leaf<K, V>,
-                );
-            }
-
-            match unsafe { next_child_in_node(self.tree, node_offset, usize::MAX) } {
-                Some((pos, child)) => {
-                    self.stack_push(CursorFrame {
-                        node_offset,
-                        current_pos: pos,
-                    });
-                    offset = child;
-                }
-                None => return None,
-            }
-        }
-        None
-    }
-
-    fn seek_to_key(&mut self, target_key: &[u8]) {
-        self.stack_clear();
-        let root_offset = self.tree.raw_root();
-        if root_offset.is_null() || root_offset.is_leaf() {
-            return;
-        }
-
-        let mut current = root_offset;
-        let mut depth = 0;
-
-        while !current.is_null() && !current.is_leaf() {
-            let node_offset = current.inner_offset();
-            let header_ptr = self.tree.arena.get_pointer(node_offset) as *const NodeHeader;
-            let (_matched, is_full) = unsafe { (*header_ptr).match_prefix(target_key, depth) };
-            if !is_full {
-                return;
-            }
-
-            depth += unsafe { (*header_ptr).prefix_len as usize };
-
-            if depth == target_key.len() {
-                self.stack_push(CursorFrame {
-                    node_offset,
-                    current_pos: usize::MAX,
-                });
-                return;
-            }
-
-            let next_byte = target_key[depth];
-            match unsafe { child_pos_for_byte(self.tree, node_offset, next_byte) } {
-                Some((pos, child)) => {
-                    self.stack_push(CursorFrame {
-                        node_offset,
-                        current_pos: pos,
-                    });
-                    if child.is_leaf() {
-                        return;
-                    }
-                    current = child;
-                    depth += 1;
-                }
-                None => return,
-            }
-        }
-    }
-
-    fn advance_forward(&mut self) -> Option<*const Leaf<K, V>> {
-        while let Some(frame) = self.stack_last_mut() {
-            let node_offset = frame.node_offset;
-            let current_pos = frame.current_pos;
-            match unsafe { next_child_in_node(self.tree, node_offset, current_pos) } {
-                Some((next_pos, child)) => {
-                    self.stack_last_mut().unwrap().current_pos = next_pos;
-                    return self.push_and_descend_left(child);
-                }
-                None => {
-                    self.stack_pop();
-                }
-            }
-        }
-        None
     }
 }
 
-impl<'a, K: AsBytes + Clone, V: Clone> Iterator for Range<'a, K, V> {
+impl<'a, K: AsBytes, V> Iterator for Range<'a, K, V> {
     type Item = ArenaEntryRef<'a, K, V>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.exhausted {
-            return None;
-        }
-
-        loop {
-            let leaf_ptr = if self.last_leaf_front.is_none() {
-                let (search_key, include_equal) = match &self.start_bound {
-                    Bound::Included(k) => (k.as_slice(), true),
-                    Bound::Excluded(k) => (k.as_slice(), false),
-                    Bound::Unbounded => (&[][..], true),
-                };
-
-                let root_offset = self.tree.raw_root();
-                if root_offset.is_null() {
-                    self.exhausted = true;
-                    return None;
-                }
-
-                if root_offset.is_leaf() {
-                    let leaf = unsafe {
-                        &*(self.tree.arena.get_pointer(root_offset.leaf_offset())
-                            as *const Leaf<K, V>)
-                    };
-                    let k = leaf.key.as_bytes();
-                    let cmp = k.cmp(search_key);
-                    if (include_equal && cmp >= std::cmp::Ordering::Equal)
-                        || (!include_equal && cmp == std::cmp::Ordering::Greater)
-                    {
-                        leaf as *const Leaf<K, V>
-                    } else {
-                        self.exhausted = true;
-                        return None;
-                    }
-                } else if (search_key.is_empty() || (search_key == [0u8] && include_equal))
-                    && include_equal
-                {
-                    match self.push_and_descend_left(root_offset) {
-                        Some(ptr) => ptr,
-                        None => {
-                            self.exhausted = true;
-                            return None;
-                        }
-                    }
-                } else {
-                    let ptr = match self.tree.find_successor(search_key, include_equal) {
-                        Some(p) => p,
-                        None => {
-                            self.exhausted = true;
-                            return None;
-                        }
-                    };
-                    let leaf = unsafe { &*ptr };
-                    self.seek_to_key(leaf.key.as_bytes());
-                    ptr
-                }
-            } else {
-                match self.advance_forward() {
-                    Some(ptr) => ptr,
-                    None => {
-                        let ptr = self
-                            .tree
-                            .find_successor(self.cursor_front().unwrap(), false)?;
-                        let leaf = unsafe { &*ptr };
-                        self.seek_to_key(leaf.key.as_bytes());
-                        ptr
-                    }
-                }
-            };
-
-            let leaf = unsafe { &*leaf_ptr };
-            let k_bytes = leaf.key.as_bytes();
-
-            // Check upper range bound
-            match &self.end_bound {
-                Bound::Included(end) if k_bytes > end.as_slice() => {
-                    self.exhausted = true;
-                    return None;
-                }
-                Bound::Excluded(end) if k_bytes >= end.as_slice() => {
-                    self.exhausted = true;
-                    return None;
-                }
-                _ => {}
-            }
-
-            // Check overlap with backward cursor
-            if let Some(back_key) = self.cursor_back() {
-                if k_bytes > back_key {
-                    self.exhausted = true;
-                    return None;
-                }
-            }
-
-            self.set_cursor_front(leaf_ptr);
-
-            let entry = ArenaEntryRef {
-                leaf_ptr,
-                _marker: PhantomData,
-            };
-            if !entry.is_removed() {
-                return Some(entry);
-            }
-        }
+        let leaf = self.cursor.next(&self.tree.raw)?;
+        // SAFETY: a leaf of the tree borrowed for `'a`.
+        Some(unsafe { ArenaEntryRef::new(leaf) })
     }
 }
 
-impl<'a, K: AsBytes + Clone, V: Clone> DoubleEndedIterator for Range<'a, K, V> {
+impl<K: AsBytes, V> DoubleEndedIterator for Range<'_, K, V> {
+    #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.exhausted {
-            return None;
-        }
-
-        loop {
-            let (search_key, include_equal) = if let Some(back_key) = self.cursor_back() {
-                (back_key, false)
-            } else {
-                match &self.end_bound {
-                    Bound::Included(k) => (k.as_slice(), true),
-                    Bound::Excluded(k) => (k.as_slice(), false),
-                    Bound::Unbounded => (&[0xFF; 64][..], true),
-                }
-            };
-
-            let leaf_ptr = self.tree.find_predecessor(search_key, include_equal)?;
-            let leaf = unsafe { &*leaf_ptr };
-            let k_bytes = leaf.key.as_bytes();
-
-            // Check lower range bound
-            match &self.start_bound {
-                Bound::Included(start) if k_bytes < start.as_slice() => {
-                    self.exhausted = true;
-                    return None;
-                }
-                Bound::Excluded(start) if k_bytes <= start.as_slice() => {
-                    self.exhausted = true;
-                    return None;
-                }
-                _ => {}
-            }
-
-            // Check overlap with forward cursor
-            if let Some(front_key) = self.cursor_front() {
-                if k_bytes < front_key {
-                    self.exhausted = true;
-                    return None;
-                }
-            }
-
-            self.set_cursor_back(leaf_ptr);
-
-            let entry = ArenaEntryRef {
-                leaf_ptr,
-                _marker: PhantomData,
-            };
-            if !entry.is_removed() {
-                return Some(entry);
-            }
-        }
+        let leaf = self.cursor.next_back(&self.tree.raw)?;
+        // SAFETY: a leaf of the tree borrowed for `'a`.
+        Some(unsafe { ArenaEntryRef::new(leaf) })
     }
 }
 
-unsafe fn next_child_in_node<K: AsBytes + Clone, V: Clone>(
-    tree: &ArenaTree<K, V>,
-    node_offset: u32,
-    current_pos: usize,
-) -> Option<(usize, TaggedOffset)> {
-    let header_ptr = tree.arena.get_pointer(node_offset) as *const NodeHeader;
-    let h = &*header_ptr;
-    match h.node_type {
-        NodeType::Node4 => {
-            let n = &*(header_ptr as *const Node4);
-            let count = n.header.num_children() as usize;
-            let next_idx = if current_pos == usize::MAX {
-                0
-            } else {
-                current_pos + 1
-            };
-            if next_idx < count {
-                let raw = n.children[next_idx].load(Ordering::Acquire);
-                if raw != 0 {
-                    return Some((next_idx, TaggedOffset(raw)));
-                }
-            }
-            None
-        }
-        NodeType::Node16 => {
-            let n = &*(header_ptr as *const Node16);
-            let count = n.header.num_children() as usize;
-            let next_idx = if current_pos == usize::MAX {
-                0
-            } else {
-                current_pos + 1
-            };
-            if next_idx < count {
-                let raw = n.children[next_idx].load(Ordering::Acquire);
-                if raw != 0 {
-                    return Some((next_idx, TaggedOffset(raw)));
-                }
-            }
-            None
-        }
-        NodeType::Node48 => {
-            let n = &*(header_ptr as *const Node48);
-            let mut next_byte = if current_pos == usize::MAX {
-                0
-            } else if current_pos < 255 {
-                (current_pos + 1) as u8
-            } else {
-                return None;
-            };
-            while let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
-                let slot = n.child_indices[byte as usize];
-                if slot != NODE48_EMPTY {
-                    let raw = n.children[slot as usize].load(Ordering::Acquire);
-                    if raw != 0 {
-                        return Some((byte as usize, TaggedOffset(raw)));
-                    }
-                }
-                if byte == 255 {
-                    break;
-                }
-                next_byte = byte + 1;
-            }
-            None
-        }
-        NodeType::Node256 => {
-            let n = &*(header_ptr as *const Node256);
-            let mut next_byte = if current_pos == usize::MAX {
-                0
-            } else if current_pos < 255 {
-                (current_pos + 1) as u8
-            } else {
-                return None;
-            };
-            while let Some(byte) = next_present_byte(&n.child_bitmap, next_byte) {
-                let raw = n.children[byte as usize].load(Ordering::Acquire);
-                if raw != 0 {
-                    return Some((byte as usize, TaggedOffset(raw)));
-                }
-                if byte == 255 {
-                    break;
-                }
-                next_byte = byte + 1;
-            }
-            None
-        }
-    }
-}
-
-unsafe fn prev_child_in_node<K: AsBytes + Clone, V: Clone>(
-    tree: &ArenaTree<K, V>,
-    node_offset: u32,
-    current_pos: usize,
-) -> Option<(usize, TaggedOffset)> {
-    let header_ptr = tree.arena.get_pointer(node_offset) as *const NodeHeader;
-    let h = &*header_ptr;
-    match h.node_type {
-        NodeType::Node4 => {
-            let n = &*(header_ptr as *const Node4);
-            let count = n.header.num_children() as usize;
-            let start = if current_pos == usize::MAX {
-                count.saturating_sub(1)
-            } else if current_pos > 0 {
-                (current_pos - 1).min(count.saturating_sub(1))
-            } else {
-                return None;
-            };
-            for i in (0..=start).rev() {
-                let raw = n.children[i].load(Ordering::Acquire);
-                if raw != 0 {
-                    return Some((i, TaggedOffset(raw)));
-                }
-            }
-            None
-        }
-        NodeType::Node16 => {
-            let n = &*(header_ptr as *const Node16);
-            let count = n.header.num_children() as usize;
-            let start = if current_pos == usize::MAX {
-                count.saturating_sub(1)
-            } else if current_pos > 0 {
-                (current_pos - 1).min(count.saturating_sub(1))
-            } else {
-                return None;
-            };
-            for i in (0..=start).rev() {
-                let raw = n.children[i].load(Ordering::Acquire);
-                if raw != 0 {
-                    return Some((i, TaggedOffset(raw)));
-                }
-            }
-            None
-        }
-        NodeType::Node48 => {
-            let n = &*(header_ptr as *const Node48);
-            let mut max_byte = if current_pos == usize::MAX {
-                255
-            } else if current_pos > 0 {
-                (current_pos - 1) as u8
-            } else {
-                return None;
-            };
-            while let Some(byte) = prev_present_byte(&n.child_bitmap, max_byte) {
-                let slot = n.child_indices[byte as usize];
-                if slot != NODE48_EMPTY {
-                    let raw = n.children[slot as usize].load(Ordering::Acquire);
-                    if raw != 0 {
-                        return Some((byte as usize, TaggedOffset(raw)));
-                    }
-                }
-                if byte == 0 {
-                    break;
-                }
-                max_byte = byte - 1;
-            }
-            None
-        }
-        NodeType::Node256 => {
-            let n = &*(header_ptr as *const Node256);
-            let mut max_byte = if current_pos == usize::MAX {
-                255
-            } else if current_pos > 0 {
-                (current_pos - 1) as u8
-            } else {
-                return None;
-            };
-            while let Some(byte) = prev_present_byte(&n.child_bitmap, max_byte) {
-                let raw = n.children[byte as usize].load(Ordering::Acquire);
-                if raw != 0 {
-                    return Some((byte as usize, TaggedOffset(raw)));
-                }
-                if byte == 0 {
-                    break;
-                }
-                max_byte = byte - 1;
-            }
-            None
-        }
-    }
-}
-
-unsafe fn child_pos_for_byte<K: AsBytes + Clone, V: Clone>(
-    tree: &ArenaTree<K, V>,
-    node_offset: u32,
-    needle: u8,
-) -> Option<(usize, TaggedOffset)> {
-    let header_ptr = tree.arena.get_pointer(node_offset) as *const NodeHeader;
-    let h = &*header_ptr;
-    match h.node_type {
-        NodeType::Node4 => {
-            let n = &*(header_ptr as *const Node4);
-            let count = n.header.num_children() as usize;
-            for i in 0..count {
-                if n.keys[i] == needle {
-                    let raw = n.children[i].load(Ordering::Acquire);
-                    if raw != 0 {
-                        return Some((i, TaggedOffset(raw)));
-                    }
-                }
-            }
-            None
-        }
-        NodeType::Node16 => {
-            let n = &*(header_ptr as *const Node16);
-            let count = n.header.num_children() as usize;
-            if let Some(idx) = find_child_node16(&n.keys, count, needle) {
-                let raw = n.children[idx].load(Ordering::Acquire);
-                if raw != 0 {
-                    return Some((idx, TaggedOffset(raw)));
-                }
-            }
-            None
-        }
-        NodeType::Node48 => {
-            let n = &*(header_ptr as *const Node48);
-            let slot = n.child_indices[needle as usize];
-            if slot != NODE48_EMPTY {
-                let raw = n.children[slot as usize].load(Ordering::Acquire);
-                if raw != 0 {
-                    return Some((needle as usize, TaggedOffset(raw)));
-                }
-            }
-            None
-        }
-        NodeType::Node256 => {
-            let n = &*(header_ptr as *const Node256);
-            let raw = n.children[needle as usize].load(Ordering::Acquire);
-            if raw != 0 {
-                return Some((needle as usize, TaggedOffset(raw)));
-            }
-            None
-        }
-    }
-}
-
-pub(crate) unsafe fn first_leaf_in_subtree<K: AsBytes + Clone, V: Clone>(
-    tree: &ArenaTree<K, V>,
-    mut offset: TaggedOffset,
-) -> Option<*const Leaf<K, V>> {
-    while !offset.is_null() {
-        if offset.is_leaf() {
-            let leaf_ptr = tree.arena.get_pointer(offset.leaf_offset()) as *const Leaf<K, V>;
-            let leaf = &*leaf_ptr;
-            if !leaf.removed.load(Ordering::Acquire) {
-                return Some(leaf_ptr);
-            }
-            return None;
-        }
-        let header_ptr = tree.arena.get_pointer(offset.inner_offset()) as *const NodeHeader;
-        let header = &*header_ptr;
-        let exact = header.exact_leaf.load(Ordering::Acquire);
-        if exact != 0 {
-            let leaf_ptr =
-                tree.arena.get_pointer(TaggedOffset(exact).leaf_offset()) as *const Leaf<K, V>;
-            let leaf = &*leaf_ptr;
-            if !leaf.removed.load(Ordering::Acquire) {
-                return Some(leaf_ptr);
-            }
-        }
-        match next_child_in_node(tree, offset.inner_offset(), usize::MAX) {
-            Some((_, child)) => offset = child,
-            None => return None,
-        }
-    }
-    None
-}
-
-pub(crate) unsafe fn last_leaf_in_subtree<K: AsBytes + Clone, V: Clone>(
-    tree: &ArenaTree<K, V>,
-    mut offset: TaggedOffset,
-) -> Option<*const Leaf<K, V>> {
-    while !offset.is_null() {
-        if offset.is_leaf() {
-            let leaf_ptr = tree.arena.get_pointer(offset.leaf_offset()) as *const Leaf<K, V>;
-            let leaf = &*leaf_ptr;
-            if !leaf.removed.load(Ordering::Acquire) {
-                return Some(leaf_ptr);
-            }
-            return None;
-        }
-        let header_ptr = tree.arena.get_pointer(offset.inner_offset()) as *const NodeHeader;
-        let header = &*header_ptr;
-        match prev_child_in_node(tree, offset.inner_offset(), usize::MAX) {
-            Some((_, child)) => offset = child,
-            None => {
-                let exact = header.exact_leaf.load(Ordering::Acquire);
-                if exact != 0 {
-                    let leaf_ptr = tree.arena.get_pointer(TaggedOffset(exact).leaf_offset())
-                        as *const Leaf<K, V>;
-                    let leaf = &*leaf_ptr;
-                    if !leaf.removed.load(Ordering::Acquire) {
-                        return Some(leaf_ptr);
-                    }
-                }
-                return None;
-            }
-        }
-    }
-    None
-}
+impl<K: AsBytes, V> std::iter::FusedIterator for Range<'_, K, V> {}

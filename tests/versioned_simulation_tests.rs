@@ -262,7 +262,11 @@ fn test_arena_versioned_artmap_deterministic_simulation() {
                         let map_latest = map.get_latest(&key);
                         assert_eq!(map_latest, oracle_latest);
 
-                        let oracle_all = o.get_all_versions(&key);
+                        let oracle_all: Vec<_> = o
+                            .get_all_versions(&key)
+                            .into_iter()
+                            .map(|(v, x)| (v, Some(x)))
+                            .collect();
                         let map_all = map.get_all_versions(&key);
                         assert_eq!(map_all, oracle_all);
                     }

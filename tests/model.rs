@@ -20,7 +20,6 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-#[allow(unused_imports)]
 use artmap::{ArenaArtMap, ArenaVersionedArtMap, ArtMap, VersionedArtMap};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -297,7 +296,6 @@ fn versioned_matches_model() {
     }
 }
 
-#[cfg(any())] // enabled with the Phase 6 arena rewrite
 #[test]
 fn arena_matches_btreemap() {
     for seed in 0..seeds() {
@@ -341,7 +339,6 @@ fn arena_matches_btreemap() {
     }
 }
 
-#[cfg(any())] // enabled with the Phase 7 arena rewrite
 #[test]
 fn arena_versioned_matches_model() {
     for seed in 0..seeds() {

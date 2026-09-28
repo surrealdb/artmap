@@ -77,7 +77,7 @@
     artmap_provenance_lints,
     deny(fuzzy_provenance_casts, lossy_provenance_casts)
 )]
-#![deny(let_underscore_drop)]
+#![deny(let_underscore_drop, clippy::let_underscore_must_use)]
 
 pub mod arena;
 mod entry;
@@ -90,7 +90,6 @@ mod hooks;
 mod iter;
 mod key;
 mod latch;
-mod latch_legacy;
 #[cfg(all(test, loom))]
 mod loom_tests;
 mod node;
@@ -114,6 +113,16 @@ use guard::{pin, GuardHandle};
 use raw::cursor::owned_bound;
 use raw::{Mode, Outcome};
 use tree::Tree;
+
+/// Positive `Send`/`Sync` assertions (§8.9).
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ArtMap<String, u64>>();
+    assert_send_sync::<VersionedArtMap<String, u64>>();
+    assert_send_sync::<ArenaArtMap<String, u64>>();
+    assert_send_sync::<ArenaVersionedArtMap<String, u64>>();
+    assert_send_sync::<Arena>();
+};
 
 /// A concurrent ordered map backed by an adaptive radix tree.
 ///

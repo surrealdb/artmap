@@ -159,7 +159,6 @@ pub(crate) const TAG_LEAF_OFFSET: u32 = 0b01;
 #[repr(transparent)]
 pub(crate) struct TaggedOffset(pub(crate) u32);
 
-#[allow(dead_code)] // used by the arena storage
 impl TaggedOffset {
     #[inline(always)]
     pub(crate) fn from_leaf(offset: u32) -> Self {

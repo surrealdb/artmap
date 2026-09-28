@@ -41,6 +41,16 @@ use crate::raw::{
     common_prefix, LeafNode, Mode, NodePtr, Outcome, Prepared, Raw, RawTree, Storage, Unpublished,
 };
 
+/// Where an insert published its leaf, for the arena inserters' fast path
+/// (§12.4): the node that holds it, the node's version *after our own unlock*
+/// (never a re-load), and the key depth at which its children start.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Hint<R> {
+    pub(crate) node: R,
+    pub(crate) version: u64,
+    pub(crate) depth: usize,
+}
+
 /// Where the parent of the node being modified keeps it.
 #[derive(Copy, Clone)]
 enum Parent<R> {
@@ -99,12 +109,60 @@ impl<S: Storage> RawTree<S> {
         count: isize,
         guard: &S::Guard,
     ) -> Result<Outcome<S::Leaf>, S::Full> {
+        self.insert_hinted(owner, key, mode, count, guard, &mut None)
+    }
+
+    /// As [`insert`](Self::insert), also reporting where the leaf landed.
+    pub(crate) fn insert_hinted(
+        &self,
+        owner: &Unpublished<'_, S>,
+        key: &[u8],
+        mode: Mode,
+        count: isize,
+        guard: &S::Guard,
+        hint: &mut Option<Hint<Raw<S>>>,
+    ) -> Result<Outcome<S::Leaf>, S::Full> {
         let mut prep = Prepared::<S>::new();
-        let r = self.insert_with(owner, key, mode, count, guard, &mut prep);
+        let r = self.insert_with(owner, key, mode, count, guard, &mut prep, hint);
         prep.release(&self.storage);
         r
     }
 
+    /// The inserters' fast path: insert under the cached node without
+    /// descending, if it is unchanged since our own unlock. `None` means "use
+    /// the full insert"; `hint` is updated either way.
+    ///
+    /// # Safety
+    /// The storage never frees nodes while the tree is alive (the arena), so
+    /// `hint.node` is still a node of this tree's memory.
+    pub(crate) unsafe fn insert_at_hint(
+        &self,
+        hint: &mut Hint<Raw<S>>,
+        owner: &Unpublished<'_, S>,
+        key: &[u8],
+        count: isize,
+    ) -> Option<Outcome<S::Leaf>> {
+        let byte = *key.get(hint.depth)?;
+        // SAFETY: per the contract, the node's memory is still valid.
+        let node = unsafe { self.node_ref(hint.node) };
+        // Unchanged since our unlock: its absolute path and prefix are the ones
+        // the hint was taken for (Inv 7), so the key belongs here.
+        let w = node.latch.try_upgrade(hint.version)?;
+        if node.find_child(byte).is_some() || node.is_full() {
+            hint.version = w.unlock();
+            return None;
+        }
+        let new_ptr = owner.ptr();
+        let bomb = AbortOnUnwind;
+        self.len_add(count);
+        owner.disarm();
+        node.insert_child(&w, byte, self.storage.leaf_raw(new_ptr));
+        bomb.defuse();
+        hint.version = w.unlock();
+        Some(Outcome::Inserted(new_ptr))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn insert_with(
         &self,
         owner: &Unpublished<'_, S>,
@@ -113,6 +171,7 @@ impl<S: Storage> RawTree<S> {
         count: isize,
         guard: &S::Guard,
         prep: &mut Prepared<S>,
+        hint: &mut Option<Hint<Raw<S>>>,
     ) -> Result<Outcome<S::Leaf>, S::Full> {
         let new_ptr = owner.ptr();
         let new_leaf = self.storage.leaf_raw(new_ptr);
@@ -168,7 +227,7 @@ impl<S: Storage> RawTree<S> {
                     return Ok(Outcome::Replaced(old));
                 }
                 let common = common_prefix(ekey, key);
-                let chain =
+                let (chain, _) =
                     self.build_chain(prep, &key[..common], (ekey, root), (key, new_leaf), common)?;
                 let Some(w) = self.root_latch.lock() else {
                     unreachable!("root latch is never obsolete")
@@ -250,6 +309,11 @@ impl<S: Storage> RawTree<S> {
                     drop(nw);
                     drop(pg);
                     prep.commit();
+                    *hint = Some(Hint {
+                        node: split_raw,
+                        version: 0,
+                        depth: depth + matched,
+                    });
                     return Ok(Outcome::Inserted(new_ptr));
                 }
 
@@ -343,6 +407,12 @@ impl<S: Storage> RawTree<S> {
                         bomb.defuse();
                         drop(pg);
                         prep.commit();
+                        // A fresh node: version 0 until someone locks it.
+                        *hint = Some(Hint {
+                            node: grown_raw,
+                            version: 0,
+                            depth: node_depth,
+                        });
                         let old = self.node_ptr(node_raw);
                         // SAFETY: unlinked under the parent latch and obsolete.
                         unsafe { self.storage.retire_node(old, guard) };
@@ -361,7 +431,11 @@ impl<S: Storage> RawTree<S> {
                         owner.disarm();
                         node.insert_child(&nw, byte, new_leaf);
                         bomb.defuse();
-                        drop(nw);
+                        *hint = Some(Hint {
+                            node: node_raw,
+                            version: nw.unlock(),
+                            depth: node_depth,
+                        });
                         return Ok(Outcome::Inserted(new_ptr));
                     }
                     Some(c) if c.is_leaf() => {
@@ -392,7 +466,7 @@ impl<S: Storage> RawTree<S> {
                         let es = ekey.get(from..).unwrap_or(&[]);
                         let ns = &key[from..];
                         let common = common_prefix(es, ns);
-                        let chain =
+                        let (chain, bottom) =
                             self.build_chain(prep, &ns[..common], (es, c), (ns, new_leaf), common)?;
                         let Some(nw) = node.latch.try_upgrade(v) else {
                             backoff.spin();
@@ -405,6 +479,11 @@ impl<S: Storage> RawTree<S> {
                         bomb.defuse();
                         drop(nw);
                         prep.commit();
+                        *hint = Some(Hint {
+                            node: bottom,
+                            version: 0,
+                            depth: from + common,
+                        });
                         return Ok(Outcome::Inserted(new_ptr));
                     }
                     Some(_) => unreachable!("inner children are descended above"),
@@ -450,7 +529,7 @@ impl<S: Storage> RawTree<S> {
         a: (&[u8], Raw<S>),
         b: (&[u8], Raw<S>),
         common: usize,
-    ) -> Result<Raw<S>, S::Full> {
+    ) -> Result<(Raw<S>, Raw<S>), S::Full> {
         debug_assert_eq!(prefix.len(), common);
         // Segments of 16 prefix bytes plus one branch byte above the bottom node.
         let mut segments = Vec::new();
@@ -471,7 +550,8 @@ impl<S: Storage> RawTree<S> {
                 }
             }
         }
-        let mut below = self.storage.node_raw(bottom);
+        let bottom = self.storage.node_raw(bottom);
+        let mut below = bottom;
         for (seg_prefix, byte) in segments.into_iter().rev() {
             let n = prep.node(&self.storage, NodeType::Node4)?;
             // SAFETY: unpublished node from the pool, exclusively ours.
@@ -480,7 +560,7 @@ impl<S: Storage> RawTree<S> {
             r.push_child_unpublished(byte, below);
             below = self.storage.node_raw(n);
         }
-        Ok(below)
+        Ok((below, bottom))
     }
 
     /// Removes the leaf for `key`, if `matches` accepts it. Returns it

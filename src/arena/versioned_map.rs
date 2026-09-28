@@ -12,29 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! # The arena-backed multi-version map
+
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
+
 use std::borrow::Borrow;
 use std::marker::PhantomData;
+use std::mem::{align_of, size_of};
 use std::ops::{Bound, RangeBounds};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::arena::map::ArenaInserter;
+use crate::arena::map::pad;
+use crate::arena::node::{VersionNode, VersionedLeaf};
+use crate::arena::tree::InserterCache;
 use crate::arena::versioned_iter::{ArenaVersionedEntryRef, ArenaVersionedRange};
-use crate::arena::versioned_tree::ArenaVersionedTree;
-use crate::arena::Arena;
+use crate::arena::versioned_tree::{chain, find_le, ArenaVersionedTree};
+use crate::arena::{Arena, ArenaFull};
 use crate::key::AsBytes;
+use crate::raw::cursor::{owned_bound, KeyBuf};
+use crate::raw::node::{Node16, Node256, Node4, Node48, MAX_PREFIX_LEN};
+use crate::sync::atomic::AtomicU32;
 
-/// A concurrent associative map with 64-bit MVCC versioning, backed by an arena-allocated Adaptive Radix Tree.
+/// A concurrent ordered map with 64-bit MVCC versions per key, allocated from
+/// an [`Arena`] (for LSM memtables and snapshot-isolated workloads).
 ///
-/// Uses 32-bit offsets for child pointers instead of 64-bit pointers, reducing inner node
-/// memory consumption by ~40% and enabling $O(1)$ whole-arena teardown when dropped or reset.
-/// Supports atomic version prepend chains in leaves for LSM memtables and snapshot-isolated workloads.
-pub struct ArenaVersionedArtMap<K: AsBytes + Clone, V: Clone> {
+/// Semantics match [`VersionedArtMap`](crate::VersionedArtMap): `len()` counts
+/// keys whose newest version is live; `delete` records a tombstone; reads at a
+/// snapshot see the newest version at or below it; scans are latest-view. It
+/// has no prune, so versions and deleted keys are kept until the map is
+/// dropped. See the [module docs](crate::arena) for ownership and capacity.
+pub struct ArenaVersionedArtMap<K, V> {
     tree: ArenaVersionedTree<K, V>,
 }
 
-impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
-    /// Creates a new `ArenaVersionedArtMap` backed by the specified [`Arena`].
+impl<K, V> ArenaVersionedArtMap<K, V> {
+    /// Creates a map in `arena`.
     #[inline]
     pub fn new(arena: Arc<Arena>) -> Self {
         Self {
@@ -42,255 +54,368 @@ impl<K: AsBytes + Clone, V: Clone> ArenaVersionedArtMap<K, V> {
         }
     }
 
-    /// Creates an `ArenaVersionedArtMap` with a dedicated new arena of the given capacity.
+    /// Creates a map in a new arena of `capacity` bytes.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        let arena = Arena::with_capacity(capacity);
-        Self {
-            tree: ArenaVersionedTree::with_capacity(arena, capacity),
-        }
+        Self::new(Arena::with_capacity(capacity))
     }
 
-    /// Returns a reference to the underlying [`Arena`].
+    /// The map's arena.
     #[inline]
     pub fn arena(&self) -> &Arc<Arena> {
         self.tree.arena()
     }
 
-    /// Returns the number of entries in the map.
+    /// The number of keys whose newest version is live.
     #[inline]
     pub fn len(&self) -> usize {
         self.tree.len()
     }
 
-    /// Returns `true` if the map contains no entries.
+    /// `true` if no key has a live newest version.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.tree.is_empty()
+        self.len() == 0
     }
 
-    /// Returns the newest committed value corresponding to the key, if present and not deleted.
+    /// An upper bound on the arena bytes one insert of a key of `key_len`
+    /// bytes can consume: a version node, a leaf, the worst prefix chain, a
+    /// split node, one node of each larger size, and alignment padding. A new
+    /// version of an existing key costs only the version node.
+    pub const fn max_insert_bytes(key_len: usize) -> usize {
+        let version = pad(size_of::<VersionNode<V>>(), align_of::<VersionNode<V>>());
+        let leaf = pad(
+            size_of::<VersionedLeaf<K, V>>(),
+            align_of::<VersionedLeaf<K, V>>(),
+        );
+        let node4s = key_len / (MAX_PREFIX_LEN + 1) + 2;
+        version
+            + leaf
+            + node4s * pad(size_of::<Node4<AtomicU32>>(), 8)
+            + pad(size_of::<Node16<AtomicU32>>(), 8)
+            + pad(size_of::<Node48<AtomicU32>>(), 8)
+            + pad(size_of::<Node256<AtomicU32>>(), 8)
+    }
+}
+
+impl<K: AsBytes, V> ArenaVersionedArtMap<K, V> {
+    /// The newest live value of `key`.
     #[inline]
     pub fn get<Q>(&self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
+        V: Clone,
     {
         self.get_latest(key).map(|(_, v)| v)
     }
 
-    /// Point lookup on raw byte slice returning the newest committed value, if present and not deleted.
+    /// The newest live value of a raw byte key.
     #[inline]
-    pub fn get_slice(&self, key_bytes: &[u8]) -> Option<V> {
-        self.tree.get_latest(key_bytes).map(|(_, v)| v)
+    pub fn get_slice(&self, key: &[u8]) -> Option<V>
+    where
+        V: Clone,
+    {
+        let e = self.entry_for(key)?;
+        Some(e.value().clone())
     }
 
-    /// Looks up a value by raw byte slice without converting to the owned key type.
+    /// Alias for [`get_slice`](Self::get_slice).
     #[inline]
-    pub fn get_by_slice(&self, key_bytes: &[u8]) -> Option<V> {
-        self.get_slice(key_bytes)
+    pub fn get_by_slice(&self, key: &[u8]) -> Option<V>
+    where
+        V: Clone,
+    {
+        self.get_slice(key)
     }
 
-    /// Looks up the newest committed version and value for `key`.
+    /// The newest version and value of `key`, if live.
     #[inline]
     pub fn get_latest<Q>(&self, key: &Q) -> Option<(u64, V)>
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
+        V: Clone,
     {
-        self.tree.get_latest(key.as_bytes())
+        let e = self.entry_for(key.as_bytes())?;
+        Some((e.version(), e.value().clone()))
     }
 
-    /// Looks up the newest version of `key` whose version is less than or equal to `max_version`.
-    ///
-    /// Essential for MVCC snapshot reads in LSM engines.
+    /// A handle on the newest live version of `key`, without cloning.
+    #[inline]
+    pub fn get_entry<Q>(&self, key: &Q) -> Option<ArenaVersionedEntryRef<'_, K, V>>
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        self.entry_for(key.as_bytes())
+    }
+
+    fn entry_for(&self, key: &[u8]) -> Option<ArenaVersionedEntryRef<'_, K, V>> {
+        let leaf = self.tree.raw.get(key)?;
+        // SAFETY: a leaf of this map; its head is a node of this arena.
+        unsafe { ArenaVersionedEntryRef::new(leaf, leaf.as_ref().head(), self.tree.arena()) }
+    }
+
+    /// The newest version of `key` that is `<= max_version`, unless it is a
+    /// tombstone.
     #[inline]
     pub fn get_version_le<Q>(&self, key: &Q, max_version: u64) -> Option<(u64, V)>
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
+        V: Clone,
     {
-        self.tree.get_version_le(key.as_bytes(), max_version)
+        let leaf = self.tree.raw.get(key.as_bytes())?;
+        // SAFETY: a leaf of this map, valid for `&self`.
+        let head = unsafe { leaf.as_ref() }.head();
+        let n = find_le::<V>(self.tree.arena(), head, max_version)?;
+        n.value.clone().map(|v| (n.version, v))
     }
 
-    /// Returns all versions stored for `key`, ordered from newest to oldest.
-    #[inline]
-    pub fn get_all_versions<Q>(&self, key: &Q) -> Vec<(u64, V)>
+    /// Every version of `key`, newest first; `None` values are tombstones.
+    pub fn get_all_versions<Q>(&self, key: &Q) -> Vec<(u64, Option<V>)>
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
+        V: Clone,
     {
-        self.tree.get_all_versions(key.as_bytes())
+        let Some(leaf) = self.tree.raw.get(key.as_bytes()) else {
+            return Vec::new();
+        };
+        // SAFETY: a leaf of this map, valid for `&self`.
+        let head = unsafe { leaf.as_ref() }.head();
+        chain::<V>(self.tree.arena(), head)
+            .map(|n| (n.version, n.value.clone()))
+            .collect()
     }
 
-    /// Returns the number of versions stored for `key`.
-    #[inline]
+    /// The number of versions of `key`, including tombstones.
     pub fn version_count<Q>(&self, key: &Q) -> usize
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
     {
-        self.tree.version_count(key.as_bytes())
+        let Some(leaf) = self.tree.raw.get(key.as_bytes()) else {
+            return 0;
+        };
+        // SAFETY: a leaf of this map, valid for `&self`.
+        let head = unsafe { leaf.as_ref() }.head();
+        chain::<V>(self.tree.arena(), head).count()
     }
 
-    /// Checks if the key is present in the map with a non-deleted head version.
+    /// `true` if the newest version of `key` is live.
     #[inline]
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
     {
-        self.get(key).is_some()
+        self.entry_for(key.as_bytes()).is_some()
     }
 
-    /// Inserts a versioned key-value pair into the map.
+    /// Adds `version` of `key`, replacing (out of place) a version with the
+    /// same number. Always returns `true`.
+    ///
+    /// # Panics
+    /// If the insert does not fit in the arena (after every latch is released,
+    /// with the map unchanged). See [`try_insert`](Self::try_insert).
     #[inline]
     pub fn insert(&self, key: K, version: u64, value: V) -> bool {
-        self.tree.insert(key, version, value)
+        match self.try_insert(key, version, value) {
+            Ok(()) => true,
+            Err(full) => panic!("{full}"),
+        }
     }
 
-    /// Inserts a versioned key-value pair into the map (alias for `insert`).
+    /// Alias for [`insert`](Self::insert).
     #[inline]
     pub fn insert_versioned(&self, key: K, version: u64, value: V) -> bool {
-        self.tree.insert(key, version, value)
+        self.insert(key, version, value)
     }
 
-    /// Inserts a versioned key-value pair using an [`ArenaInserter`] cache to accelerate sequential or localized writes.
+    /// As [`insert`](Self::insert), returning the key and value if the insert
+    /// does not fit.
     #[inline]
-    pub fn insert_with_inserter(
-        &self,
-        key: K,
-        version: u64,
-        value: V,
-        inserter: &mut ArenaInserter,
-    ) -> bool {
-        self.tree
-            .insert_with_inserter(key, version, value, inserter)
+    pub fn try_insert(&self, key: K, version: u64, value: V) -> Result<(), ArenaFull<K, V>> {
+        match self.tree.insert(key, version, Some(value), None) {
+            Ok(_) => Ok(()),
+            Err((key, value)) => Err(ArenaFull {
+                key,
+                value: value.expect("the value comes back"),
+            }),
+        }
     }
 
-    /// Marks the latest version of a key as removed, returning the removed value if present.
-    #[inline]
-    pub fn remove<Q>(&self, key: &Q) -> Option<V>
+    /// Records a tombstone at `version` for `key`, creating the key if needed
+    /// (so it shadows older data elsewhere). Older snapshots are unchanged.
+    /// Returns `true` if the key's newest version was live and is now deleted.
+    ///
+    /// # Panics
+    /// If the tombstone does not fit in the arena.
+    pub fn delete(&self, key: K, version: u64) -> bool {
+        match self.tree.insert(key, version, None, None) {
+            Ok(delta) => delta < 0,
+            Err(_) => panic!("the arena is full"),
+        }
+    }
+
+    /// Deletes the newest version of `key` in place of its value: a tombstone
+    /// with the same version number, so snapshots at or after it see the key
+    /// as absent. Returns the replaced version.
+    ///
+    /// # Panics
+    /// If the tombstone does not fit in the arena.
+    #[deprecated(note = "use `delete(key, version)`, which does not rewrite history")]
+    pub fn remove<Q>(&self, key: &Q) -> Option<ArenaVersionedEntryRef<'_, K, V>>
     where
         K: Borrow<Q>,
         Q: AsBytes + ?Sized,
     {
-        let leaf_ptr = self.tree.get_leaf(key.as_bytes())?;
-        let leaf = unsafe { &*leaf_ptr };
-        let head_off = leaf.versions_offset.load(Ordering::Acquire) & !1;
-        if head_off == 0 {
-            return None;
-        }
-        let head = unsafe {
-            &*(self.tree.arena.get_pointer(head_off)
-                as *const crate::arena::node::ArenaVersionNode<V>)
-        };
-        if head.removed.swap(true, Ordering::AcqRel) {
-            None
-        } else {
-            self.tree.len.fetch_sub(1, Ordering::Relaxed);
-            Some(head.value.clone())
+        let (leaf, old) = self
+            .tree
+            .remove_head(key.as_bytes())
+            .unwrap_or_else(|()| panic!("the arena is full"))?;
+        // SAFETY: the replaced version stays valid for the map's life.
+        unsafe { ArenaVersionedEntryRef::new(leaf, old, self.tree.arena()) }
+    }
+
+    /// An inserter for this map, caching the last insertion point.
+    #[inline]
+    pub fn inserter(&self) -> ArenaVersionedInserter<'_, K, V> {
+        ArenaVersionedInserter {
+            tree: &self.tree,
+            cache: InserterCache::new(),
+            _not_send: PhantomData,
         }
     }
 
-    /// Returns an iterator over a sub-range of entries.
+    /// A latest-view iterator over `range`.
     pub fn range<R, Q>(&self, range: R) -> ArenaVersionedRange<'_, K, V>
     where
         R: RangeBounds<Q>,
         Q: AsBytes + ?Sized,
     {
-        let start = match range.start_bound() {
-            Bound::Included(b) => Bound::Included(b.as_bytes().to_vec()),
-            Bound::Excluded(b) => Bound::Excluded(b.as_bytes().to_vec()),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-        let end = match range.end_bound() {
-            Bound::Included(b) => Bound::Included(b.as_bytes().to_vec()),
-            Bound::Excluded(b) => Bound::Excluded(b.as_bytes().to_vec()),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-
-        ArenaVersionedRange::new(&self.tree, start, end)
+        ArenaVersionedRange::new(
+            &self.tree,
+            owned_bound(range.start_bound()),
+            owned_bound(range.end_bound()),
+        )
     }
 
-    /// Returns an iterator visiting all entries in ascending key order.
+    /// A latest-view iterator over every key.
     pub fn iter(&self) -> ArenaVersionedRange<'_, K, V> {
-        self.range::<std::ops::RangeFull, [u8]>(..)
+        ArenaVersionedRange::new(&self.tree, Bound::Unbounded, Bound::Unbounded)
     }
 
-    /// Finds the entry matching `search_key` or its successor in lexicographical key order.
+    /// The first live entry at or after (`include_equal`) or strictly after
+    /// `search_key`.
     #[inline]
     pub fn find_successor(
         &self,
         search_key: &[u8],
         include_equal: bool,
     ) -> Option<ArenaVersionedEntryRef<'_, K, V>> {
-        self.tree
-            .find_successor(search_key, include_equal)
-            .map(|leaf_ptr| ArenaVersionedEntryRef {
-                leaf_ptr,
-                arena: &self.tree.arena,
-                _marker: PhantomData,
-            })
+        let start = if include_equal {
+            Bound::Included(KeyBuf::new(search_key))
+        } else {
+            Bound::Excluded(KeyBuf::new(search_key))
+        };
+        ArenaVersionedRange::new(&self.tree, start, Bound::Unbounded).next()
     }
 
-    /// Finds the entry matching `search_key` or its predecessor in lexicographical key order.
+    /// The last live entry at or before (`include_equal`) or strictly before
+    /// `search_key`.
     #[inline]
     pub fn find_predecessor(
         &self,
         search_key: &[u8],
         include_equal: bool,
     ) -> Option<ArenaVersionedEntryRef<'_, K, V>> {
-        self.tree
-            .find_predecessor(search_key, include_equal)
-            .map(|leaf_ptr| ArenaVersionedEntryRef {
-                leaf_ptr,
-                arena: &self.tree.arena,
-                _marker: PhantomData,
-            })
+        let end = if include_equal {
+            Bound::Included(KeyBuf::new(search_key))
+        } else {
+            Bound::Excluded(KeyBuf::new(search_key))
+        };
+        ArenaVersionedRange::new(&self.tree, Bound::Unbounded, end).next_back()
     }
 
-    /// Finds the first entry in lexicographical key order.
+    /// The first live entry.
     #[inline]
     pub fn first_entry(&self) -> Option<ArenaVersionedEntryRef<'_, K, V>> {
-        self.find_successor(&[], true)
+        self.iter().next()
     }
 
-    /// Finds the last entry in lexicographical key order.
+    /// The last live entry.
     #[inline]
     pub fn last_entry(&self) -> Option<ArenaVersionedEntryRef<'_, K, V>> {
-        self.tree
-            .last_leaf()
-            .map(|leaf_ptr| ArenaVersionedEntryRef {
-                leaf_ptr,
-                arena: &self.tree.arena,
-                _marker: PhantomData,
-            })
+        self.iter().next_back()
     }
 
-    /// Scans entries in the given key range, invoking `callback` for each entry with its key, value, and version.
-    ///
-    /// If `callback` returns `false`, scanning terminates early.
+    /// Calls `callback(key, value, version)` for the newest live version of
+    /// each key in `range`, until it returns `false`.
     pub fn scan<R, Q, F>(&self, range: R, mut callback: F)
     where
         R: RangeBounds<Q>,
         Q: AsBytes + ?Sized,
         F: FnMut(&K, &V, u64) -> bool,
     {
-        for entry in self.range(range) {
-            if !callback(entry.key(), entry.value(), entry.version()) {
+        for e in self.range(range) {
+            if !callback(e.key(), e.value(), e.version()) {
                 break;
             }
         }
     }
+
+    /// Checks the structural invariants; panics on a violation.
+    pub fn validate_invariants(&mut self) {
+        self.tree.raw.validate();
+    }
 }
 
-impl<'a, K: AsBytes + Clone, V: Clone> IntoIterator for &'a ArenaVersionedArtMap<K, V> {
+impl<'a, K: AsBytes, V> IntoIterator for &'a ArenaVersionedArtMap<K, V> {
     type Item = ArenaVersionedEntryRef<'a, K, V>;
     type IntoIter = ArenaVersionedRange<'a, K, V>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+/// A map-bound inserter for an [`ArenaVersionedArtMap`], created by
+/// [`ArenaVersionedArtMap::inserter`]. Neither `Send` nor `Sync`.
+pub struct ArenaVersionedInserter<'m, K, V> {
+    tree: &'m ArenaVersionedTree<K, V>,
+    cache: InserterCache,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<K: AsBytes, V> ArenaVersionedInserter<'_, K, V> {
+    /// As [`ArenaVersionedArtMap::insert`].
+    ///
+    /// # Panics
+    /// If the insert does not fit in the arena.
+    #[inline]
+    pub fn insert(&mut self, key: K, version: u64, value: V) -> bool {
+        match self.try_insert(key, version, value) {
+            Ok(()) => true,
+            Err(full) => panic!("{full}"),
+        }
+    }
+
+    /// As [`ArenaVersionedArtMap::try_insert`].
+    #[inline]
+    pub fn try_insert(&mut self, key: K, version: u64, value: V) -> Result<(), ArenaFull<K, V>> {
+        match self
+            .tree
+            .insert(key, version, Some(value), Some(&mut self.cache))
+        {
+            Ok(_) => Ok(()),
+            Err((key, value)) => Err(ArenaFull {
+                key,
+                value: value.expect("the value comes back"),
+            }),
+        }
     }
 }

@@ -148,7 +148,6 @@ impl HybridLatch {
 impl WriteGuard<'_> {
     /// W4: releases the latch and returns the new version, so callers that
     /// cache versions (the arena inserters) never re-load it.
-    #[allow(dead_code)] // used by the arena inserters
     #[inline]
     pub(crate) fn unlock(self) -> u64 {
         let nv = self.v.wrapping_add(VERSION_STEP);
@@ -260,6 +259,11 @@ impl SpinBackoff {
 mod tests {
     use super::*;
 
+    /// `true` if an acquisition failed (and so holds nothing).
+    fn fails(r: Option<WriteGuard<'_>>) -> bool {
+        r.is_none()
+    }
+
     #[test]
     fn latch_lifecycle() {
         let latch = HybridLatch::new();
@@ -277,26 +281,23 @@ mod tests {
         assert_eq!(v1, v0 + VERSION_STEP);
         assert_eq!(latch.read_version(), Some(v1));
         assert!(!latch.validate(v0));
-        assert!(
-            latch.try_upgrade(v0).is_none(),
-            "stale version cannot upgrade"
-        );
+        assert!(fails(latch.try_upgrade(v0)), "stale version cannot upgrade");
 
         let w = latch.lock().expect("lock");
         w.mark_obsolete();
         assert!(latch.is_obsolete());
         assert!(latch.read_version().is_none());
-        assert!(latch.lock().is_none(), "obsolete latch cannot be locked");
+        assert!(fails(latch.lock()), "obsolete latch cannot be locked");
     }
 
     #[test]
     fn upgrade_rejects_flagged_versions() {
         let latch = HybridLatch::new();
-        assert!(latch.try_upgrade(LOCK_BIT).is_none());
-        assert!(latch.try_upgrade(OBSOLETE_BIT).is_none());
+        assert!(fails(latch.try_upgrade(LOCK_BIT)));
+        assert!(fails(latch.try_upgrade(OBSOLETE_BIT)));
         let w = latch.lock().unwrap();
         // A stale version that happens to equal the locked word must fail.
-        assert!(latch.try_upgrade(LOCK_BIT).is_none());
+        assert!(fails(latch.try_upgrade(LOCK_BIT)));
         drop(w);
     }
 
@@ -382,8 +383,8 @@ mod tests {
         let v = latch.read_version().unwrap();
         latch.lock().unwrap().mark_obsolete();
         assert!(latch.is_obsolete());
-        assert!(latch.lock().is_none());
-        assert!(latch.try_upgrade(v).is_none());
+        assert!(fails(latch.lock()));
+        assert!(fails(latch.try_upgrade(v)));
         assert!(latch.read_version().is_none());
         assert!(!latch.validate(v));
     }

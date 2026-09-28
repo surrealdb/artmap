@@ -20,8 +20,6 @@ use crate::key::AsBytes;
 use crate::raw::LeafNode;
 use crate::sync::atomic::{AtomicBool, Ordering};
 
-pub(crate) use crate::raw::node::{NodeType, MAX_PREFIX_LEN, NODE48_EMPTY};
-
 /// A leaf of an [`ArtMap`](crate::ArtMap): one key and its value.
 ///
 /// Immutable once published (Inv 1): replacing a value allocates a new leaf.

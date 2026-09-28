@@ -27,7 +27,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use artmap::arena::{Arena, ArenaArtMap, ArenaInserter, ArenaVersionedArtMap};
+use artmap::arena::{Arena, ArenaArtMap, ArenaVersionedArtMap};
 use artmap::versioned::VersionedArtMap;
 use artmap::ArtMap;
 
@@ -447,11 +447,11 @@ fn test_stress_arena_inserter_concurrent_cache_resilience() {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                let mut ins = ArenaInserter::new();
+                let mut ins = map.inserter();
                 let start = (t * KEYS_PER_INSERTER) as u64;
                 for i in 0..KEYS_PER_INSERTER as u64 {
                     let k = (start + i).to_be_bytes();
-                    map.insert_with_inserter(k, start + i, &mut ins);
+                    ins.insert(k, start + i);
                 }
             })
         })

@@ -12,248 +12,421 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # Arena-Backed Concurrent Adaptive Radix Tree
+//! # Arena-backed adaptive radix trees
 //!
-//! Provides [`ArenaArtMap`], an arena-backed concurrent Adaptive Radix Tree (ART)
-//! that uses 32-bit offsets for child pointers instead of 64-bit raw pointers.
+//! [`ArenaArtMap`] and [`ArenaVersionedArtMap`] allocate their nodes, leaves
+//! and versions from a bump [`Arena`], addressed by 32-bit offsets, which keeps
+//! inner nodes small (a `Node4` is 64 bytes).
 //!
-//! ## Design & Features
-//!
-//! - **32-Bit Offsets**: Shrinks inner node memory footprint by ~40% and doubles CPU L1/L2
-//!   cache efficiency.
-//! - **$O(1)$ Zero-Cost Teardown**: The entire tree is discarded or recycled in $O(1)$ by
-//!   dropping or resetting the underlying arena buffer.
-//! - **Optimistic Lock Coupling (OLC)**: Readers traverse child offsets non-blocking with zero
-//!   locks, and without epoch-based GC registration overhead.
-//! - **Multi-Version Support**: Built-in 64-bit versioning (`insert_versioned`, `get_version_le`)
-//!   supporting atomic version prepend chains in leaves.
+//! - **Reclamation.** Nothing is freed while the map is alive: removed or
+//!   replaced entries stay readable for the whole map borrow, and every update
+//!   permanently consumes arena capacity. Dropping the map drops every key and
+//!   value exactly once (the live tree, the version chains, and every entry
+//!   unlinked while the map was alive). Teardown is O(1) only for types without
+//!   drop glue; otherwise it walks the tree.
+//! - **Capacity.** An insert that does not fit fails cleanly: `try_insert`
+//!   returns the key and value, and `insert` panics outside any latch.
+//!   `max_insert_bytes` bounds what one insert can consume.
+//! - **Stability.** Every `&K`/`&V` obtained from an arena map stays valid and
+//!   unchanged for the whole map borrow, whatever concurrent writes happen.
 
-// The arena modules still expose their pre-0.6 internals; they are rebuilt
-// on the shared core and sealed by the arena rewrite.
-#![allow(private_interfaces)]
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
-pub mod iter;
-pub mod map;
-pub mod node;
-pub mod tree;
-pub mod versioned_iter;
-pub mod versioned_map;
-pub mod versioned_tree;
+mod iter;
+mod map;
+mod node;
+mod storage;
+mod tree;
+mod versioned_iter;
+mod versioned_map;
+mod versioned_tree;
 
-use std::cell::{Cell, UnsafeCell};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::alloc::Layout;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub use iter::{ArenaEntryRef, Range};
 pub use map::{ArenaArtMap, ArenaInserter};
-pub use versioned_iter::{ArenaVersionedEntryRef, ArenaVersionedRange};
-pub use versioned_map::ArenaVersionedArtMap;
+pub use versioned_iter::{ArenaVersionedEntryRef, ArenaVersionedRange, VersionRef};
+pub use versioned_map::{ArenaVersionedArtMap, ArenaVersionedInserter};
 
-/// Maximum arena size (`u32::MAX` to fit in 32-bit offsets).
-pub const MAX_ARENA_SIZE: usize = u32::MAX as usize;
+/// Every arena allocation is aligned to at most this; the buffer is aligned to it.
+pub(crate) const ARENA_ALIGN: usize = 64;
 
-/// Node allocation alignment in the arena (8 bytes).
-pub const NODE_ALIGNMENT: u32 = 8;
+/// The largest arena: offsets are 32-bit.
+pub const MAX_ARENA_SIZE: usize = (u32::MAX as usize) & !(ARENA_ALIGN - 1);
 
-/// Size of thread-local allocation buffer chunks (64 KB).
-const TLAB_CHUNK_SIZE: u32 = 64 * 1024;
-
-#[derive(Clone, Copy, Default)]
-struct TlabSlot {
-    arena_id: usize,
-    gen: u32,
-    current: u32,
-    limit: u32,
-}
-
-thread_local! {
-    static TLAB: Cell<[TlabSlot; 4]> = const {
-        Cell::new([TlabSlot {
-            arena_id: 0,
-            gen: 0,
-            current: 0,
-            limit: 0,
-        }; 4])
-    };
-}
-
-static NEXT_ARENA_ID: AtomicUsize = AtomicUsize::new(1);
-
-/// A lock-free contiguous byte arena allocator for [`ArenaArtMap`].
+/// A contiguous, pre-allocated memory region for the arena maps.
 ///
-/// Memory is pre-allocated upon creation and allocated sequentially via atomic bump allocation
-/// accelerated by thread-local allocation buffers (TLAB).
-/// When dropped, the entire memory block is reclaimed in $O(1)$.
+/// Allocation is a lock-free bump of an atomic cursor. Memory is released
+/// only when the arena is dropped, or reused only after [`reset`](Self::reset),
+/// which needs exclusive access (so no map can still be using the arena).
 pub struct Arena {
-    id: usize,
-    n: AtomicU64,
-    gen: AtomicU32,
-    _pad: [u8; 44],
-    buf: Box<[UnsafeCell<u8>]>,
+    /// Fresh from a global counter on `new` and on every `reset`.
+    id: u64,
+    /// Offsets `[0, ARENA_ALIGN)` are the null region.
+    cursor: AtomicU64,
+    base: NonNull<u8>,
+    /// `ARENA_ALIGN <= capacity <= MAX_ARENA_SIZE`, a multiple of `ARENA_ALIGN`.
+    capacity: usize,
 }
 
-// SAFETY: `Arena` buffer memory is self-contained.
+// SAFETY: `Arena` owns its buffer. The atomic cursor hands out each byte range
+// at most once; each range is accessed only through raw pointers derived from
+// `base` (never a `&`/`&mut` to the whole buffer), and the fields inside a range
+// that are shared are atomics (Inv 3, Inv 5).
 unsafe impl Send for Arena {}
-
-// SAFETY: All mutation is coordinated through the atomic `n` cursor in `alloc`.
-// Distinct allocations reserve disjoint byte ranges that never overlap.
+// SAFETY: as above; `&Arena` exposes only `alloc` (an atomic CAS) and the
+// `unsafe` pointer accessors.
 unsafe impl Sync for Arena {}
 
-impl Arena {
-    /// Creates a new arena with the specified byte capacity.
-    #[cfg_attr(target_pointer_width = "32", allow(clippy::unnecessary_min_or_max))]
-    pub fn new(capacity: usize) -> Self {
-        let capacity = capacity.min(MAX_ARENA_SIZE);
-        let buf: Box<[u8]> = vec![0u8; capacity].into_boxed_slice();
-        // SAFETY: `UnsafeCell<u8>` is `#[repr(transparent)]` over `u8`.
-        let buf: Box<[UnsafeCell<u8>]> =
-            unsafe { Box::from_raw(Box::into_raw(buf) as *mut [UnsafeCell<u8>]) };
+fn next_arena_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
+impl Arena {
+    /// Creates an arena of `capacity` bytes, clamped to
+    /// `[64, MAX_ARENA_SIZE]` and rounded down to a multiple of 64.
+    pub fn new(capacity: usize) -> Self {
+        // A zero-size layout is UB for `alloc_zeroed`. `[0, ARENA_ALIGN)` is the
+        // null region, so clamping up only changes `capacity()` for requests
+        // below `ARENA_ALIGN`; no allocation that fitted before fails now.
+        let capacity = capacity.clamp(ARENA_ALIGN, MAX_ARENA_SIZE) & !(ARENA_ALIGN - 1);
+        let layout = Layout::from_size_align(capacity, ARENA_ALIGN).expect("arena layout");
+        // SAFETY: `layout.size() >= ARENA_ALIGN > 0`.
+        let base = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })
+            .unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
         Self {
-            id: NEXT_ARENA_ID.fetch_add(1, Ordering::Relaxed),
-            n: AtomicU64::new(NODE_ALIGNMENT as u64),
-            gen: AtomicU32::new(0),
-            _pad: [0u8; 44],
-            buf,
+            id: next_arena_id(),
+            cursor: AtomicU64::new(ARENA_ALIGN as u64),
+            base,
+            capacity,
         }
     }
 
-    /// Creates an `Arc<Arena>` with the specified byte capacity.
+    /// Creates an `Arc<Arena>` of `capacity` bytes.
     pub fn with_capacity(capacity: usize) -> Arc<Self> {
         Arc::new(Self::new(capacity))
     }
 
-    /// Returns the number of bytes allocated in the arena so far.
+    /// Bytes handed out so far, including the 64-byte null region.
     pub fn size(&self) -> usize {
-        let s = self.n.load(Ordering::Relaxed);
-        if s > self.buf.len() as u64 {
-            self.buf.len()
-        } else {
-            s as usize
-        }
+        (self.cursor.load(Ordering::Relaxed) as usize).min(self.capacity)
     }
 
-    /// Returns the total capacity in bytes of this arena.
-    #[inline]
+    /// Usable capacity after clamping.
     pub fn capacity(&self) -> usize {
-        self.buf.len()
+        self.capacity
     }
 
-    /// Returns the remaining available bytes in this arena.
-    #[inline]
+    /// Bytes still available.
     pub fn remaining(&self) -> usize {
-        self.capacity().saturating_sub(self.size())
+        self.capacity - self.size()
     }
 
-    /// Returns `true` if no user allocations have been made yet.
-    #[inline]
+    /// `true` if nothing has been allocated since creation or the last reset.
     pub fn is_empty(&self) -> bool {
-        self.size() <= NODE_ALIGNMENT as usize
+        self.cursor.load(Ordering::Relaxed) <= ARENA_ALIGN as u64
     }
 
-    /// Resets the allocation offset to allow reusing the allocated memory buffer in $O(1)$.
+    /// Makes the whole arena available again, in O(1). Requires exclusive
+    /// access, so no map can still hold it. The arena gets a fresh identity.
     pub fn reset(&mut self) {
-        self.gen.fetch_add(1, Ordering::Relaxed);
-        self.n.store(NODE_ALIGNMENT as u64, Ordering::Relaxed);
+        // Every node, leaf and version is fully written before use, so the
+        // old bytes need no clearing.
+        self.id = next_arena_id();
+        *self.cursor.get_mut() = ARENA_ALIGN as u64;
     }
 
-    /// Returns the offset of a pointer allocated in this arena.
-    #[inline(always)]
-    pub fn offset_of(&self, ptr: *const u8) -> u32 {
-        ((ptr as usize) - (self.buf.as_ptr() as usize)) as u32
+    /// The arena's identity: fresh on creation and on every reset.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
-    /// Reserves `size` bytes directly from the global atomic bump cursor.
-    pub fn alloc_global(&self, size: u32, alignment: u32, overflow: u32) -> Option<u32> {
-        debug_assert!(alignment.is_power_of_two());
-
-        let align_mask = alignment as u64 - 1;
-        let padded = (size as u64 + align_mask) & !align_mask;
-        let prev_size = self.n.fetch_add(padded, Ordering::Relaxed);
-        let new_size = prev_size + padded;
-        if new_size + overflow as u64 > self.buf.len() as u64 {
-            return None;
+    /// Reserves `layout.size()` bytes aligned to `layout.align()`.
+    ///
+    /// Uncontended, this is a check-then-bump CAS on the global cursor, which
+    /// never advances on failure. A thread whose CAS loses a race switches to a
+    /// thread-local chunk for this arena (the TLAB, §12.1), so concurrent
+    /// writers stop contending on one cache line. Chunks are small
+    /// (`min(16 KiB, remaining / 32)`), carved with checked `u64` arithmetic,
+    /// and keyed on the arena's identity, which is fresh after every reset; a
+    /// failed refill falls back to an exact-size global allocation.
+    pub(crate) fn alloc(&self, layout: Layout) -> Option<u32> {
+        debug_assert!(layout.align() <= ARENA_ALIGN);
+        let align = layout.align() as u64;
+        let size = (layout.size() as u64).max(1);
+        if let Some(off) = tlab::take(self.id, align, size) {
+            return Some(off);
         }
-
-        let offset = prev_size as u32;
-        debug_assert_eq!(offset % alignment, 0);
-        Some(offset)
-    }
-
-    /// Allocates `size` bytes with the specified `alignment`.
-    #[inline]
-    pub fn alloc(&self, size: u32, alignment: u32, overflow: u32) -> Option<u32> {
-        debug_assert!(alignment.is_power_of_two());
-        let align_mask = alignment - 1;
-        let padded = (size + align_mask) & !align_mask;
-
-        // Try thread-local allocation buffer (TLAB) for small allocations
-        if padded <= TLAB_CHUNK_SIZE / 4 {
-            let arena_id = self.id;
-            let current_gen = self.gen.load(Ordering::Relaxed);
-            let res = TLAB.with(|cell| {
-                let mut slots = cell.get();
-                for slot in slots.iter_mut() {
-                    if slot.arena_id == arena_id && slot.gen == current_gen {
-                        let cur_aligned = (slot.current + align_mask) & !align_mask;
-                        let next = cur_aligned + padded;
-                        if next <= slot.limit {
-                            slot.current = next;
-                            cell.set(slots);
-                            return Some(cur_aligned);
-                        }
-                        break;
-                    }
+        let mut cur = self.cursor.load(Ordering::Relaxed);
+        let mut contended = false;
+        loop {
+            let start = cur.checked_add(align - 1)? & !(align - 1);
+            let end = start.checked_add(size)?;
+            if end > self.capacity as u64 {
+                return None;
+            }
+            if contended {
+                if let Some(off) = self.refill(align, size, cur) {
+                    return Some(off);
                 }
-
-                // Refill TLAB from global atomic cursor
-                let chunk_size = TLAB_CHUNK_SIZE;
-                if let Some(block_start) = self.alloc_global(chunk_size, alignment, overflow) {
-                    let cur_aligned = (block_start + align_mask) & !align_mask;
-                    let next = cur_aligned + padded;
-                    let mut target_idx = 0;
-                    for (i, slot) in slots.iter().enumerate() {
-                        if slot.arena_id == arena_id || slot.current >= slot.limit {
-                            target_idx = i;
-                            break;
-                        }
-                    }
-                    slots[target_idx] = TlabSlot {
-                        arena_id,
-                        gen: current_gen,
-                        current: next,
-                        limit: block_start + chunk_size,
-                    };
-                    cell.set(slots);
-                    Some(cur_aligned)
-                } else {
-                    None
+            }
+            match self
+                .cursor
+                .compare_exchange_weak(cur, end, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return Some(start as u32),
+                Err(actual) => {
+                    // Only a real conflict counts: `compare_exchange_weak` may
+                    // also fail spuriously, with the cursor unchanged.
+                    contended |= actual != cur;
+                    cur = actual;
                 }
-            });
-
-            if let Some(offset) = res {
-                return Some(offset);
             }
         }
-
-        self.alloc_global(size, alignment, overflow)
     }
 
-    /// Returns a raw pointer to the data at the specified 32-bit offset.
-    #[inline(always)]
-    pub fn get_pointer(&self, offset: u32) -> *const u8 {
-        debug_assert_ne!(offset, 0);
-        debug_assert!((offset as usize) < self.buf.len());
-        // SAFETY: `offset` was verified within bounds during `alloc`.
-        unsafe { (self.buf.as_ptr() as *const u8).add(offset as usize) }
+    /// Claims a chunk for this thread and carves the request from it.
+    fn refill(&self, align: u64, size: u64, mut cur: u64) -> Option<u32> {
+        const MAX_CHUNK: u64 = 16 * 1024;
+        loop {
+            let remaining = (self.capacity as u64).saturating_sub(cur);
+            let chunk = MAX_CHUNK.min(remaining / 32);
+            let start = cur.checked_add(ARENA_ALIGN as u64 - 1)? & !(ARENA_ALIGN as u64 - 1);
+            let end = start.checked_add(chunk)?;
+            // Too small to be worth it, or does not fit: the caller falls back
+            // to an exact-size allocation.
+            if chunk < size + align || end > self.capacity as u64 {
+                return None;
+            }
+            match self
+                .cursor
+                .compare_exchange_weak(cur, end, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    tlab::install(self.id, start, end);
+                    return tlab::take(self.id, align, size);
+                }
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
-    /// Returns a raw mutable pointer to the data at the specified 32-bit offset.
+    /// A pointer to the `T` at `offset`.
+    ///
+    /// # Safety
+    /// `offset` was returned by `self.alloc` for a layout that fits `T` (and
+    /// the arena was not reset since).
     #[inline(always)]
-    pub fn get_pointer_mut(&self, offset: u32) -> *mut u8 {
-        debug_assert_ne!(offset, 0);
-        debug_assert!((offset as usize) < self.buf.len());
-        // SAFETY: `offset` was verified within bounds during `alloc`.
-        unsafe { (self.buf.as_ptr() as *mut u8).add(offset as usize) }
+    pub(crate) unsafe fn ptr<T>(&self, offset: u32) -> NonNull<T> {
+        debug_assert!(offset as usize >= ARENA_ALIGN && (offset as usize) < self.capacity);
+        // SAFETY: per the contract the offset is inside the buffer; provenance
+        // flows from `base` (Inv 4).
+        unsafe { self.base.add(offset as usize).cast::<T>() }
+    }
+
+    /// The offset of a pointer into this arena.
+    #[inline(always)]
+    pub(crate) fn offset_of<T>(&self, ptr: NonNull<T>) -> u32 {
+        let off = ptr.addr().get() - self.base.addr().get();
+        debug_assert!(off < self.capacity);
+        off as u32
+    }
+}
+
+/// Per-thread allocation buffers (§12.1). A slot is `(arena id, cursor,
+/// end)`; ids are never reused, so a slot for a dropped or reset arena is
+/// simply never matched again.
+mod tlab {
+    use std::cell::Cell;
+
+    const SLOTS: usize = 4;
+
+    #[derive(Copy, Clone)]
+    struct Slot {
+        arena: u64,
+        cur: u64,
+        end: u64,
+    }
+
+    const EMPTY: Slot = Slot {
+        arena: 0,
+        cur: 0,
+        end: 0,
+    };
+
+    std::thread_local! {
+        static SLOTS_TLS: Cell<[Slot; SLOTS]> = const { Cell::new([EMPTY; SLOTS]) };
+    }
+
+    /// Carves `size` bytes aligned to `align` from this thread's chunk for
+    /// `arena`, if it has one with room.
+    pub(super) fn take(arena: u64, align: u64, size: u64) -> Option<u32> {
+        SLOTS_TLS
+            .try_with(|c| {
+                let mut slots = c.get();
+                let s = slots.iter_mut().find(|s| s.arena == arena)?;
+                let start = s.cur.checked_add(align - 1)? & !(align - 1);
+                let end = start.checked_add(size)?;
+                if end > s.end {
+                    return None;
+                }
+                s.cur = end;
+                c.set(slots);
+                u32::try_from(start).ok()
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// Makes `[start, end)` this thread's chunk for `arena`, replacing its old
+    /// chunk (whose remainder is abandoned) or the least useful slot.
+    pub(super) fn install(arena: u64, start: u64, end: u64) {
+        // Outside a live thread (TLS teardown) the chunk is simply not kept.
+        SLOTS_TLS
+            .try_with(|c| {
+                let mut slots = c.get();
+                let i = slots
+                    .iter()
+                    .position(|s| s.arena == arena)
+                    .or_else(|| slots.iter().position(|s| s.arena == 0))
+                    .unwrap_or_else(|| {
+                        // Evict the slot with the least room left.
+                        (0..SLOTS)
+                            .min_by_key(|&i| slots[i].end - slots[i].cur)
+                            .unwrap_or(0)
+                    });
+                slots[i] = Slot {
+                    arena,
+                    cur: start,
+                    end,
+                };
+                c.set(slots);
+            })
+            .unwrap_or(());
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` with exactly this (non-zero) layout.
+        unsafe {
+            std::alloc::dealloc(
+                self.base.as_ptr(),
+                Layout::from_size_align_unchecked(self.capacity, ARENA_ALIGN),
+            )
+        }
+    }
+}
+
+impl std::fmt::Debug for Arena {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Arena")
+            .field("size", &self.size())
+            .field("capacity", &self.capacity)
+            .finish()
+    }
+}
+
+/// An insert did not fit in the arena. Holds the key and value that were not
+/// inserted; nothing was published and no latch is held.
+pub struct ArenaFull<K, V> {
+    /// The key that was not inserted.
+    pub key: K,
+    /// The value that was not inserted.
+    pub value: V,
+}
+
+impl<K, V> std::fmt::Debug for ArenaFull<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ArenaFull")
+    }
+}
+
+impl<K, V> std::fmt::Display for ArenaFull<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the arena is full")
+    }
+}
+
+impl<K, V> std::error::Error for ArenaFull<K, V> {}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiny_and_zero_arenas_are_sound() {
+        for cap in [0, 1, 63, 64, 65, 4096] {
+            let a = Arena::new(cap);
+            assert!(a.capacity() >= ARENA_ALIGN);
+            assert_eq!(a.capacity() % ARENA_ALIGN, 0);
+            // The null region leaves nothing for a 64-byte arena.
+            let r = a.alloc(Layout::new::<u64>());
+            assert_eq!(r.is_some(), a.capacity() > ARENA_ALIGN);
+        }
+    }
+
+    #[test]
+    fn allocations_are_aligned_bounded_and_never_advance_on_failure() {
+        let a = Arena::new(4096);
+        let o1 = a.alloc(Layout::new::<u8>()).unwrap();
+        let o2 = a.alloc(Layout::new::<u128>()).unwrap();
+        assert_eq!(o2 % 16, 0);
+        assert!(o2 > o1);
+        let o3 = a.alloc(Layout::from_size_align(8, 64).unwrap()).unwrap();
+        assert_eq!(o3 % 64, 0);
+        let before = a.size();
+        assert!(a
+            .alloc(Layout::from_size_align(1 << 20, 8).unwrap())
+            .is_none());
+        assert_eq!(a.size(), before, "a failed allocation does not advance");
+        // Fill exactly.
+        while a.alloc(Layout::new::<u64>()).is_some() {}
+        assert!(a.remaining() < 8);
+        // Addresses round-trip through offsets with provenance.
+        let a2 = Arena::new(4096);
+        let off = a2.alloc(Layout::new::<u64>()).unwrap();
+        // SAFETY: freshly allocated for a u64.
+        let p = unsafe { a2.ptr::<u64>(off) };
+        assert_eq!(a2.offset_of(p), off);
+        assert_eq!(p.as_ptr().addr() % 8, 0);
+    }
+
+    #[test]
+    fn concurrent_allocations_never_overlap() {
+        let a = Arc::new(Arena::new(8 << 20));
+        let threads = if cfg!(miri) { 2 } else { 8 };
+        let per = if cfg!(miri) { 50 } else { 10_000 };
+        let hs: Vec<_> = (0..threads)
+            .map(|_| {
+                let a = Arc::clone(&a);
+                std::thread::spawn(move || {
+                    (0..per)
+                        .filter_map(|_| a.alloc(Layout::from_size_align(24, 8).unwrap()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut all: Vec<u32> = hs.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        all.sort_unstable();
+        assert!(
+            all.windows(2).all(|w| w[1] - w[0] >= 24),
+            "overlapping allocations"
+        );
+    }
+
+    #[test]
+    fn reset_gives_a_fresh_identity() {
+        let mut a = Arena::new(1024);
+        let id = a.id();
+        a.alloc(Layout::new::<u64>()).unwrap();
+        a.reset();
+        assert!(a.is_empty());
+        assert_ne!(a.id(), id);
     }
 }
