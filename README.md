@@ -31,8 +31,6 @@ There are four map types:
 
 ## Performance
 
-> **These numbers were measured on 0.5.0.** The 0.6 rewrite fixes soundness bugs and changes the performance profile. Re-measured on the same Threadripper, 0.6 is 30–49% faster for 8-thread writes and 14–29% faster for mixed workloads. Point gets are within about 10%, and single-threaded inserts within about 15%. 100-item range scans are slower: about 30% for the arena maps, 72% for `ArtMap` and about 3× for `VersionedArtMap`; `scan(range, callback)` avoids the per-entry handle. The tables will be regenerated for the release.
-
 Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM**, Linux 6.8):
 
 | Data Structure | Read<br><sup>(with&nbsp;standard&nbsp;key)</sup> | Read<br><sup>(with&nbsp;slice&nbsp;key)</sup> | Insert<br><sup>(sequential&nbsp;entries)</sup> | Insert<br><sup>(random&nbsp;entries)</sup> | Range&nbsp;scans<br><sup>(100&nbsp;items)</sup> |
