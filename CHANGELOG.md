@@ -84,14 +84,15 @@ For the old `insert` behaviour when `V: Clone`, use `insert_cloned(k, v) -> Opti
 - The `Node256` lock-free insert path is removed. All inserts take the node latch.
 
 ### Performance
-Compared with 0.5.0 on aarch64:
-- per-operation `get` is 4–16% slower, depending on the benchmark;
-- 100-item range scans are 9–21% slower;
-- overwrites are 45–55% slower, because each allocates a new leaf and retires the old one through EBR;
-- versioned updates are up to 20% slower;
-- inserts of new keys, lookups under long shared prefixes, and 8-thread versioned updates are faster.
+Compared with 0.5.0 on the same machine (AMD Threadripper 9970X, one session):
+- point gets are within ±10%;
+- 100-item range scans are 28–30% slower for the arena maps, 67% slower for `ArtMap` and about 3× slower for `VersionedArtMap`;
+- 8-thread writes and mixed 4R+4W workloads are about 5% slower for `ArtMap`, and 28–68% slower for `VersionedArtMap` and both arena maps;
+- heap inserts are 4–10% slower, and arena inserts 5–25% faster;
+- memory per key is unchanged for `ArtMap` and `ArenaArtMap`, and 20–36% higher for `VersionedArtMap` and `ArenaVersionedArtMap`;
+- overwrites are 45–55% slower (measured on aarch64), because each allocates a new leaf and retires the old one through EBR.
 
-See `benches/safety_bench.rs` and `benches/memory_bench.rs`.
+See `benches/comparison_bench.rs`, `benches/safety_bench.rs` and `benches/memory_bench.rs`.
 
 ### Known limitations
 - Inner nodes emptied by removes are not reclaimed until `clear()` or drop. Delete-side compaction is planned after 0.6.
