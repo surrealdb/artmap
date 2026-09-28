@@ -361,22 +361,19 @@ mod tests {
                 n += 1;
             }
         });
-        let (mut ok, mut failed) = (0, 0);
         for _ in 0..if cfg!(miri) { 200 } else { 100_000 } {
+            // Under a busy writer, a read may see the latch locked, validate,
+            // or fail validation; all three are correct outcomes.
             if let Some(v) = latch.read_version() {
                 std::hint::spin_loop();
-                if latch.validate(v) {
-                    ok += 1;
-                } else {
-                    failed += 1;
-                }
+                std::hint::black_box(latch.validate(v));
             }
         }
         running.store(false, std::sync::atomic::Ordering::Relaxed);
         writer.join().unwrap();
-        // Both outcomes are possible; the invariant is that neither panics and
-        // that a stable read validates.
-        assert!(ok + failed > 0 || cfg!(miri));
+        // With the writer gone, a read is stable and always validates.
+        let v = latch.read_version().expect("no writer holds the latch");
+        assert!(latch.validate(v));
     }
 
     #[test]
