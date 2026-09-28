@@ -325,9 +325,17 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                         let old_val = unsafe { ManuallyDrop::take(&mut existing_leaf.value) };
                         existing_leaf.value =
                             ManuallyDrop::new(unsafe { ManuallyDrop::take(&mut new_leaf.value) });
+                        let was_removed = existing_leaf.removed.swap(false, Ordering::AcqRel);
+                        if was_removed {
+                            self.len.fetch_add(1, Ordering::Relaxed);
+                        }
                         self.root_latch.unlock();
                         return Ok((Some(old_val), cur_root.as_leaf_ptr::<K, V>()));
                     } else {
+                        let was_removed = existing_leaf.removed.swap(false, Ordering::AcqRel);
+                        if was_removed {
+                            self.len.fetch_add(1, Ordering::Relaxed);
+                        }
                         unsafe { ManuallyDrop::drop(&mut new_leaf.value) };
                         self.root_latch.unlock();
                         return Ok((None, cur_root.as_leaf_ptr::<K, V>()));
@@ -484,9 +492,17 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                             existing_leaf.value = ManuallyDrop::new(unsafe {
                                 ManuallyDrop::take(&mut new_leaf.value)
                             });
+                            let was_removed = existing_leaf.removed.swap(false, Ordering::AcqRel);
+                            if was_removed {
+                                self.len.fetch_add(1, Ordering::Relaxed);
+                            }
                             header.latch.unlock();
                             return Ok((Some(old_val), leaf_ptr));
                         } else {
+                            let was_removed = existing_leaf.removed.swap(false, Ordering::AcqRel);
+                            if was_removed {
+                                self.len.fetch_add(1, Ordering::Relaxed);
+                            }
                             unsafe { ManuallyDrop::drop(&mut new_leaf.value) };
                             header.latch.unlock();
                             return Ok((None, leaf_ptr));
@@ -666,9 +682,19 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> Tree<K, V> {
                                     existing_leaf.value = ManuallyDrop::new(unsafe {
                                         ManuallyDrop::take(&mut new_leaf.value)
                                     });
+                                    let was_removed =
+                                        existing_leaf.removed.swap(false, Ordering::AcqRel);
+                                    if was_removed {
+                                        self.len.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     header.latch.unlock();
                                     return Ok((Some(old_val), child.as_leaf_ptr::<K, V>()));
                                 } else {
+                                    let was_removed =
+                                        existing_leaf.removed.swap(false, Ordering::AcqRel);
+                                    if was_removed {
+                                        self.len.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     unsafe { ManuallyDrop::drop(&mut new_leaf.value) };
                                     header.latch.unlock();
                                     return Ok((None, child.as_leaf_ptr::<K, V>()));
