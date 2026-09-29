@@ -175,9 +175,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
         // `value` is declared before the guard, so an unwind drops the latch
         // guard first and runs `V::drop` outside the latch.
         let value = value;
-        let Some(w) = leaf.chain_latch.lock() else {
-            unreachable!("chain latches are only obsoleted by Phase 8 unlinks")
-        };
+        let w = leaf.chain_latch.lock();
         // Positions are found under the latch.
         let head = leaf.head_ptr();
         // SAFETY: `head` is live (see `VersionedLeaf::head`).
@@ -235,9 +233,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
         let leaf_ptr = self.raw.get(key)?;
         // SAFETY: protected by `guard`.
         let leaf = unsafe { leaf_ptr.as_ref() };
-        let Some(w) = leaf.chain_latch.lock() else {
-            unreachable!("chain latches are only obsoleted by Phase 8 unlinks")
-        };
+        let w = leaf.chain_latch.lock();
         let head = leaf.head_ptr();
         // SAFETY: live.
         let h = unsafe { &*head };
@@ -287,9 +283,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
             let dead = is_head && t.value().is_none_or(is_tombstone);
 
             // 2. Re-check under the latch.
-            let Some(w) = leaf.chain_latch.lock() else {
-                unreachable!("chain latches are only obsoleted by Phase 8 unlinks")
-            };
+            let w = leaf.chain_latch.lock();
             let head_now = leaf.head_ptr();
             let t_now = find_le_ptr(head_now, min_version);
             if t_now != Some(t_ptr) || t.is_superseded() {
@@ -352,7 +346,7 @@ unsafe fn retire_version<V: Send + 'static>(
     guard: &crossbeam_epoch::Guard,
 ) {
     // SAFETY: `n` is live until retired.
-    if unsafe { (*n).inline } {
+    if unsafe { (*n).is_inline() } {
         return;
     }
     // SAFETY: a heap node from `Box::into_raw`, unlinked, retired once.

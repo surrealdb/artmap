@@ -31,7 +31,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
-use crate::sync::atomic::{fence, AtomicU64, Ordering};
+use crate::sync::atomic::{fence, AtomicU64, AtomicU8, Ordering};
 
 /// Switches for the loom mutant self-checks (§16.3): each model must fail
 /// with the fence it depends on removed, which proves the model explores.
@@ -188,6 +188,71 @@ impl Drop for WriteGuard<'_> {
         self.latch
             .version
             .store(self.v.wrapping_add(VERSION_STEP), Ordering::Release);
+    }
+}
+
+/// A one-byte lock that serialises the writers of one version chain. It is
+/// terminal in the lock order (Inv 7).
+///
+/// Chain readers never validate it: they load `head` and `next` with
+/// `Acquire`, paired with the writers' `Release` stores. So, unlike a
+/// [`HybridLatch`], it needs no version and cannot become obsolete: plain
+/// mutual exclusion (`Acquire` on lock, `Release` on unlock) is enough, in one
+/// byte instead of eight.
+#[repr(transparent)]
+pub(crate) struct ChainLock {
+    locked: AtomicU8,
+}
+
+/// Proof that this thread holds a [`ChainLock`]. Dropping it unlocks.
+#[must_use = "dropping a ChainGuard immediately releases the lock"]
+pub(crate) struct ChainGuard<'l> {
+    lock: &'l ChainLock,
+}
+
+impl ChainLock {
+    crate::sync::const_fn_unless_loom! {
+        /// Creates an unlocked lock.
+        #[inline]
+        pub(crate) fn new() -> Self {
+            Self {
+                locked: AtomicU8::new(0),
+            }
+        }
+    }
+
+    /// Blocking acquire (test and test-and-set, with backoff).
+    #[must_use = "binding the guard is what holds the lock"]
+    #[inline]
+    pub(crate) fn lock(&self) -> ChainGuard<'_> {
+        let mut backoff = SpinBackoff::new();
+        loop {
+            if self
+                .locked
+                .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return ChainGuard { lock: self };
+            }
+            while self.locked.load(Ordering::Relaxed) != 0 {
+                backoff.spin();
+            }
+        }
+    }
+}
+
+impl ChainGuard<'_> {
+    /// `true` if this guard holds `lock`.
+    #[inline]
+    pub(crate) fn holds(&self, lock: &ChainLock) -> bool {
+        std::ptr::eq(self.lock, lock)
+    }
+}
+
+impl Drop for ChainGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.lock.locked.store(0, Ordering::Release);
     }
 }
 

@@ -21,28 +21,33 @@ use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
 
 use crate::key::AsBytes;
-use crate::latch::{HybridLatch, WriteGuard};
+use crate::latch::{ChainGuard, ChainLock};
 use crate::raw::LeafNode;
-use crate::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
+use crate::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
+
+/// Flags kept in the low bits of `VersionNode::next` (nodes are 8-aligned).
+/// Set by the chain-latch holder when the node is unlinked (superseded or
+/// pruned). Distinct from tombstone state; never a retirement guard.
+const SUPERSEDED: usize = 0b001;
+/// This version is a deletion and has no value. Immutable.
+const TOMBSTONE: usize = 0b010;
+/// A leaf-owned inline slot, never retired independently (D5). Immutable.
+const INLINE: usize = 0b100;
+const FLAGS: usize = SUPERSEDED | TOMBSTONE | INLINE;
 
 /// One version of a key. Immutable after publication (Inv 1), except for the
-/// `next` link and the `superseded` flag, which only the chain-latch holder
+/// `next` link and the superseded flag, which only the chain-latch holder
 /// writes.
 #[repr(C, align(8))]
 pub(crate) struct VersionNode<V> {
     pub(crate) version: u64,
+    /// The next older version, tagged with this node's flags in its three
+    /// low bits. Packing the flags here, and the tombstone flag instead of an
+    /// `Option<V>` discriminant, keeps a node at `16 + size_of::<V>()` bytes.
     next: AtomicPtr<VersionNode<V>>,
-    /// Initialised if and only if `!tombstone`. Immutable after publication.
-    /// A separate flag instead of `Option<V>` saves the discriminant's word
-    /// for values without a niche.
+    /// Initialised if and only if the node is not a tombstone. Immutable
+    /// after publication.
     value: MaybeUninit<V>,
-    /// Set by the chain-latch holder when the node is unlinked (superseded or
-    /// pruned). Distinct from tombstone state; never a retirement guard.
-    superseded: AtomicBool,
-    /// This version is a deletion and has no value. Immutable.
-    tombstone: bool,
-    /// A leaf-owned inline slot, never retired independently (D5).
-    pub(crate) inline: bool,
 }
 
 impl<V> VersionNode<V> {
@@ -51,61 +56,82 @@ impl<V> VersionNode<V> {
             Some(v) => (MaybeUninit::new(v), false),
             None => (MaybeUninit::uninit(), true),
         };
+        let flags = if tombstone { TOMBSTONE } else { 0 } | if inline { INLINE } else { 0 };
         Self {
             version,
-            next: AtomicPtr::new(ptr::null_mut()),
+            next: AtomicPtr::new(ptr::without_provenance_mut(flags)),
             value,
-            superseded: AtomicBool::new(false),
-            tombstone,
-            inline,
         }
+    }
+
+    /// The immutable flags (tombstone, inline) need no ordering.
+    #[inline]
+    fn flags(&self) -> usize {
+        self.next.load(Ordering::Relaxed).addr() & FLAGS
     }
 
     #[inline]
     pub(crate) fn is_tombstone(&self) -> bool {
-        self.tombstone
+        self.flags() & TOMBSTONE != 0
+    }
+
+    #[inline]
+    pub(crate) fn is_inline(&self) -> bool {
+        self.flags() & INLINE != 0
     }
 
     /// The value, or `None` for a tombstone.
     #[inline]
     pub(crate) fn value(&self) -> Option<&V> {
-        // SAFETY: `value` is initialised whenever `tombstone` is false, and
-        // neither changes after publication (Inv 1).
-        (!self.tombstone).then(|| unsafe { self.value.assume_init_ref() })
+        // SAFETY: `value` is initialised whenever the node is not a tombstone,
+        // and neither changes after publication (Inv 1).
+        (!self.is_tombstone()).then(|| unsafe { self.value.assume_init_ref() })
     }
 
     #[inline]
     pub(crate) fn next(&self) -> *mut VersionNode<V> {
-        self.next.load(Ordering::Acquire)
+        self.next.load(Ordering::Acquire).map_addr(|a| a & !FLAGS)
     }
 
     #[inline]
     pub(crate) fn is_superseded(&self) -> bool {
-        self.superseded.load(Ordering::Acquire)
+        self.next.load(Ordering::Acquire).addr() & SUPERSEDED != 0
+    }
+
+    /// Stores `next`, keeping this node's flags. Only one thread writes `next`
+    /// at a time (the chain-latch holder, or the builder), so the read and the
+    /// store need no read-modify-write.
+    #[inline]
+    fn store_next(&self, next: *mut VersionNode<V>, order: Ordering) {
+        debug_assert_eq!(next.addr() & FLAGS, 0, "version nodes are 8-aligned");
+        let flags = self.next.load(Ordering::Relaxed).addr() & FLAGS;
+        self.next.store(next.map_addr(|a| a | flags), order);
     }
 
     /// W3: caller holds the owning leaf's chain latch (`_w`).
     #[inline]
-    pub(crate) fn set_next(&self, _w: &WriteGuard<'_>, next: *mut VersionNode<V>) {
-        self.next.store(next, Ordering::Release);
+    pub(crate) fn set_next(&self, _w: &ChainGuard<'_>, next: *mut VersionNode<V>) {
+        self.store_next(next, Ordering::Release);
     }
 
     /// Builder: the node is not yet published.
     #[inline]
     pub(crate) fn init_next(&self, next: *mut VersionNode<V>) {
-        self.next.store(next, Ordering::Relaxed);
+        self.store_next(next, Ordering::Relaxed);
     }
 
     /// Caller holds the owning leaf's chain latch and has unlinked the node.
     #[inline]
-    pub(crate) fn mark_superseded(&self, _w: &WriteGuard<'_>) {
-        self.superseded.store(true, Ordering::Release);
+    pub(crate) fn mark_superseded(&self, _w: &ChainGuard<'_>) {
+        let cur = self.next.load(Ordering::Relaxed);
+        self.next
+            .store(cur.map_addr(|a| a | SUPERSEDED), Ordering::Release);
     }
 }
 
 impl<V> Drop for VersionNode<V> {
     fn drop(&mut self) {
-        if !self.tombstone {
+        if !self.is_tombstone() {
             // SAFETY: initialised (not a tombstone), dropped exactly once here.
             unsafe { self.value.assume_init_drop() };
         }
@@ -118,13 +144,15 @@ const SLOT1: u8 = 0b10;
 /// A key and its version chain, newest first.
 #[repr(C, align(8))]
 pub(crate) struct VersionedLeaf<K, V> {
+    // Readers touch `key`, `head` and (usually) `slot0`, so they come first;
+    // the writer-only bytes share the last word.
     pub(crate) key: K,
-    /// Serialises every writer of `head` and of any `next` in this chain.
-    /// Terminal in the lock order (Inv 7).
-    pub(crate) chain_latch: HybridLatch,
     head: AtomicPtr<VersionNode<V>>,
     slot0: UnsafeCell<MaybeUninit<VersionNode<V>>>,
     slot1: UnsafeCell<MaybeUninit<VersionNode<V>>>,
+    /// Serialises every writer of `head` and of any `next` in this chain.
+    /// Terminal in the lock order (Inv 7).
+    pub(crate) chain_latch: ChainLock,
     /// Which inline slots are initialised. Set by the chain-latch holder (or
     /// the creator) before publication; never cleared while shared.
     slots_init: AtomicU8,
@@ -143,10 +171,10 @@ impl<K, V> VersionedLeaf<K, V> {
     pub(crate) fn new_boxed(key: K, version: u64, value: Option<V>) -> NonNull<Self> {
         let leaf = Box::into_raw(Box::new(Self {
             key,
-            chain_latch: HybridLatch::new(),
             head: AtomicPtr::new(ptr::null_mut()),
             slot0: UnsafeCell::new(MaybeUninit::new(VersionNode::new(version, value, true))),
             slot1: UnsafeCell::new(MaybeUninit::uninit()),
+            chain_latch: ChainLock::new(),
             slots_init: AtomicU8::new(SLOT0),
         }));
         // Every pointer into the leaf, including the self-referential head,
@@ -170,7 +198,7 @@ impl<K, V> VersionedLeaf<K, V> {
 
     /// W3: caller holds the chain latch.
     #[inline]
-    pub(crate) fn set_head(&self, w: &WriteGuard<'_>, node: *mut VersionNode<V>) {
+    pub(crate) fn set_head(&self, w: &ChainGuard<'_>, node: *mut VersionNode<V>) {
         debug_assert!(w.holds(&self.chain_latch));
         self.head.store(node, Ordering::Release);
     }
@@ -187,7 +215,7 @@ impl<K, V> VersionedLeaf<K, V> {
     /// Never runs user code: `value` is moved, not dropped, on every path.
     pub(crate) fn alloc_version(
         &self,
-        w: &WriteGuard<'_>,
+        w: &ChainGuard<'_>,
         version: u64,
         value: Option<V>,
     ) -> *mut VersionNode<V> {
@@ -223,7 +251,7 @@ impl<K, V> VersionedLeaf<K, V> {
             let slot0 = (*leaf).slot0.get().cast::<VersionNode<V>>();
             let version = (*slot0).version;
             // Moved out: clearing `slots_init` stops the leaf dropping slot0.
-            let value = if (*slot0).tombstone {
+            let value = if (*slot0).is_tombstone() {
                 None
             } else {
                 Some(ptr::read((*slot0).value.as_ptr()))
@@ -253,7 +281,7 @@ impl<K, V> Drop for VersionedLeaf<K, V> {
                 cur
             };
             // SAFETY: exclusive access; `at` is a live node of this chain.
-            let (next, inline) = unsafe { ((*at).next.load(Ordering::Relaxed), (*at).inline) };
+            let (next, inline) = unsafe { ((*at).next(), (*at).is_inline()) };
             if !inline {
                 // SAFETY: a heap node owned by the live chain, freed once.
                 drop(unsafe { Box::from_raw(cur) });
@@ -307,13 +335,13 @@ mod tests {
         {
             // SAFETY: exclusively owned, never published.
             let l = unsafe { leaf.as_ref() };
-            let w = l.chain_latch.lock().unwrap();
+            let w = l.chain_latch.lock();
             let v20 = l.alloc_version(&w, 20, Some(D(Arc::clone(&n))));
             // SAFETY: freshly allocated.
-            assert!(unsafe { (*v20).inline }, "second version takes slot1");
+            assert!(unsafe { (*v20).is_inline() }, "second version takes slot1");
             let v30 = l.alloc_version(&w, 30, Some(D(Arc::clone(&n))));
             // SAFETY: freshly allocated.
-            let spilled = !unsafe { (*v30).inline };
+            let spilled = !unsafe { (*v30).is_inline() };
             assert!(spilled, "third version spills to the heap");
             // SAFETY: both unpublished until `set_head`.
             unsafe {
@@ -354,13 +382,41 @@ mod tests {
         assert_eq!(n.load(Ordering::SeqCst), 1);
     }
 
-    /// A tombstone flag instead of `Option<V>`: 32 bytes for a `u64` value,
-    /// not 40 (the leaf holds two inline nodes).
+    /// Flags in the low bits of `next`, and a tombstone flag instead of
+    /// `Option<V>`: 24 bytes for a `u64` value (the leaf holds two inline
+    /// nodes).
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn version_nodes_stay_compact() {
-        assert_eq!(std::mem::size_of::<VersionNode<u64>>(), 32);
-        assert_eq!(std::mem::size_of::<VersionedLeaf<[u8; 8], u64>>(), 96);
+        assert_eq!(std::mem::size_of::<VersionNode<u64>>(), 24);
+        assert_eq!(std::mem::size_of::<VersionedLeaf<[u8; 8], u64>>(), 72);
+    }
+
+    /// The flags survive every `next` update and never leak into the link.
+    #[test]
+    fn flags_survive_next_updates() {
+        let leaf = VersionedLeaf::<u8, u8>::new_boxed(1, 1, None);
+        // SAFETY: exclusively owned, never published.
+        let l = unsafe { leaf.as_ref() };
+        let head = l.head();
+        assert!(head.is_tombstone() && head.is_inline() && !head.is_superseded());
+        assert!(head.next().is_null());
+        let w = l.chain_latch.lock();
+        let v2 = l.alloc_version(&w, 2, Some(7));
+        // SAFETY: freshly allocated, unpublished.
+        let n = unsafe { &*v2 };
+        assert!(!n.is_tombstone() && n.is_inline());
+        n.init_next(l.head_ptr());
+        assert_eq!(n.next(), l.head_ptr(), "the link is untagged");
+        head.mark_superseded(&w);
+        assert!(head.is_superseded() && head.is_tombstone() && head.is_inline());
+        assert!(head.next().is_null());
+        n.set_next(&w, std::ptr::null_mut());
+        assert!(!n.is_tombstone() && n.is_inline() && !n.is_superseded());
+        assert_eq!(n.value(), Some(&7));
+        drop(w);
+        // SAFETY: a Box allocation, exclusively owned.
+        drop(unsafe { Box::from_raw(leaf.as_ptr()) });
     }
 
     #[test]

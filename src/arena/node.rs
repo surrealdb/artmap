@@ -27,7 +27,7 @@ use std::ptr::NonNull;
 use crate::arena::storage::ArenaLeaf;
 use crate::arena::Arena;
 use crate::key::AsBytes;
-use crate::latch::{HybridLatch, WriteGuard};
+use crate::latch::{ChainGuard, ChainLock};
 use crate::raw::LeafNode;
 use crate::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -75,8 +75,8 @@ unsafe impl<K, V> ArenaLeaf for Leaf<K, V> {
     const NEEDS_DROP: bool = std::mem::needs_drop::<K>() || std::mem::needs_drop::<V>();
 
     #[inline]
-    fn next_retired(&self) -> &AtomicU32 {
-        &self.next_retired
+    fn next_retired(&self) -> Option<&AtomicU32> {
+        Some(&self.next_retired)
     }
 
     unsafe fn drop_in_arena(this: NonNull<Self>, _arena: &Arena) {
@@ -85,51 +85,56 @@ unsafe impl<K, V> ArenaLeaf for Leaf<K, V> {
     }
 }
 
+/// Flags kept in the low bits of `VersionNode::next` (arena offsets of
+/// version nodes are 8-aligned). Set by the chain-latch holder when the node
+/// is unlinked.
+const SUPERSEDED: u32 = 0b01;
+/// This version is a deletion and has no value. Immutable.
+const TOMBSTONE: u32 = 0b10;
+const FLAGS: u32 = SUPERSEDED | TOMBSTONE;
+
 /// One version of a key in an [`ArenaVersionedArtMap`](crate::ArenaVersionedArtMap).
 #[repr(C, align(8))]
 pub(crate) struct VersionNode<V> {
     pub(crate) version: u64,
-    /// Offset of the next older version, or 0. Written by the chain-latch
-    /// holder (`Release`); loaded with `Acquire`.
+    /// Offset of the next older version, or 0, tagged with this node's flags
+    /// in its low bits. Written by the chain-latch holder (`Release`); loaded
+    /// with `Acquire`.
     next: AtomicU32,
     /// Link of the retired-versions list.
     pub(crate) next_retired: AtomicU32,
-    /// Initialised if and only if `!tombstone`. Immutable after publication.
-    /// A separate flag instead of `Option<V>` saves the discriminant's word
-    /// for values without a niche.
+    /// Initialised if and only if the node is not a tombstone. Immutable
+    /// after publication. A flag instead of `Option<V>` saves the
+    /// discriminant's word for values without a niche.
     value: MaybeUninit<V>,
-    superseded: AtomicBool,
-    /// This version is a deletion and has no value. Immutable.
-    tombstone: bool,
 }
 
 impl<V> VersionNode<V> {
     pub(crate) fn new(version: u64, value: Option<V>) -> Self {
-        let (value, tombstone) = match value {
-            Some(v) => (MaybeUninit::new(v), false),
-            None => (MaybeUninit::uninit(), true),
+        let (value, flags) = match value {
+            Some(v) => (MaybeUninit::new(v), 0),
+            None => (MaybeUninit::uninit(), TOMBSTONE),
         };
         Self {
             version,
-            next: AtomicU32::new(0),
+            next: AtomicU32::new(flags),
             next_retired: AtomicU32::new(0),
             value,
-            superseded: AtomicBool::new(false),
-            tombstone,
         }
     }
 
     #[inline]
     pub(crate) fn is_tombstone(&self) -> bool {
-        self.tombstone
+        // Immutable: no ordering needed.
+        self.next.load(Ordering::Relaxed) & TOMBSTONE != 0
     }
 
     /// The value, or `None` for a tombstone.
     #[inline]
     pub(crate) fn value(&self) -> Option<&V> {
-        // SAFETY: `value` is initialised whenever `tombstone` is false, and
-        // neither changes after publication (Inv 1).
-        (!self.tombstone).then(|| unsafe { self.value.assume_init_ref() })
+        // SAFETY: `value` is initialised whenever the node is not a tombstone,
+        // and neither changes after publication (Inv 1).
+        (!self.is_tombstone()).then(|| unsafe { self.value.assume_init_ref() })
     }
 
     /// Consumes a node that was never published, returning its value.
@@ -137,41 +142,51 @@ impl<V> VersionNode<V> {
         let this = std::mem::ManuallyDrop::new(self);
         // SAFETY: initialised when not a tombstone; `this` is never dropped,
         // so the value is moved out exactly once.
-        (!this.tombstone).then(|| unsafe { std::ptr::read(this.value.as_ptr()) })
+        (!this.is_tombstone()).then(|| unsafe { std::ptr::read(this.value.as_ptr()) })
     }
 
     #[inline]
     pub(crate) fn next(&self) -> u32 {
-        self.next.load(Ordering::Acquire)
+        self.next.load(Ordering::Acquire) & !FLAGS
+    }
+
+    /// Stores `next`, keeping this node's flags. Only one thread writes `next`
+    /// at a time (the chain-latch holder, or the builder).
+    #[inline]
+    fn store_next(&self, next: u32, order: Ordering) {
+        debug_assert_eq!(next & FLAGS, 0, "version nodes are 8-aligned");
+        let flags = self.next.load(Ordering::Relaxed) & FLAGS;
+        self.next.store(next | flags, order);
     }
 
     /// Builder: the node is not yet published.
     #[inline]
     pub(crate) fn init_next(&self, next: u32) {
-        self.next.store(next, Ordering::Relaxed);
+        self.store_next(next, Ordering::Relaxed);
     }
 
     /// W3: caller holds the owning leaf's chain latch (`_w`).
     #[inline]
-    pub(crate) fn set_next(&self, _w: &WriteGuard<'_>, next: u32) {
-        self.next.store(next, Ordering::Release);
+    pub(crate) fn set_next(&self, _w: &ChainGuard<'_>, next: u32) {
+        self.store_next(next, Ordering::Release);
     }
 
     #[inline]
     pub(crate) fn is_superseded(&self) -> bool {
-        self.superseded.load(Ordering::Acquire)
+        self.next.load(Ordering::Acquire) & SUPERSEDED != 0
     }
 
     /// Caller holds the chain latch and has unlinked the node.
     #[inline]
-    pub(crate) fn mark_superseded(&self, _w: &WriteGuard<'_>) {
-        self.superseded.store(true, Ordering::Release);
+    pub(crate) fn mark_superseded(&self, _w: &ChainGuard<'_>) {
+        let cur = self.next.load(Ordering::Relaxed);
+        self.next.store(cur | SUPERSEDED, Ordering::Release);
     }
 }
 
 impl<V> Drop for VersionNode<V> {
     fn drop(&mut self) {
-        if !self.tombstone {
+        if !self.is_tombstone() {
             // SAFETY: initialised (not a tombstone), dropped exactly once here.
             unsafe { self.value.assume_init_drop() };
         }
@@ -181,11 +196,10 @@ impl<V> Drop for VersionNode<V> {
 /// A key and its version chain, newest first.
 #[repr(C, align(8))]
 pub(crate) struct VersionedLeaf<K, V> {
-    next_retired: AtomicU32,
     /// Offset of the newest version. Never 0 once published.
     head: AtomicU32,
     /// Serialises every chain writer; terminal in the lock order (Inv 7).
-    pub(crate) chain_latch: HybridLatch,
+    pub(crate) chain_latch: ChainLock,
     pub(crate) key: K,
     _values: PhantomData<V>,
 }
@@ -193,9 +207,8 @@ pub(crate) struct VersionedLeaf<K, V> {
 impl<K, V> VersionedLeaf<K, V> {
     pub(crate) fn new(key: K, head: u32) -> Self {
         Self {
-            next_retired: AtomicU32::new(0),
             head: AtomicU32::new(head),
-            chain_latch: HybridLatch::new(),
+            chain_latch: ChainLock::new(),
             key,
             _values: PhantomData,
         }
@@ -208,7 +221,7 @@ impl<K, V> VersionedLeaf<K, V> {
 
     /// W3: caller holds the chain latch.
     #[inline]
-    pub(crate) fn set_head(&self, w: &WriteGuard<'_>, head: u32) {
+    pub(crate) fn set_head(&self, w: &ChainGuard<'_>, head: u32) {
         debug_assert!(w.holds(&self.chain_latch));
         self.head.store(head, Ordering::Release);
     }
@@ -235,15 +248,17 @@ impl<K: AsBytes, V> LeafNode for VersionedLeaf<K, V> {
     fn mark_removed(&self) {}
 }
 
-// SAFETY: the link is only used by the retired list; `drop_in_arena` drops
-// the key and every version of the live chain once. Versions unlinked while
-// the map was alive are on the tree's own retired-versions list instead.
+// SAFETY: versioned leaves are never unlinked (inserts use
+// `Mode::InsertIfAbsent`, and there is no remove, prune or clear), so they need
+// no retired-list link; `drop_in_arena` drops the key and every version of the
+// live chain once. Versions unlinked while the map was alive are on the tree's
+// own retired-versions list instead.
 unsafe impl<K, V> ArenaLeaf for VersionedLeaf<K, V> {
     const NEEDS_DROP: bool = std::mem::needs_drop::<K>() || std::mem::needs_drop::<V>();
 
     #[inline]
-    fn next_retired(&self) -> &AtomicU32 {
-        &self.next_retired
+    fn next_retired(&self) -> Option<&AtomicU32> {
+        None
     }
 
     unsafe fn drop_in_arena(this: NonNull<Self>, arena: &Arena) {
@@ -253,7 +268,7 @@ unsafe impl<K, V> ArenaLeaf for VersionedLeaf<K, V> {
             // SAFETY: a version node of this arena in the live chain.
             let n = unsafe { arena.ptr::<VersionNode<V>>(off) };
             // SAFETY: as above.
-            let next = unsafe { n.as_ref() }.next.load(Ordering::Relaxed);
+            let next = unsafe { n.as_ref() }.next();
             // SAFETY: each live version is dropped exactly once, here.
             unsafe { n.drop_in_place() };
             off = next;
@@ -267,11 +282,16 @@ unsafe impl<K, V> ArenaLeaf for VersionedLeaf<K, V> {
 mod tests {
     use super::VersionNode;
 
-    /// A tombstone flag instead of `Option<V>`: 32 bytes for a `u64` value,
-    /// not 40.
+    /// Flags in the low bits of `next`, and a tombstone flag instead of
+    /// `Option<V>`: 24 bytes for a `u64` value.
     #[test]
     fn version_nodes_stay_compact() {
-        assert_eq!(std::mem::size_of::<VersionNode<u64>>(), 32);
+        assert_eq!(std::mem::size_of::<VersionNode<u64>>(), 24);
+        // A one-byte chain lock and no retired-list link.
+        assert_eq!(
+            std::mem::size_of::<super::VersionedLeaf<[u8; 8], u64>>(),
+            16
+        );
     }
 
     #[test]
