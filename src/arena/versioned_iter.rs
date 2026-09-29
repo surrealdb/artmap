@@ -117,11 +117,12 @@ impl<'a, K: 'a, V: 'a> ArenaVersionedEntryRef<'a, K, V> {
         false
     }
 
-    /// `true` once the captured version was unlinked (a same-version insert
-    /// replaced it, or `remove` deleted it).
+    /// `true` once the captured version was unlinked: a same-version insert
+    /// replaced it, `remove` or `remove_version` removed it, a prune unlinked
+    /// it, or its whole key was removed, pruned or cleared.
     #[inline]
     pub fn is_superseded(&self) -> bool {
-        self.node().is_superseded()
+        self.node().is_superseded() || self.leaf().chain_latch.is_dead()
     }
 
     /// The captured version and every older one, newest first, resolved

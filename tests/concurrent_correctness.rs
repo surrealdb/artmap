@@ -681,3 +681,136 @@ fn arena_versioned_len_under_delete_and_reinsert() {
     assert_eq!(map.len(), live);
     assert_eq!(map.iter().count(), live);
 }
+
+/// One key's versions in a thread's model, oldest first.
+type Chain = BTreeMap<u64, Option<u64>>;
+
+/// The model's prune (§13): unlinks the key if its newest version at or
+/// below `min` is its newest version and a tombstone, and otherwise every
+/// version older than that one. Returns how many versions went.
+fn model_prune(model: &mut BTreeMap<Vec<u8>, Chain>, k: &[u8], min: u64) -> usize {
+    let Some(chain) = model.get_mut(k) else {
+        return 0;
+    };
+    let Some((&t, &tv)) = chain.range(..=min).next_back() else {
+        return 0;
+    };
+    if chain.keys().next_back() == Some(&t) && tv.is_none() {
+        let n = chain.len();
+        model.remove(k);
+        return n;
+    }
+    let older: Vec<u64> = chain.range(..t).map(|(&v, _)| v).collect();
+    for v in &older {
+        chain.remove(v);
+    }
+    older.len()
+}
+
+macro_rules! versioned_oracle {
+    ($name:ident, $map:ty, $new:expr, $max_ops:expr) => {
+        #[test]
+        fn $name() {
+            // Each writer owns the keys `id % n == t` and checks every result
+            // against its own model while the others remove, prune and rewrite
+            // keys that share its nodes, so leaves are unlinked and nodes
+            // compacted around it. A reader scans sentinels that nobody
+            // touches.
+            let n = threads();
+            let map = Arc::new($new);
+            let sentinels: Vec<Vec<u8>> = (0..8).map(|i| format!("v:{i}").into_bytes()).collect();
+            for s in &sentinels {
+                map.insert(s.clone(), 1, 1);
+            }
+            let m = Arc::clone(&map);
+            let totals = Arc::new(AtomicUsize::new(0));
+            let tot = Arc::clone(&totals);
+            run(n + 1, move |t, stop| {
+                if t == n {
+                    while !stop.load(Ordering::Relaxed) {
+                        for s in &sentinels {
+                            assert_eq!(m.get(&s[..]), Some(1), "sentinel {s:?} missed");
+                        }
+                        let seen: Vec<Vec<u8>> = m
+                            .iter()
+                            .map(|e| e.key().clone())
+                            .filter(|k| sentinels.contains(k))
+                            .collect();
+                        assert_eq!(seen, sentinels, "every sentinel once, in order");
+                    }
+                    return;
+                }
+                let mut rng = StdRng::seed_from_u64(900 + t as u64);
+                let mut model: BTreeMap<Vec<u8>, Chain> = BTreeMap::new();
+                let mut version = 0u64;
+                while !stop.load(Ordering::Relaxed) && version < $max_ops {
+                    version += 1;
+                    let id = rng.gen_range(0..48u64) * n as u64 + t as u64;
+                    // Prefixes shared with the other writers and the sentinels.
+                    let k = format!("v:{}:{id}", id % 5).into_bytes();
+                    match rng.gen_range(0..7) {
+                        0 | 1 => {
+                            m.insert(k.clone(), version, version);
+                            model
+                                .entry(k.clone())
+                                .or_default()
+                                .insert(version, Some(version));
+                        }
+                        2 => {
+                            m.delete(k.clone(), version);
+                            model.entry(k.clone()).or_default().insert(version, None);
+                        }
+                        3 => assert_eq!(m.remove_key(&k[..]), model.remove(&k).is_some()),
+                        4 => {
+                            // An existing version or, now and then, a missing one.
+                            let v = model
+                                .get(&k)
+                                .and_then(|c| {
+                                    let vs: Vec<u64> = c.keys().copied().collect();
+                                    vs.get(rng.gen_range(0..vs.len() + 1)).copied()
+                                })
+                                .unwrap_or(version);
+                            let want = model.get_mut(&k).is_some_and(|c| c.remove(&v).is_some());
+                            if model.get(&k).is_some_and(|c| c.is_empty()) {
+                                model.remove(&k);
+                            }
+                            assert_eq!(m.remove_version(&k[..], v), want, "remove_version {v}");
+                        }
+                        _ => {
+                            let min = version.saturating_sub(rng.gen_range(0..20));
+                            let want = model_prune(&mut model, &k, min);
+                            assert_eq!(m.prune_key(&k[..], min, |_| false), want, "prune at {min}");
+                        }
+                    }
+                    let want: Vec<(u64, Option<u64>)> = model
+                        .get(&k)
+                        .map(|c| c.iter().rev().map(|(&v, &x)| (v, x)).collect())
+                        .unwrap_or_default();
+                    assert_eq!(m.get_all_versions(&k[..]), want, "versions of {k:?}");
+                }
+                let live = model
+                    .values()
+                    .filter(|c| c.values().next_back().is_some_and(|x| x.is_some()))
+                    .count();
+                tot.fetch_add(live, Ordering::Relaxed);
+            });
+            let mut map = Arc::try_unwrap(map).ok().unwrap();
+            assert_eq!(map.len(), totals.load(Ordering::Relaxed) + 8);
+            map.validate_invariants();
+        }
+    };
+}
+
+versioned_oracle!(
+    versioned_oracle_with_removes_and_prunes,
+    VersionedArtMap<Vec<u8>, u64>,
+    VersionedArtMap::<Vec<u8>, u64>::new(),
+    u64::MAX
+);
+// Bounded, so the arena never fills.
+versioned_oracle!(
+    arena_versioned_oracle_with_removes_and_prunes,
+    ArenaVersionedArtMap<Vec<u8>, u64>,
+    ArenaVersionedArtMap::<Vec<u8>, u64>::with_capacity(64 << 20),
+    40_000
+);

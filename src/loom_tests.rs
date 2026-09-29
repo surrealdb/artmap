@@ -228,6 +228,9 @@ impl LeafNode for TLeaf {
     fn mark_removed(&self) {
         self.removed.store(true, Ordering::Release);
     }
+    fn is_removed(&self) -> bool {
+        self.removed.load(Ordering::Acquire)
+    }
 }
 
 struct Leak<L>(PhantomData<L>);
@@ -801,9 +804,12 @@ fn chain_same_version_replace_against_delete() {
 type HMap = crate::VersionedArtMap<Vec<u8>, u64>;
 
 #[test]
-fn chain_prune_tombstone_replacement_against_older_insert() {
+fn chain_prune_unlink_against_older_insert() {
     model(|| {
-        // The head is a user tombstone (value 0) at version 2.
+        // The head is a user tombstone (value 0) at version 2: the prune
+        // unlinks the key. An older write that lands first is unlinked with
+        // it; one that lands after starts the key afresh (the watermark
+        // contract leaves writes below the watermark unsupported).
         let m = Arc::new(HMap::new());
         m.insert(b"k".to_vec(), 2, 0);
         let (a, b) = (Arc::clone(&m), Arc::clone(&m));
@@ -816,10 +822,10 @@ fn chain_prune_tombstone_replacement_against_older_insert() {
             },
         );
         let all = m.get_all_versions(&b"k"[..]);
-        assert_eq!(all[0], (2, None), "the head became a built-in tombstone");
-        assert!(all.windows(2).all(|w| w[0].0 > w[1].0), "sorted: {all:?}");
-        assert!(all.len() <= 2);
-        assert_eq!(m.len(), 0);
+        assert!(all.is_empty() || all == [(1, Some(10))], "{all:?}");
+        assert_eq!(m.len(), all.len());
+        let mut m = Arc::try_unwrap(m).ok().expect("threads joined");
+        m.validate_invariants();
     });
 }
 
@@ -841,5 +847,120 @@ fn chain_prune_detach_against_same_version_head_replace() {
         let all = m.get_all_versions(&b"k"[..]);
         assert_eq!(all, vec![(2, Some(21))], "the replace wins; v1 is pruned");
         assert_eq!(m.len(), 1);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Unlinking versioned leaves (§13): a prune, `remove_key`, `remove_version`
+// or `clear` kills the chain under the node latch before unlinking, so a
+// writer that found the leaf earlier retries instead of writing into it.
+
+/// A map holding "k" at version 1 and a tombstone at version 2.
+fn vmap_deleted() -> Arc<VMap> {
+    let m = VMap::with_capacity(1 << 16);
+    m.insert(b"k".to_vec(), 1, 10);
+    m.delete(b"k".to_vec(), 2);
+    Arc::new(m)
+}
+
+fn arena_quiescent(m: Arc<VMap>) {
+    let mut m = Arc::try_unwrap(m).ok().expect("threads joined");
+    m.validate_invariants();
+}
+
+fn prune_unlink_against_insert_model() {
+    let m = vmap_deleted();
+    let (a, b) = (Arc::clone(&m), Arc::clone(&m));
+    par(
+        move || {
+            a.prune_key(&b"k"[..], 5, |_| false);
+        },
+        move || {
+            b.insert(b"k".to_vec(), 3, 30);
+        },
+    );
+    // Before the prune, the insert makes version 3 the one visible at 5, and
+    // the prune trims the rest; after it, the insert starts the key afresh.
+    assert_eq!(
+        m.get_all_versions(&b"k"[..]),
+        vec![(3, Some(30))],
+        "the insert was lost"
+    );
+    assert_eq!(m.len(), 1);
+    arena_quiescent(m);
+}
+
+#[test]
+fn chain_prune_unlink_against_insert() {
+    model(prune_unlink_against_insert_model);
+}
+
+#[test]
+fn chain_unlink_mutant_without_killing_the_chain() {
+    // A writer that found the leaf before the unlink writes into it.
+    assert_mutant_fails(
+        &mutants::CHAIN_NOT_KILLED,
+        prune_unlink_against_insert_model,
+    );
+}
+
+#[test]
+fn chain_remove_key_against_insert() {
+    model(|| {
+        let m = Arc::new(HMap::new());
+        m.insert(b"k".to_vec(), 1, 10);
+        let (a, b) = (Arc::clone(&m), Arc::clone(&m));
+        par(
+            move || assert!(a.remove_key(&b"k"[..])),
+            move || {
+                b.insert(b"k".to_vec(), 2, 20);
+            },
+        );
+        // The insert lands in the old leaf (and goes with it) or in a new one.
+        let all = m.get_all_versions(&b"k"[..]);
+        assert!(all.is_empty() || all == [(2, Some(20))], "{all:?}");
+        assert_eq!(m.len(), all.len());
+        let mut m = Arc::try_unwrap(m).ok().expect("threads joined");
+        m.validate_invariants();
+    });
+}
+
+#[test]
+fn chain_remove_only_version_against_insert() {
+    model(|| {
+        let m = VMap::with_capacity(1 << 16);
+        m.insert(b"k".to_vec(), 1, 10);
+        let m = Arc::new(m);
+        let (a, b) = (Arc::clone(&m), Arc::clone(&m));
+        par(
+            move || assert!(a.remove_version(&b"k"[..], 1)),
+            move || {
+                b.insert(b"k".to_vec(), 2, 20);
+            },
+        );
+        // Version 1 goes with its leaf, or from a chain the insert extended.
+        assert_eq!(m.get_all_versions(&b"k"[..]), vec![(2, Some(20))]);
+        assert_eq!(m.len(), 1);
+        arena_quiescent(m);
+    });
+}
+
+#[test]
+fn chain_clear_against_insert() {
+    model(|| {
+        let m = vmap_deleted();
+        let (a, b) = (Arc::clone(&m), Arc::clone(&m));
+        par(
+            move || a.clear(),
+            move || {
+                b.insert(b"k".to_vec(), 3, 30);
+            },
+        );
+        let all = m.get_all_versions(&b"k"[..]);
+        assert!(all.is_empty() || all == [(3, Some(30))], "{all:?}");
+        // `validate_invariants` checks that `len` counts the reachable live
+        // keys: a write into a cleared leaf would leave it one too high.
+        assert_eq!(m.len(), all.len());
+        arena_quiescent(m);
     });
 }

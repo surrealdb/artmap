@@ -35,17 +35,21 @@ pub(crate) struct Full;
 /// storage (and the maps) can always be dropped.
 ///
 /// # Safety
-/// `next_retired` is used only by the retired list; a leaf without a link is
-/// never unlinked from its tree. `drop_in_arena` drops the leaf's contents
+/// The retired-list link is used only by the retired list, and holds what
+/// `set_next_retired` last stored. `drop_in_arena` drops the leaf's contents
 /// exactly once, resolving offsets only through `arena`.
 pub(crate) unsafe trait ArenaLeaf {
     /// Whether dropping the leaf runs any destructor; if not, teardown skips
     /// the walk (O(1) drop).
     const NEEDS_DROP: bool;
 
-    /// The intrusive link of the retired list, or `None` for leaves that are
-    /// never unlinked (versioned leaves).
-    fn next_retired(&self) -> Option<&AtomicU32>;
+    /// Links an unlinked leaf to the next retired leaf. Called only by the
+    /// thread that retires the leaf (a versioned leaf's chain is dead by
+    /// then).
+    fn set_next_retired(&self, next: u32);
+
+    /// The link that `set_next_retired` stored.
+    fn next_retired(&self) -> u32;
 
     /// Drops the leaf's keys and values in place (for versioned leaves, its
     /// live chain as well). The bytes stay in the arena.
@@ -170,15 +174,10 @@ unsafe impl<L: ArenaLeaf + LeafNode> Storage for ArenaStorage<L> {
     unsafe fn retire_leaf(&self, l: NonNull<L>, _g: &()) {
         let off = self.arena.offset_of(l);
         // SAFETY: the leaf lives in this arena for the map's life.
-        let Some(link) = unsafe { l.as_ref() }.next_retired() else {
-            // Leaves without a link are never unlinked (the trait contract).
-            // Were one retired anyway, leaking its contents is the safe outcome.
-            debug_assert!(false, "retired a leaf that is never unlinked");
-            return;
-        };
+        let leaf = unsafe { l.as_ref() };
         let mut head = self.retired.load(Ordering::Relaxed);
         loop {
-            link.store(head, Ordering::Relaxed);
+            leaf.set_next_retired(head);
             match self.retired.compare_exchange_weak(
                 head,
                 off,
@@ -204,9 +203,7 @@ impl<L: ArenaLeaf> Drop for ArenaStorage<L> {
             // once; `&mut self` gives exclusive access.
             let leaf = unsafe { self.arena.ptr::<L>(off) };
             // SAFETY: as above.
-            let next = unsafe { leaf.as_ref() }
-                .next_retired()
-                .map_or(0, |l| l.load(Ordering::Relaxed));
+            let next = unsafe { leaf.as_ref() }.next_retired();
             // SAFETY: each retired leaf is dropped exactly once, here.
             unsafe { L::drop_in_arena(leaf, &self.arena) };
             off = next;

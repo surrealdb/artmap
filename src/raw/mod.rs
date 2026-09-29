@@ -64,6 +64,10 @@ pub(crate) trait LeafNode {
     /// Sets the leaf's `removed` flag (Release). Called only by the thread that
     /// unlinks or supersedes the leaf, inside the critical section (Inv 1).
     fn mark_removed(&self);
+
+    /// `true` once the leaf has been unlinked or superseded. A leaf reachable
+    /// at quiescence never is (checked by `validate`).
+    fn is_removed(&self) -> bool;
 }
 
 /// How a tree allocates, addresses and frees its nodes and leaves.

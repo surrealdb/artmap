@@ -18,7 +18,7 @@
 
 There are four map types and a set type:
 - **`artmap::ArtMap`**: a key-value map. Removed and replaced entries are reclaimed through `crossbeam-epoch`.
-- **`artmap::VersionedArtMap`**: a map with a chain of 64-bit MVCC versions per key, snapshot reads (`get_version_le`, `get_latest`), tombstones (`delete`) and pruning (`prune_key`, `prune_all`).
+- **`artmap::VersionedArtMap`**: a map with a chain of 64-bit MVCC versions per key, snapshot reads (`get_version_le`, `get_latest`), tombstones (`delete`), pruning (`prune_key`, `prune_all`) and removes that change history (`remove_key`, `remove_version`).
 - **`artmap::ArenaArtMap`**: a key-value map allocated from a fixed-size bump arena with 32-bit offsets. Inserts make no heap allocations, and nothing is freed until the map is dropped.
 - **`artmap::ArenaVersionedArtMap`**: the versioned map on an arena, designed for LSM memtables.
 - **`artmap::ArtSet`**: an ordered set of keys, a thin wrapper over `ArtMap<K, ()>`. `insert` only adds a key that is absent, and `insert`, `remove` and `contains` return a `bool`. It costs no more memory than the keys.
@@ -28,7 +28,7 @@ There are four map types and a set type:
 | Memory Model | Unversioned (General Purpose) | Versioned / MVCC (Storage Engines) |
 | :--- | :--- | :--- |
 | **EBR / Dynamic Heap**<br><sup>(reclaimed via `crossbeam-epoch`)</sup> | **`artmap::ArtMap<K, V>`**<br>• Optimistic lock coupling (OLC)<br>• Out-of-place replacement: handles stay valid<br>• Dynamic heap growth and node resizing | **`artmap::VersionedArtMap<K, V>`**<br>• Snapshot reads (`get_version_le`)<br>• Per-key chain latch for version writes<br>• Tombstones and pruning |
-| **Arena / 32-Bit Offsets**<br><sup>(fixed-size arena)</sup> | **`artmap::ArenaArtMap<K, V>`**<br>• Compact nodes with 32-bit child offsets<br>• 0 heap allocations per insert<br>• `try_insert` and `max_insert_bytes` for capacity planning | **`artmap::ArenaVersionedArtMap<K, V>`**<br>• 32-bit offset version chains<br>• Sequential inserter cache (`map.inserter()`)<br>• Memtable-oriented: no pruning, freed on drop |
+| **Arena / 32-Bit Offsets**<br><sup>(fixed-size arena)</sup> | **`artmap::ArenaArtMap<K, V>`**<br>• Compact nodes with 32-bit child offsets<br>• 0 heap allocations per insert<br>• `try_insert` and `max_insert_bytes` for capacity planning | **`artmap::ArenaVersionedArtMap<K, V>`**<br>• 32-bit offset version chains<br>• Sequential inserter cache (`map.inserter()`)<br>• Pruning and removes; memory freed on drop |
 
 ## Performance
 
@@ -296,9 +296,19 @@ map.delete("account:1001".to_string(), 3);
 assert_eq!(map.get("account:1001"), None);
 assert_eq!(map.get_version_le("account:1001", 2), Some((2, 750)));
 
-// Drop versions that no snapshot at or above 3 can see.
-map.prune_key("account:1001", 3, |_| false);
-assert_eq!(map.version_count("account:1001"), 1);
+// Drop the versions that no snapshot at or above 2 can see: version 1.
+assert_eq!(map.prune_key("account:1001", 2, |_| false), 1);
+// No snapshot at or above 3 sees the key at all, so it goes.
+assert_eq!(map.prune_key("account:1001", 3, |_| false), 2);
+assert_eq!(map.version_count("account:1001"), 0);
+
+// `remove_key` and `remove_version` change history for every snapshot.
+map.insert("account:1002".to_string(), 1, 10);
+map.insert("account:1002".to_string(), 2, 20);
+assert!(map.remove_version("account:1002", 2));
+assert_eq!(map.get("account:1002"), Some(10));
+assert!(map.remove_key("account:1002"));
+assert!(map.is_empty());
 ```
 
 ### Arena maps
@@ -340,7 +350,7 @@ for i in 0..1000 {
 assert_eq!(map.len(), 1001);
 ```
 
-The arena's capacity is fixed. Updates and removes do not free arena memory: replaced leaves and versions, and inner nodes that removes unlink, stay in the arena until the map is dropped. When `K` and `V` need `Drop`, dropping the map runs their destructors; otherwise it is $O(1)$. `Arena::reset` needs exclusive access, so it can only run once no map is using the arena.
+The arena's capacity is fixed. Updates, removes and prunes do not free arena memory: replaced leaves and versions, and the leaves, versions and inner nodes they unlink, stay in the arena until the map is dropped. When `K` and `V` need `Drop`, dropping the map runs their destructors; otherwise it is $O(1)$. `Arena::reset` needs exclusive access, so it can only run once no map is using the arena.
 
 ## Memory retention
 
@@ -371,13 +381,14 @@ assert_eq!(map.len(), 10);
 
 A registry of 200,000 random keys thinned to 2,000 holds 735 KB after its removes, and 94 KB after `shrink_to_fit()`.
 
-- **Arena maps** unlink emptied nodes too, so scans never walk dead nodes, but arena memory is only freed when the map is dropped, and they have no `shrink_to_fit()`: its smaller copies would only add to the arena.
-- **Versioned maps** never unlink a key: `delete` writes a tombstone and `prune_key` keeps the key, so a deleted key keeps its leaf and a tombstone, and their nodes are never emptied.
+The versioned maps unlink a key once nothing can see it: `delete` writes a tombstone, which hides the key from newer snapshots, and a later `prune_key` or `prune_all` at or above the tombstone's version unlinks the key with all its versions. `remove_key` and `remove_version` unlink keys and versions directly, for every snapshot. So a versioned queue that prunes behind itself stays bounded too: 1,000 live keys hold 85 KB after 300,000 inserts and deletes, against 24 MB with a prune that keeps deleted keys. `VersionedArtMap::shrink_to_fit()` fits its nodes as `ArtMap`'s does.
+
+- **Arena maps** unlink emptied nodes and prune too, so scans never walk dead nodes or keys, but arena memory is only freed when the map is dropped, and they have no `shrink_to_fit()`: its smaller copies would only add to the arena.
 
 ## Verification
 
 - **Miri**, under Tree Borrows: the EBR suites, and the arena suites leak-checked with strict provenance and symbolic alignment checks, on x86_64 and aarch64.
-- **loom** models of the real latch and node protocol, including removes that empty nodes and `shrink_to_fit` against lookups, inserts, cached-node inserts, removes and `clear`. Each protocol has mutants that must fail: a missing writer fence, a missing validation fence, missing lock coupling, a node unlinked or fitted without its own latch, and a merge without the child's latch.
+- **loom** models of the real latch and node protocol, including removes that empty nodes and `shrink_to_fit` against lookups, inserts, cached-node inserts, removes and `clear`, and versioned prunes, removes and `clear` against inserts of the same key. Each protocol has mutants that must fail: a missing writer fence, a missing validation fence, missing lock coupling, a node unlinked or fitted without its own latch, a merge without the child's latch, and a versioned leaf unlinked without killing its chain lock.
 - **ThreadSanitizer and AddressSanitizer** over the race and stress tests.
 - **Model tests** of every map and iterator against `BTreeMap`. Property tests over arbitrary byte keys, and a linearizability checker for point operations and `clear`.
 - **Fault injection**: panicking `AsBytes`, `Clone` and closures, and re-entrant user code, at every call site.

@@ -26,15 +26,19 @@
 //!   (inline slot) after unlocking;
 //! - `len` changes by the liveness of the head before and after, decided under
 //!   the latch;
-//! - readers take no latch: `head` and `next` are loaded with `Acquire`.
+//! - readers take no latch: `head` and `next` are loaded with `Acquire`;
+//! - a leaf is unlinked (by a prune, `remove_key`, `remove_version` or
+//!   `clear`) only once its chain latch is killed under the ART latches, and a
+//!   writer that finds the latch dead looks the key up again (§13).
 
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
+use std::cell::Cell;
 use std::ptr::NonNull;
 
 use crate::guard::{retire, Retired};
 use crate::key::AsBytes;
-use crate::latch::AbortOnUnwind;
+use crate::latch::{AbortOnUnwind, ChainGuard, SpinBackoff};
 use crate::raw::heap::HeapStorage;
 use crate::raw::{Mode, Outcome, RawTree, Unpublished};
 use crate::versioned::node::{VersionNode, VersionedLeaf};
@@ -117,6 +121,16 @@ pub(crate) fn chain<V>(head: &VersionNode<V>) -> impl Iterator<Item = &VersionNo
     })
 }
 
+/// The result of trying to unlink a versioned leaf (§13).
+pub(crate) enum Unlinked {
+    /// Unlinked; its chain held this many versions.
+    Done(usize),
+    /// Its chain was already dead, or the check refused it. Nothing changed.
+    Refused,
+    /// Not found by its own key bytes (an inconsistent `AsBytes`, Inv 10).
+    Missing,
+}
+
 impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
     /// Adds `version` of `key` (a tombstone if `value` is `None`). The caller
     /// holds `guard` (Inv 6). Returns the change in the number of live keys.
@@ -127,11 +141,22 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
         value: Option<V>,
         guard: &crossbeam_epoch::Guard,
     ) -> isize {
+        let mut backoff = SpinBackoff::new();
         // Fast path: the key exists. The probe on the caller's key is a hint
         // (Inv 10); the chain protocol does not depend on it.
-        if let Some(leaf) = self.raw.get(key.as_bytes()) {
+        while let Some(leaf) = self.raw.get(key.as_bytes()) {
+            // SAFETY: a published leaf, protected by `guard`.
+            let l = unsafe { leaf.as_ref() };
+            let Some(w) = l.chain_latch.lock() else {
+                // Dead: the leaf is being unlinked (§13). Look again: the key
+                // is then absent, or lives in a new leaf.
+                backoff.spin();
+                continue;
+            };
+            let delta = self.apply_locked(l, version, value, w, guard);
+            // `K::drop` runs after the latch is released.
             drop(key);
-            return self.apply(leaf, version, value, guard);
+            return delta;
         }
         let count = isize::from(value.is_some());
         let leaf = VersionedLeaf::new_boxed(key, version, value);
@@ -139,43 +164,51 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
         let owner = unsafe { Unpublished::new(&self.raw.storage, leaf) };
         // SAFETY: `owner` keeps the leaf alive for the call (§9.3).
         let key_bytes = unsafe { leaf.as_ref() }.key.as_bytes();
-        let outcome = match self
-            .raw
-            .insert(&owner, key_bytes, Mode::InsertIfAbsent, count, guard)
-        {
-            Ok(o) => o,
-            Err(never) => match never {},
-        };
-        match outcome {
-            Outcome::Inserted(_) => count,
-            Outcome::Existing(existing) => {
-                // Lost the race to another inserter: move the version out of
-                // the unpublished leaf and apply it to the live one. `owner`
-                // then frees the husk (and its key) outside every latch.
-                // SAFETY: never published, exclusively owned through `owner`.
-                let (version, value) = unsafe { VersionedLeaf::take_first(owner.ptr()) };
-                self.apply(existing, version, value, guard)
+        loop {
+            let outcome =
+                match self
+                    .raw
+                    .insert(&owner, key_bytes, Mode::InsertIfAbsent, count, guard)
+                {
+                    Ok(o) => o,
+                    Err(never) => match never {},
+                };
+            match outcome {
+                Outcome::Inserted(_) => return count,
+                Outcome::Existing(existing) => {
+                    // SAFETY: a published leaf, protected by `guard`.
+                    let e = unsafe { existing.as_ref() };
+                    let Some(w) = e.chain_latch.lock() else {
+                        // It is being unlinked: ours takes its place once it
+                        // is gone.
+                        backoff.spin();
+                        continue;
+                    };
+                    // Lost the race to a live leaf: move the version out of
+                    // the unpublished one and apply it there. `owner` then
+                    // frees the husk (and its key) outside every latch.
+                    // SAFETY: never published, exclusively owned through `owner`.
+                    let (version, value) = unsafe { VersionedLeaf::take_first(owner.ptr()) };
+                    return self.apply_locked(e, version, value, w, guard);
+                }
+                Outcome::Replaced(_) => unreachable!("InsertIfAbsent never replaces"),
             }
-            Outcome::Replaced(_) => unreachable!("InsertIfAbsent never replaces"),
         }
     }
 
-    /// Applies one version to a published leaf under its chain latch.
-    /// Returns the change in the number of live keys.
-    fn apply(
+    /// Applies one version to a published leaf whose chain latch `w` the
+    /// caller holds. Returns the change in the number of live keys.
+    ///
+    /// `value` is declared before `w`, so an unwind drops the latch guard
+    /// first and runs `V::drop` outside the latch.
+    fn apply_locked(
         &self,
-        leaf: NonNull<VersionedLeaf<K, V>>,
+        leaf: &VersionedLeaf<K, V>,
         version: u64,
         value: Option<V>,
+        w: ChainGuard<'_>,
         guard: &crossbeam_epoch::Guard,
     ) -> isize {
-        // SAFETY: a published leaf, protected by `guard`; versioned leaves are
-        // never unlinked before Phase 8.
-        let leaf = unsafe { leaf.as_ref() };
-        // `value` is declared before the guard, so an unwind drops the latch
-        // guard first and runs `V::drop` outside the latch.
-        let value = value;
-        let w = leaf.chain_latch.lock();
         // Positions are found under the latch.
         let head = leaf.head_ptr();
         // SAFETY: `head` is live (see `VersionedLeaf::head`).
@@ -230,42 +263,105 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
         key: &[u8],
         guard: &crossbeam_epoch::Guard,
     ) -> Option<RemovedHead<K, V>> {
-        let leaf_ptr = self.raw.get(key)?;
-        // SAFETY: protected by `guard`.
-        let leaf = unsafe { leaf_ptr.as_ref() };
-        let w = leaf.chain_latch.lock();
-        let head = leaf.head_ptr();
-        // SAFETY: live.
-        let h = unsafe { &*head };
-        if h.is_tombstone() {
-            return None;
+        let mut backoff = SpinBackoff::new();
+        loop {
+            let leaf_ptr = self.raw.get(key)?;
+            // SAFETY: protected by `guard`.
+            let leaf = unsafe { leaf_ptr.as_ref() };
+            let Some(w) = leaf.chain_latch.lock() else {
+                // Being unlinked: look again.
+                backoff.spin();
+                continue;
+            };
+            let head = leaf.head_ptr();
+            // SAFETY: live.
+            let h = unsafe { &*head };
+            if h.is_tombstone() {
+                return None;
+            }
+            let tomb = leaf.alloc_version(&w, h.version, None);
+            // SAFETY: unpublished.
+            unsafe { (*tomb).init_next(h.next()) };
+            let bomb = AbortOnUnwind;
+            leaf.set_head(&w, tomb);
+            h.mark_superseded(&w);
+            self.raw.len_add(-1);
+            bomb.defuse();
+            drop(w);
+            // SAFETY: unlinked under the chain latch, exactly once.
+            unsafe { retire_version(head, guard) };
+            // SAFETY: non-null.
+            return Some((leaf_ptr, unsafe { NonNull::new_unchecked(head) }));
         }
-        let tomb = leaf.alloc_version(&w, h.version, None);
-        // SAFETY: unpublished.
-        unsafe { (*tomb).init_next(h.next()) };
-        let bomb = AbortOnUnwind;
-        leaf.set_head(&w, tomb);
-        h.mark_superseded(&w);
-        self.raw.len_add(-1);
-        bomb.defuse();
-        drop(w);
-        // SAFETY: unlinked under the chain latch, exactly once.
-        unsafe { retire_version(head, guard) };
-        // SAFETY: non-null.
-        Some((leaf_ptr, unsafe { NonNull::new_unchecked(head) }))
     }
 
-    /// Prunes versions older than the newest one `<= min_version` (§11.4).
-    /// Returns the number of versions unlinked from the chain.
-    pub(crate) fn prune_leaf<F: Fn(&V) -> bool>(
+    /// Unlinks `leaf` and its whole chain from the tree if `check` accepts
+    /// it (§13, versioned leaves).
+    ///
+    /// The unlinker takes the ART latches (the parent's too if the unlink
+    /// compacts), then the terminal chain latch. Under it, it runs `check`
+    /// (which must not run user code) and kills the latch before the
+    /// unlinking store: a writer that found the leaf earlier then fails to
+    /// lock it and retries from the tree, so no version is ever written into
+    /// an unlinked leaf. `len` drops by the liveness of the head.
+    fn unlink_leaf(
         &self,
         leaf: NonNull<VersionedLeaf<K, V>>,
+        check: impl Fn(&VersionedLeaf<K, V>) -> bool,
+        guard: &crossbeam_epoch::Guard,
+    ) -> Unlinked {
+        // User code, outside every latch; the bytes come from the leaf itself
+        // (Inv 10), which `guard` protects.
+        // SAFETY: protected by `guard`.
+        let key = unsafe { leaf.as_ref() }.key.as_bytes();
+        // Set by `confirm`, which runs at most once: `Some(n)` if it accepted
+        // a chain of `n` versions, `None` if it refused.
+        let seen: Cell<Option<Option<usize>>> = Cell::new(None);
+        let removed = self.raw.remove_confirmed(
+            key,
+            |c| c == leaf,
+            |c| {
+                seen.set(Some(None));
+                // SAFETY: `c` is `leaf`, protected by `guard`.
+                let l = unsafe { c.as_ref() };
+                let w = l.chain_latch.lock()?;
+                if !check(l) {
+                    return None;
+                }
+                seen.set(Some(Some(chain(l.head()).count())));
+                let live = !l.head().is_tombstone();
+                w.kill();
+                Some(isize::from(live))
+            },
+            guard,
+        );
+        match (removed, seen.get()) {
+            (Some(_), Some(Some(n))) => Unlinked::Done(n),
+            (Some(_), _) => unreachable!("confirm accepted without counting"),
+            (None, Some(_)) => Unlinked::Refused,
+            // Not reached: already unlinked by another thread, or not found
+            // by its own key bytes.
+            // SAFETY: protected by `guard`.
+            (None, None) if unsafe { leaf.as_ref() }.chain_latch.is_dead() => Unlinked::Refused,
+            (None, None) => Unlinked::Missing,
+        }
+    }
+
+    /// Prunes the chain of `leaf` at `min_version` (§11.4). If its newest
+    /// version is a tombstone at or below `min_version` (a built-in one, or a
+    /// value `is_tombstone` accepts), no snapshot at or above `min_version`
+    /// can see the key, and the whole leaf is unlinked (§13). Otherwise every
+    /// version older than the newest one `<= min_version` is unlinked.
+    /// Returns the number of versions unlinked.
+    pub(crate) fn prune_leaf<F: Fn(&V) -> bool>(
+        &self,
+        leaf_ptr: NonNull<VersionedLeaf<K, V>>,
         min_version: u64,
         is_tombstone: &F,
         guard: &crossbeam_epoch::Guard,
     ) -> usize {
         // SAFETY: protected by `guard`.
-        let leaf = unsafe { leaf.as_ref() };
+        let leaf = unsafe { leaf_ptr.as_ref() };
         // Prune is best-effort maintenance: a chain that keeps moving (for
         // example, an `is_tombstone` that writes this key) is left alone
         // rather than retried forever.
@@ -279,42 +375,34 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
             };
             // SAFETY: live.
             let t = unsafe { &*t_ptr };
-            let is_head = t_ptr == head;
-            let dead = is_head && t.value().is_none_or(is_tombstone);
+            if t_ptr == head && t.value().is_none_or(is_tombstone) {
+                // 2. A dead key: unlink it, if T is still its head.
+                match self.unlink_leaf(leaf_ptr, |l| l.head_ptr() == t_ptr, guard) {
+                    Unlinked::Done(n) => return n,
+                    Unlinked::Refused if leaf.chain_latch.is_dead() => return 0,
+                    // The head moved: start again.
+                    Unlinked::Refused => continue,
+                    // Trim the chain instead.
+                    Unlinked::Missing => {}
+                }
+            }
 
-            // 2. Re-check under the latch.
-            let w = leaf.chain_latch.lock();
+            // 3. Re-check under the latch.
+            let Some(w) = leaf.chain_latch.lock() else {
+                // Unlinked meanwhile, by a remove or another prune.
+                return 0;
+            };
             let head_now = leaf.head_ptr();
-            let t_now = find_le_ptr(head_now, min_version);
-            if t_now != Some(t_ptr) || t.is_superseded() {
+            if find_le_ptr(head_now, min_version) != Some(t_ptr) || t.is_superseded() {
                 drop(w);
                 continue;
             }
-            // T is unchanged; if newer versions arrived it is no longer the
-            // head, and only the head can be replaced by a tombstone.
-            let dead = dead && head_now == t_ptr;
 
-            // 3. Replace a user tombstone head by a built-in one.
+            // 4. Detach everything older than T.
             let bomb = AbortOnUnwind;
             let mut unlinked: Vec<*mut VersionNode<V>> = Vec::new();
-            let kept: &VersionNode<V> = if dead && !t.is_tombstone() {
-                let b = leaf.alloc_version(&w, t.version, None);
-                // A fresh node: `next` is already null.
-                leaf.set_head(&w, b);
-                t.mark_superseded(&w);
-                self.raw.len_add(-1);
-                unlinked.push(t_ptr);
-                // SAFETY: just linked; live.
-                unsafe { &*b }
-            } else {
-                t
-            };
-
-            // 4. Detach everything older than the kept node.
             let mut cur = t.next();
-            if std::ptr::eq(kept, t) {
-                kept.set_next(&w, std::ptr::null_mut());
-            }
+            t.set_next(&w, std::ptr::null_mut());
             while !cur.is_null() {
                 // SAFETY: a detached node, immutable now (unreachable from head).
                 let n = unsafe { &*cur };
@@ -334,6 +422,128 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
             return count;
         }
         0
+    }
+
+    /// Unlinks `key` and every version of it, for every snapshot (§13).
+    /// Returns `false` if the key had no version.
+    pub(crate) fn remove_key(&self, key: &[u8], guard: &crossbeam_epoch::Guard) -> bool {
+        let mut backoff = SpinBackoff::new();
+        loop {
+            let Some(leaf) = self.raw.get(key) else {
+                return false;
+            };
+            match self.unlink_leaf(leaf, |_| true, guard) {
+                Unlinked::Done(_) => return true,
+                Unlinked::Missing => return false,
+                // Another thread is unlinking it: look again.
+                Unlinked::Refused => backoff.spin(),
+            }
+        }
+    }
+
+    /// Unlinks exactly `version` of `key`, a value or a tombstone. If it was
+    /// the key's only version, the key goes with it. Returns `false` if there
+    /// was no such version.
+    pub(crate) fn remove_version(
+        &self,
+        key: &[u8],
+        version: u64,
+        guard: &crossbeam_epoch::Guard,
+    ) -> bool {
+        let only = |l: &VersionedLeaf<K, V>| {
+            let h = l.head();
+            h.version == version && h.next().is_null()
+        };
+        let mut backoff = SpinBackoff::new();
+        loop {
+            let Some(leaf_ptr) = self.raw.get(key) else {
+                return false;
+            };
+            // SAFETY: protected by `guard`.
+            let leaf = unsafe { leaf_ptr.as_ref() };
+            if only(leaf) {
+                // The key's only version: unlink the whole leaf, since a
+                // chain is never empty.
+                match self.unlink_leaf(leaf_ptr, only, guard) {
+                    Unlinked::Done(_) => return true,
+                    Unlinked::Missing => return false,
+                    Unlinked::Refused if leaf.chain_latch.is_dead() => {
+                        backoff.spin();
+                        continue;
+                    }
+                    // A version arrived: edit the chain below.
+                    Unlinked::Refused => {}
+                }
+            }
+            let Some(w) = leaf.chain_latch.lock() else {
+                backoff.spin();
+                continue;
+            };
+            // Positions are found under the latch.
+            let head = leaf.head_ptr();
+            let at = |p: *mut VersionNode<V>| -> Option<&VersionNode<V>> {
+                // SAFETY: nodes reachable from `head` under the latch are live
+                // and protected by `guard`; null is the end of the chain.
+                unsafe { p.as_ref() }
+            };
+            let mut prev: *mut VersionNode<V> = std::ptr::null_mut();
+            let mut cur = head;
+            while let Some(n) = at(cur).filter(|n| n.version > version) {
+                prev = cur;
+                cur = n.next();
+            }
+            let Some(n) = at(cur).filter(|n| n.version == version) else {
+                return false;
+            };
+            if prev.is_null() && n.next().is_null() {
+                // It became the only version meanwhile.
+                drop(w);
+                continue;
+            }
+            // SAFETY: live.
+            let old_live = !unsafe { &*head }.is_tombstone();
+            let bomb = AbortOnUnwind;
+            if prev.is_null() {
+                leaf.set_head(&w, n.next());
+            } else {
+                // SAFETY: `prev` is a live node of this chain.
+                unsafe { (*prev).set_next(&w, n.next()) };
+            }
+            n.mark_superseded(&w);
+            let new_live = !leaf.head().is_tombstone();
+            self.raw
+                .len_add(isize::from(new_live) - isize::from(old_live));
+            bomb.defuse();
+            drop(w);
+            // SAFETY: unlinked under the chain latch, exactly once.
+            unsafe { retire_version(cur, guard) };
+            return true;
+        }
+    }
+
+    /// Removes every key (§9.8), killing each detached leaf's chain before
+    /// counting its head, so no writer changes it afterwards.
+    pub(crate) fn clear(&self, guard: &crossbeam_epoch::Guard) {
+        self.raw.clear_counting(guard, |l| {
+            // SAFETY: a detached leaf, protected by `guard`.
+            let l = unsafe { l.as_ref() };
+            let Some(w) = l.chain_latch.lock() else {
+                debug_assert!(false, "only its node's latch holder kills a chain");
+                return 0;
+            };
+            let live = !l.head().is_tombstone();
+            w.kill();
+            isize::from(live)
+        });
+    }
+
+    /// Checks the tree's invariants at quiescence; `len` counts the keys
+    /// whose newest version is live.
+    pub(crate) fn validate(&mut self) {
+        self.raw.validate_counting(|l| {
+            // SAFETY: exclusive access (`&mut self`); a reachable leaf.
+            usize::from(!unsafe { l.as_ref() }.head().is_tombstone())
+        });
     }
 }
 

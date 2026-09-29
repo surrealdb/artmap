@@ -271,7 +271,7 @@ jobs:
               --test concurrent_correctness --test unwind --test regressions
               --test drop_accounting --test panicking_drop --test linearizability
               --test byteslice_keys --test sim --test versioned_simulation_tests
-              --test versioned_artmap_tests
+              --test versioned_artmap_tests --test versioned_reclaim
             seeds: 0..4
           - name: model 0..2
             tests: --test model

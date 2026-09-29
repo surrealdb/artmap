@@ -174,25 +174,32 @@ descents; the two ends of a double-ended scan stop when they meet.
 
 ## §11 Version chains
 
-Every chain mutation holds the leaf's `chain_latch`, a one-byte lock
+Every chain mutation holds the leaf's `chain_latch`, a four-byte lock
 (`ChainLock`). Chain readers never validate it: they load `head` and `next`
 with `Acquire`, paired with the writers' `Release` stores, so it needs no
-version and is never obsoleted. A version node's flags (superseded,
+version. It can die: the thread that unlinks the leaf kills it while holding
+it (§13), after which every `lock` fails, and a writer that found the leaf
+before the unlink looks the key up again rather than writing into an
+unlinked chain. A dead lock is the leaf's removed state, and in the arena it
+holds the leaf's retired-list link. A version node's flags (superseded,
 tombstone, inline) live in the low bits of its 8-aligned `next` link; only
 the latch holder writes the link and the superseded bit, and the tombstone
 and inline bits never change. Positions are found under the latch. Same-version replacement is out of place. Inline slots are owned by
 the leaf and never retired independently. `len` changes by the liveness of
 the head before and after, decided under the latch. `prune_key` evaluates the
 user's `is_tombstone` without any latch, re-checks under the latch, and
-retires every detached heap node exactly once.
+retires every detached heap node exactly once. `remove_version` unlinks one
+node under the latch, or the whole leaf (§13) when it is the only one.
 
 ## §12 Arena
 
 The arena buffer is aligned to 64 bytes; allocation is a check-then-bump CAS
 that honours each type's alignment and never advances on failure. Arena maps
 drop every key and value exactly once when dropped: the live tree, the
-version chains, and a retired list of every leaf or version node unlinked
-while the map was alive. Allocation happens only in prepare phases; a failed
+version chains, and retired lists of every leaf or version node unlinked
+while the map was alive. An unlinked versioned leaf keeps its whole chain,
+and is linked into the storage's retired list through its dead chain lock, so
+it needs no field of its own. Allocation happens only in prepare phases; a failed
 allocation releases every latch and returns the caller's key and value.
 
 ## §13 Delete-side unlinking and `shrink_to_fit`
@@ -242,5 +249,23 @@ holds its children.
 - It runs under one pin and holds at most three latches at a time. The arena
   maps do not offer it: their replaced nodes would only add to the arena.
 
-The versioned maps never unlink a leaf (a delete is a tombstone), so their
-nodes are never emptied and this section does not apply to them.
+**Versioned leaves.** A versioned leaf is unlinked by a prune (when its
+newest version at or below the watermark is its newest version and a
+tombstone), by `remove_key`, by `remove_version` of its only version, and by
+`clear`. A delete is still a tombstone.
+
+- The unlinker never takes an ART latch while holding a `chain_latch`: it
+  evaluates any user code (`is_tombstone`, `AsBytes`) first, holding nothing,
+  then descends and takes the ART latches as above, then the terminal
+  `chain_latch`. Under it, it re-checks its condition, counts the head's
+  liveness for `len`, and kills the lock, all before the unlinking store.
+- A writer that found the leaf before the unlink therefore either linked its
+  version first (and it goes with the leaf) or fails to lock and retries
+  from the tree, where it finds no leaf or a new one. No version is written
+  into an unlinked leaf.
+- `clear` kills each detached leaf's lock under that leaf's node latch before
+  counting its head, so `len` stays exact.
+- The heap retires the leaf through EBR, and its drop frees the chain that is
+  still linked to it; the arena puts it on the storage's retired list.
+- A write at or below a watermark that already unlinked its key starts the
+  key afresh; the watermark contract leaves such writes unsupported.

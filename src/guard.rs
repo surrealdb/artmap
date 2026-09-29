@@ -195,9 +195,21 @@ impl<T> Retired<T> {
 /// period, on an arbitrary thread.
 #[inline]
 pub(crate) fn retire<T: Send + 'static>(guard: &crossbeam_epoch::Guard, r: Retired<T>) {
+    // Loom runs every thread of every model execution on one OS thread, so
+    // they share one crossbeam participant, and a destructor deferred in one
+    // execution can run in a later one, where it touches the earlier
+    // execution's loom atomics and aborts. The models check the latch and
+    // chain protocols, not EBR (which loom does not instrument), so retired
+    // objects leak, as in the leak-only tree storage.
+    #[cfg(loom)]
+    {
+        let _ = guard;
+        std::mem::forget(r);
+    }
     // Capture `r` whole via the method call; never write `r.0` in the closure.
     // SAFETY: `r` is unlinked and owned by this closure alone (Retired
     // contract); crossbeam runs it only after the grace period has elapsed.
+    #[cfg(not(loom))]
     guard.defer(move || unsafe { drop(r.into_box()) });
 }
 

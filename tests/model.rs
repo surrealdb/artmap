@@ -121,6 +121,40 @@ where
     front
 }
 
+/// One key's versions in a model, oldest first.
+type Chain = BTreeMap<u64, Option<u64>>;
+
+/// The versioned maps' prune (§13): unlinks the key if its newest version at
+/// or below `min` is its newest version and a tombstone, and otherwise every
+/// version older than that one. Returns how many versions went.
+fn model_prune(model: &mut BTreeMap<Vec<u8>, Chain>, k: &[u8], min: u64) -> usize {
+    let Some(chain) = model.get_mut(k) else {
+        return 0;
+    };
+    let Some((&t, &tv)) = chain.range(..=min).next_back() else {
+        return 0;
+    };
+    if chain.keys().next_back() == Some(&t) && tv.is_none() {
+        let n = chain.len();
+        model.remove(k);
+        return n;
+    }
+    let older: Vec<u64> = chain.range(..t).map(|(&v, _)| v).collect();
+    for v in &older {
+        chain.remove(v);
+    }
+    older.len()
+}
+
+/// The versioned maps' `remove_version`, on the model.
+fn model_remove_version(model: &mut BTreeMap<Vec<u8>, Chain>, k: &[u8], v: u64) -> bool {
+    let removed = model.get_mut(k).is_some_and(|c| c.remove(&v).is_some());
+    if model.get(k).is_some_and(|c| c.is_empty()) {
+        model.remove(k);
+    }
+    removed
+}
+
 #[test]
 fn artmap_matches_btreemap() {
     for seed in 0..seeds() {
@@ -314,13 +348,36 @@ fn artset_all_bytes_at_one_level() {
 fn versioned_matches_model() {
     for seed in 0..seeds() {
         let mut rng = StdRng::seed_from_u64(seed);
-        let map = VersionedArtMap::<Vec<u8>, u64>::new();
+        let mut map = VersionedArtMap::<Vec<u8>, u64>::new();
         // key -> version -> Option<value>
-        let mut model = BTreeMap::<Vec<u8>, BTreeMap<u64, Option<u64>>>::new();
+        let mut model = BTreeMap::<Vec<u8>, Chain>::new();
         for i in 0..ops() as u64 {
             let k = gen_key(&mut rng);
             let ver = rng.gen_range(1..20u64);
-            match rng.gen_range(0..10) {
+            match rng.gen_range(0..14) {
+                10 => assert_eq!(
+                    map.remove_key(&k),
+                    model.remove(&k).is_some(),
+                    "seed {seed}"
+                ),
+                11 => assert_eq!(
+                    map.remove_version(&k, ver),
+                    model_remove_version(&mut model, &k, ver),
+                    "seed {seed}"
+                ),
+                12 => {
+                    let min = rng.gen_range(0..22u64);
+                    let want = model_prune(&mut model, &k, min);
+                    assert_eq!(
+                        map.prune_key(&k, min, |_| false),
+                        want,
+                        "prune, seed {seed}"
+                    );
+                }
+                13 if rng.gen_ratio(1, 30) => {
+                    map.clear();
+                    model.clear();
+                }
                 0..=4 => {
                     map.insert(k.clone(), ver, i);
                     model.entry(k).or_default().insert(ver, Some(i));
@@ -380,6 +437,7 @@ fn versioned_matches_model() {
                 .count();
             assert_eq!(map.len(), live, "versioned len, seed {seed}");
         }
+        map.validate_invariants();
         // Prune everything below the median version and check the watermark contract.
         let min = 10;
         map.prune_all(min, |_| false);
@@ -446,12 +504,35 @@ fn arena_matches_btreemap() {
 fn arena_versioned_matches_model() {
     for seed in 0..seeds() {
         let mut rng = StdRng::seed_from_u64(seed);
-        let map = ArenaVersionedArtMap::<Vec<u8>, u64>::with_capacity(64 << 20);
-        let mut model = BTreeMap::<Vec<u8>, BTreeMap<u64, Option<u64>>>::new();
+        let mut map = ArenaVersionedArtMap::<Vec<u8>, u64>::with_capacity(64 << 20);
+        let mut model = BTreeMap::<Vec<u8>, Chain>::new();
         for i in 0..ops() as u64 {
             let k = gen_key(&mut rng);
             let ver = rng.gen_range(1..20u64);
-            match rng.gen_range(0..10) {
+            match rng.gen_range(0..14) {
+                10 => assert_eq!(
+                    map.remove_key(&k),
+                    model.remove(&k).is_some(),
+                    "seed {seed}"
+                ),
+                11 => assert_eq!(
+                    map.remove_version(&k, ver),
+                    model_remove_version(&mut model, &k, ver),
+                    "seed {seed}"
+                ),
+                12 => {
+                    let min = rng.gen_range(0..22u64);
+                    let want = model_prune(&mut model, &k, min);
+                    assert_eq!(
+                        map.prune_key(&k, min, |_| false),
+                        want,
+                        "prune, seed {seed}"
+                    );
+                }
+                13 if rng.gen_ratio(1, 30) => {
+                    map.clear();
+                    model.clear();
+                }
                 0..=4 => {
                     map.insert(k.clone(), ver, i);
                     model.entry(k).or_default().insert(ver, Some(i));
@@ -520,5 +601,6 @@ fn arena_versioned_matches_model() {
                 .count();
             assert_eq!(map.len(), live, "arena versioned len, seed {seed}");
         }
+        map.validate_invariants();
     }
 }
