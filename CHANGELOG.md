@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0 (unreleased)
+## 0.6.0 (2026-09-29)
 
 0.6 rebuilds all four maps on one shared ART core. The goal is a safe API that is sound, with memory safety checked by Miri, loom and the sanitizers. `docs/SAFETY.md` states the invariants that the code relies on.
 
