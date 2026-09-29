@@ -75,7 +75,7 @@ impl<'a, K, V> Range<'a, K, V> {
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, K, V> {
     type Item = EntryRef<'a, K, V>;
 
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         let leaf = self.cursor.next(&self.tree.raw)?;
         Some(EntryRef::new(leaf, self.tree, self.guard.duplicate()))
@@ -83,7 +83,7 @@ impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, 
 }
 
 impl<K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for Range<'_, K, V> {
-    #[inline]
+    #[inline(always)]
     fn next_back(&mut self) -> Option<Self::Item> {
         let leaf = self.cursor.next_back(&self.tree.raw)?;
         Some(EntryRef::new(leaf, self.tree, self.guard.duplicate()))

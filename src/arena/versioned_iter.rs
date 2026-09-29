@@ -219,6 +219,7 @@ impl<'a, K: AsBytes, V> ArenaVersionedRange<'a, K, V> {
 impl<'a, K: AsBytes, V> Iterator for ArenaVersionedRange<'a, K, V> {
     type Item = ArenaVersionedEntryRef<'a, K, V>;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let leaf = self.cursor.next(&self.tree.raw)?;
@@ -230,6 +231,7 @@ impl<'a, K: AsBytes, V> Iterator for ArenaVersionedRange<'a, K, V> {
 }
 
 impl<K: AsBytes, V> DoubleEndedIterator for ArenaVersionedRange<'_, K, V> {
+    #[inline(always)]
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
             let leaf = self.cursor.next_back(&self.tree.raw)?;

@@ -153,7 +153,7 @@ impl GuardHandle<'_> {
 
     /// Duplicates the protection: a nested pin, a shared `Rc`, or a copy of
     /// the borrow. Never an unverified nested pin (§8.2).
-    #[inline]
+    #[inline(always)]
     pub(crate) fn duplicate(&self) -> Self {
         match self {
             GuardHandle::Owned(_, id) => GuardHandle::Owned(nested_pin(*id), *id),

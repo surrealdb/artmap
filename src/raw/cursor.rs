@@ -149,6 +149,8 @@ impl<R: Copy> Stack<R> {
 
 enum Step<R> {
     Leaf(R),
+    /// The first leaf of a freshly gathered batch.
+    Batch(R),
     End,
     Invalid,
 }
@@ -164,6 +166,9 @@ struct Side<R: Slot> {
     batch: [R; BATCH],
     batch_len: u8,
     batch_pos: u8,
+    /// Every leaf left in the batch is inside the far bound (the batch's last
+    /// leaf was checked), so single-ended steps skip the per-leaf check.
+    batch_in_range: bool,
     last: Option<Resume<R>>,
     positioned: bool,
 }
@@ -200,6 +205,7 @@ impl<R: Slot> Side<R> {
             batch: [R::NULL; BATCH],
             batch_len: 0,
             batch_pos: 0,
+            batch_in_range: false,
             last: None,
             positioned: false,
         }
@@ -211,6 +217,7 @@ impl<R: Slot> Side<R> {
         self.pending = None;
         self.batch_len = 0;
         self.batch_pos = 0;
+        self.batch_in_range = false;
     }
 
     #[inline]
@@ -310,23 +317,52 @@ impl<S: Storage> Cursor<S> {
 
 impl<S: Storage> Cursor<S> {
     /// The next leaf in ascending order. The caller keeps `tree` protected.
+    #[inline(always)]
     pub(crate) fn next(&mut self, tree: &RawTree<S>) -> Option<NonNull<S::Leaf>> {
         self.advance(tree, Dir::Forward)
     }
 
     /// The next leaf in descending order.
+    #[inline(always)]
     pub(crate) fn next_back(&mut self, tree: &RawTree<S>) -> Option<NonNull<S::Leaf>> {
         self.advance(tree, Dir::Backward)
     }
 
+    /// The fast path, small enough to inline into the iterators: the next
+    /// leaf is already validated in this side's batch, the batch is known to
+    /// be inside the far bound, and the other end has not moved, so nothing
+    /// needs checking (15 of every 16 steps on dense nodes).
+    #[inline(always)]
     fn advance(&mut self, tree: &RawTree<S>, dir: Dir) -> Option<NonNull<S::Leaf>> {
+        let (side, other) = match dir {
+            Dir::Forward => (&mut self.front, &self.back),
+            Dir::Backward => (&mut self.back, &self.front),
+        };
+        if side.batch_in_range
+            && side.batch_pos < side.batch_len
+            && other.last.is_none()
+            && side.pending.is_none()
+            && side.positioned
+            && !self.done
+        {
+            let leaf_raw = side.batch[side.batch_pos as usize];
+            side.batch_pos += 1;
+            side.remember(leaf_raw);
+            // SAFETY: a protected leaf reached through a validated slot.
+            return Some(unsafe { tree.storage.leaf(leaf_raw) });
+        }
+        self.advance_slow(tree, dir)
+    }
+
+    #[inline(never)]
+    fn advance_slow(&mut self, tree: &RawTree<S>, dir: Dir) -> Option<NonNull<S::Leaf>> {
         loop {
             if self.done {
                 return None;
             }
-            let (side, other) = match dir {
-                Dir::Forward => (&mut self.front, &self.back),
-                Dir::Backward => (&mut self.back, &self.front),
+            let side = match dir {
+                Dir::Forward => &mut self.front,
+                Dir::Backward => &mut self.back,
             };
             if !side.positioned {
                 let bound = match (&side.last, dir) {
@@ -341,6 +377,20 @@ impl<S: Storage> Cursor<S> {
                 Some(l) => l,
                 None => match step(tree, side, dir) {
                     Step::Leaf(l) => l,
+                    Step::Batch(l) => {
+                        // Keys ascend (forward) or descend (backward) within a
+                        // node, so if the batch's last leaf is inside the far
+                        // bound, all of them are. (An inconsistent `AsBytes`
+                        // can then only cause wrong results.)
+                        let last = side.batch[side.batch_len as usize - 1];
+                        // SAFETY: a protected leaf reached through a validated slot.
+                        let k = unsafe { tree.leaf_ref(last) }.key_bytes();
+                        side.batch_in_range = match dir {
+                            Dir::Forward => below_end(k, &self.end),
+                            Dir::Backward => above_start(k, &self.start),
+                        };
+                        l
+                    }
                     Step::End => {
                         self.done = true;
                         return None;
@@ -351,36 +401,51 @@ impl<S: Storage> Cursor<S> {
                     }
                 },
             };
-            // SAFETY: a protected leaf reached through a validated slot.
-            let leaf = unsafe { tree.storage.leaf(leaf_raw) };
-            // SAFETY: as above.
-            let k = unsafe { leaf.as_ref() }.key_bytes();
-            // Structure guarantees keys past the last yielded one and inside
-            // the start bound; only the far bound and the other end are checked.
-            // (An inconsistent `AsBytes` can then only cause wrong results.)
-            let (in_range, crossed) = match dir {
-                Dir::Forward => (
-                    below_end(k, &self.end),
-                    other
-                        .last
-                        .as_ref()
-                        .is_some_and(|b| cmp_keys(k, b.key(tree)).is_ge()),
-                ),
-                Dir::Backward => (
-                    above_start(k, &self.start),
-                    other
-                        .last
-                        .as_ref()
-                        .is_some_and(|f| cmp_keys(k, f.key(tree)).is_le()),
-                ),
-            };
-            if !in_range || crossed {
-                self.done = true;
-                return None;
-            }
-            side.remember(leaf_raw);
-            return Some(leaf);
+            return self.accept(tree, dir, leaf_raw);
         }
+    }
+
+    /// Checks a leaf against the far bound and the other end, then yields it.
+    #[inline]
+    fn accept(
+        &mut self,
+        tree: &RawTree<S>,
+        dir: Dir,
+        leaf_raw: Raw<S>,
+    ) -> Option<NonNull<S::Leaf>> {
+        let (side, other) = match dir {
+            Dir::Forward => (&mut self.front, &self.back),
+            Dir::Backward => (&mut self.back, &self.front),
+        };
+        // SAFETY: a protected leaf reached through a validated slot.
+        let leaf = unsafe { tree.storage.leaf(leaf_raw) };
+        // SAFETY: as above.
+        let k = unsafe { leaf.as_ref() }.key_bytes();
+        // Structure guarantees keys past the last yielded one and inside
+        // the start bound; only the far bound and the other end are checked.
+        // (An inconsistent `AsBytes` can then only cause wrong results.)
+        let (in_range, crossed) = match dir {
+            Dir::Forward => (
+                below_end(k, &self.end),
+                other
+                    .last
+                    .as_ref()
+                    .is_some_and(|b| cmp_keys(k, b.key(tree)).is_ge()),
+            ),
+            Dir::Backward => (
+                above_start(k, &self.start),
+                other
+                    .last
+                    .as_ref()
+                    .is_some_and(|f| cmp_keys(k, f.key(tree)).is_le()),
+            ),
+        };
+        if !in_range || crossed {
+            self.done = true;
+            return None;
+        }
+        side.remember(leaf_raw);
+        Some(leaf)
     }
 }
 
@@ -630,7 +695,8 @@ fn step<S: Storage>(tree: &RawTree<S>, side: &mut Side<Raw<S>>, dir: Dir) -> Ste
         if n > 0 {
             side.batch_len = n as u8;
             side.batch_pos = 1;
-            return Step::Leaf(side.batch[0]);
+            side.batch_in_range = false;
+            return Step::Batch(side.batch[0]);
         }
         match dir {
             Dir::Forward => stack.pop(),
