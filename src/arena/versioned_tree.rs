@@ -246,12 +246,7 @@ impl<K: AsBytes, V> ArenaVersionedTree<K, V> {
         // SAFETY: allocated by the caller, unpublished.
         let new = unsafe { arena.ptr::<VersionNode<V>>(node).as_ref() };
         let version = new.version;
-        let lock = || {
-            let Some(w) = leaf.chain_latch.lock() else {
-                unreachable!("arena chain latches are never obsoleted")
-            };
-            w
-        };
+        let lock = || leaf.chain_latch.lock();
         #[cfg(loom)]
         let unlatched = crate::latch::mutants::CHAIN_POSITION_UNLATCHED.with(|m| m.get());
         #[cfg(not(loom))]
@@ -304,9 +299,7 @@ impl<K: AsBytes, V> ArenaVersionedTree<K, V> {
         let arena = &**self.arena();
         // SAFETY: arena leaves are valid for the map's life.
         let leaf = unsafe { leaf_ptr.as_ref() };
-        let Some(w) = leaf.chain_latch.lock() else {
-            unreachable!("arena chain latches are never obsoleted")
-        };
+        let w = leaf.chain_latch.lock();
         let head = leaf.head();
         // SAFETY: a version node of this arena.
         let h = unsafe { arena.ptr::<VersionNode<V>>(head).as_ref() };

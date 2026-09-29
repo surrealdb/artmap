@@ -127,7 +127,7 @@ impl<'a, K, V> Range<'a, K, V> {
 impl<'a, K: AsBytes, V> Iterator for Range<'a, K, V> {
     type Item = ArenaEntryRef<'a, K, V>;
 
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         let leaf = self.cursor.next(&self.tree.raw)?;
         // SAFETY: a leaf of the tree borrowed for `'a`.
@@ -136,7 +136,7 @@ impl<'a, K: AsBytes, V> Iterator for Range<'a, K, V> {
 }
 
 impl<K: AsBytes, V> DoubleEndedIterator for Range<'_, K, V> {
-    #[inline]
+    #[inline(always)]
     fn next_back(&mut self) -> Option<Self::Item> {
         let leaf = self.cursor.next_back(&self.tree.raw)?;
         // SAFETY: a leaf of the tree borrowed for `'a`.

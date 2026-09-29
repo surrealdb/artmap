@@ -17,6 +17,7 @@
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
 use std::ops::Bound;
+use std::ptr::NonNull;
 use std::rc::Rc;
 
 use crate::guard::{pin_tagged, GuardHandle};
@@ -71,26 +72,46 @@ impl<'a, K, V> Range<'a, K, V> {
 impl<'a, K: AsBytes + Send + 'static, V: Send + 'static> Iterator for Range<'a, K, V> {
     type Item = VersionedEntryRef<'a, K, V>;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let leaf = self.cursor.next(&self.tree.raw)?;
             // SAFETY: protected by the iterator's guard. The head is loaded once.
             let head = unsafe { leaf.as_ref() }.head();
-            if let Some(e) = VersionedEntryRef::new(leaf, head, self.tree, self.guard.duplicate()) {
-                return Some(e);
+            // Checked before the guard is shared, and the item is built in
+            // place: building it through `VersionedEntryRef::new` spilled the
+            // guard handle to the stack and reloaded it wider, a
+            // store-forwarding stall on every item.
+            if !head.is_tombstone() {
+                return Some(VersionedEntryRef {
+                    leaf,
+                    node: NonNull::from(head),
+                    tree: self.tree,
+                    guard: self.guard.duplicate(),
+                });
             }
         }
     }
 }
 
 impl<K: AsBytes + Send + 'static, V: Send + 'static> DoubleEndedIterator for Range<'_, K, V> {
+    #[inline(always)]
     fn next_back(&mut self) -> Option<Self::Item> {
         loop {
             let leaf = self.cursor.next_back(&self.tree.raw)?;
             // SAFETY: as for `next`.
             let head = unsafe { leaf.as_ref() }.head();
-            if let Some(e) = VersionedEntryRef::new(leaf, head, self.tree, self.guard.duplicate()) {
-                return Some(e);
+            // Checked before the guard is shared, and the item is built in
+            // place: building it through `VersionedEntryRef::new` spilled the
+            // guard handle to the stack and reloaded it wider, a
+            // store-forwarding stall on every item.
+            if !head.is_tombstone() {
+                return Some(VersionedEntryRef {
+                    leaf,
+                    node: NonNull::from(head),
+                    tree: self.tree,
+                    guard: self.guard.duplicate(),
+                });
             }
         }
     }

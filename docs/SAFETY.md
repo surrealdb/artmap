@@ -169,8 +169,13 @@ descents; the two ends of a double-ended scan stop when they meet.
 
 ## §11 Version chains
 
-Every chain mutation holds the leaf's `chain_latch`. Positions are found under
-the latch. Same-version replacement is out of place. Inline slots are owned by
+Every chain mutation holds the leaf's `chain_latch`, a one-byte lock
+(`ChainLock`). Chain readers never validate it: they load `head` and `next`
+with `Acquire`, paired with the writers' `Release` stores, so it needs no
+version and is never obsoleted. A version node's flags (superseded,
+tombstone, inline) live in the low bits of its 8-aligned `next` link; only
+the latch holder writes the link and the superseded bit, and the tombstone
+and inline bits never change. Positions are found under the latch. Same-version replacement is out of place. Inline slots are owned by
 the leaf and never retired independently. `len` changes by the liveness of
 the head before and after, decided under the latch. `prune_key` evaluates the
 user's `is_tombstone` without any latch, re-checks under the latch, and

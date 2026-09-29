@@ -35,20 +35,20 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 | Data Structure | Read<br><sup>(with&nbsp;standard&nbsp;key)</sup> | Read<br><sup>(with&nbsp;slice&nbsp;key)</sup> | Insert<br><sup>(sequential&nbsp;entries)</sup> | Insert<br><sup>(random&nbsp;entries)</sup> | Range&nbsp;scans<br><sup>(100&nbsp;items)</sup> |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| **`artmap::ArtMap`** | **22.9&nbsp;ns**<br><sup>(43.6M/s)</sup> | **23.2&nbsp;ns**<br><sup>(43.1M/s)</sup> | **32.5&nbsp;ns**<br><sup>(30.8M/s)</sup> | **48.6&nbsp;ns**<br><sup>(20.6M/s)</sup> | **1.05&nbsp;µs**<br><sup>(95.1M/s)</sup> |
-| **`artmap::VersionedArtMap`** | **21.6&nbsp;ns**<br><sup>(46.2M/s)</sup> | **22.3&nbsp;ns**<br><sup>(44.9M/s)</sup> | **48.5&nbsp;ns**<br><sup>(20.6M/s)</sup> | **70.7&nbsp;ns**<br><sup>(14.1M/s)</sup> | **1.81&nbsp;µs**<br><sup>(55.2M/s)</sup> |
-| **`artmap::ArenaArtMap`** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**13.8&nbsp;ns**<br><sup>(72.2M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**14.4&nbsp;ns**<br><sup>(69.7M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**26.9&nbsp;ns**<br><sup>(37.2M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**39.4&nbsp;ns**<br><sup>(25.4M/s)</sup> | **840&nbsp;ns**<br><sup>(119M/s)</sup> |
-| **`artmap::ArenaVersionedArtMap`** | **15.6&nbsp;ns**<br><sup>(64.1M/s)</sup> | **15.2&nbsp;ns**<br><sup>(65.8M/s)</sup> | **42.4&nbsp;ns**<br><sup>(23.6M/s)</sup> | **51.6&nbsp;ns**<br><sup>(19.4M/s)</sup> | **798&nbsp;ns**<br><sup>(125M/s)</sup> |
-| `arenaskiplist::SkipList` | 182&nbsp;ns<br><sup>(5.5M/s)</sup> | 182&nbsp;ns<br><sup>(5.5M/s)</sup> | 39.5&nbsp;ns<br><sup>(25.3M/s)</sup> | 153&nbsp;ns<br><sup>(6.5M/s)</sup> | 808&nbsp;ns<br><sup>(124M/s)</sup> |
-| `concread::bptree::BPTree` | 65.7&nbsp;ns<br><sup>(15.2M/s)</sup> | — | 44.4&nbsp;ns<br><sup>(22.5M/s)</sup> | 129&nbsp;ns<br><sup>(7.7M/s)</sup> | 424&nbsp;ns<br><sup>(236M/s)</sup> |
-| `crossbeam_skiplist::SkipMap` | 165&nbsp;ns<br><sup>(6.1M/s)</sup> | — | 76.0&nbsp;ns<br><sup>(13.2M/s)</sup> | 175&nbsp;ns<br><sup>(5.7M/s)</sup> | 2.38&nbsp;µs<br><sup>(41.9M/s)</sup> |
-| `imbl::OrdMap` | 40.7&nbsp;ns<br><sup>(24.6M/s)</sup> | — | 50.8&nbsp;ns<br><sup>(19.7M/s)</sup> | 74.4&nbsp;ns<br><sup>(13.4M/s)</sup> | 356&nbsp;ns<br><sup>(281M/s)</sup> |
-| `std::collections::BTreeMap` | 63.9&nbsp;ns<br><sup>(15.7M/s)</sup> | — | 33.2&nbsp;ns<br><sup>(30.1M/s)</sup> | 64.0&nbsp;ns<br><sup>(15.6M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**225&nbsp;ns**<br><sup>(445M/s)</sup> |
-| `vart::Tree` | 21.4&nbsp;ns<br><sup>(46.6M/s)</sup> | 19.6&nbsp;ns<br><sup>(50.9M/s)</sup> | 64.8&nbsp;ns<br><sup>(15.4M/s)</sup> | 72.1&nbsp;ns<br><sup>(13.9M/s)</sup> | 2.58&nbsp;µs<br><sup>(38.8M/s)</sup> |
-| `dashmap::DashMap`* | 17.5&nbsp;ns<br><sup>(57.2M/s)</sup> | — | 23.7&nbsp;ns<br><sup>(42.2M/s)</sup> | 29.6&nbsp;ns<br><sup>(33.8M/s)</sup> | N/A |
-| `papaya::HashMap`* | 22.2&nbsp;ns<br><sup>(45.1M/s)</sup> | — | 51.7&nbsp;ns<br><sup>(19.3M/s)</sup> | 56.7&nbsp;ns<br><sup>(17.6M/s)</sup> | N/A |
-| `scc::HashIndex`* | 16.7&nbsp;ns<br><sup>(59.7M/s)</sup> | — | 27.9&nbsp;ns<br><sup>(35.8M/s)</sup> | 31.0&nbsp;ns<br><sup>(32.2M/s)</sup> | N/A |
-| `std::collections::HashMap`* | 13.3&nbsp;ns<br><sup>(75.2M/s)</sup> | — | 18.7&nbsp;ns<br><sup>(53.6M/s)</sup> | 21.1&nbsp;ns<br><sup>(47.3M/s)</sup> | N/A |
+| **`artmap::ArtMap`** | **24.8&nbsp;ns**<br><sup>(40.4M/s)</sup> | **25.1&nbsp;ns**<br><sup>(39.9M/s)</sup> | **32.5&nbsp;ns**<br><sup>(30.7M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**38.7&nbsp;ns**<br><sup>(25.9M/s)</sup> | **718&nbsp;ns**<br><sup>(139M/s)</sup> |
+| **`artmap::VersionedArtMap`** | **21.9&nbsp;ns**<br><sup>(45.7M/s)</sup> | **21.6&nbsp;ns**<br><sup>(46.2M/s)</sup> | **48.2&nbsp;ns**<br><sup>(20.7M/s)</sup> | **69.4&nbsp;ns**<br><sup>(14.4M/s)</sup> | **807&nbsp;ns**<br><sup>(124M/s)</sup> |
+| **`artmap::ArenaArtMap`** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**13.4&nbsp;ns**<br><sup>(74.5M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**13.4&nbsp;ns**<br><sup>(74.8M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**27.1&nbsp;ns**<br><sup>(36.9M/s)</sup> | **39.8&nbsp;ns**<br><sup>(25.1M/s)</sup> | **574&nbsp;ns**<br><sup>(174M/s)</sup> |
+| **`artmap::ArenaVersionedArtMap`** | **14.7&nbsp;ns**<br><sup>(68.2M/s)</sup> | **15.7&nbsp;ns**<br><sup>(63.6M/s)</sup> | **41.3&nbsp;ns**<br><sup>(24.2M/s)</sup> | **51.6&nbsp;ns**<br><sup>(19.4M/s)</sup> | **616&nbsp;ns**<br><sup>(162M/s)</sup> |
+| `arenaskiplist::SkipList` | 181&nbsp;ns<br><sup>(5.5M/s)</sup> | 181&nbsp;ns<br><sup>(5.5M/s)</sup> | 39.5&nbsp;ns<br><sup>(25.3M/s)</sup> | 151&nbsp;ns<br><sup>(6.6M/s)</sup> | 809&nbsp;ns<br><sup>(124M/s)</sup> |
+| `concread::bptree::BPTree` | 64.2&nbsp;ns<br><sup>(15.6M/s)</sup> | — | 44.9&nbsp;ns<br><sup>(22.3M/s)</sup> | 128&nbsp;ns<br><sup>(7.8M/s)</sup> | 434&nbsp;ns<br><sup>(231M/s)</sup> |
+| `crossbeam_skiplist::SkipMap` | 160&nbsp;ns<br><sup>(6.2M/s)</sup> | — | 77.8&nbsp;ns<br><sup>(12.9M/s)</sup> | 174&nbsp;ns<br><sup>(5.8M/s)</sup> | 2.39&nbsp;µs<br><sup>(41.9M/s)</sup> |
+| `imbl::OrdMap` | 41.8&nbsp;ns<br><sup>(23.9M/s)</sup> | — | 52.6&nbsp;ns<br><sup>(19.0M/s)</sup> | 74.6&nbsp;ns<br><sup>(13.4M/s)</sup> | 343&nbsp;ns<br><sup>(291M/s)</sup> |
+| `std::collections::BTreeMap` | 62.4&nbsp;ns<br><sup>(16.0M/s)</sup> | — | 31.1&nbsp;ns<br><sup>(32.1M/s)</sup> | 65.7&nbsp;ns<br><sup>(15.2M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**235&nbsp;ns**<br><sup>(426M/s)</sup> |
+| `vart::Tree` | 22.0&nbsp;ns<br><sup>(45.5M/s)</sup> | 20.6&nbsp;ns<br><sup>(48.6M/s)</sup> | 67.7&nbsp;ns<br><sup>(14.8M/s)</sup> | 69.6&nbsp;ns<br><sup>(14.4M/s)</sup> | 2.68&nbsp;µs<br><sup>(37.3M/s)</sup> |
+| `dashmap::DashMap`* | 17.3&nbsp;ns<br><sup>(58.0M/s)</sup> | — | 23.6&nbsp;ns<br><sup>(42.4M/s)</sup> | 29.1&nbsp;ns<br><sup>(34.4M/s)</sup> | N/A |
+| `papaya::HashMap`* | 21.7&nbsp;ns<br><sup>(46.1M/s)</sup> | — | 52.2&nbsp;ns<br><sup>(19.1M/s)</sup> | 56.9&nbsp;ns<br><sup>(17.6M/s)</sup> | N/A |
+| `scc::HashIndex`* | 17.0&nbsp;ns<br><sup>(58.7M/s)</sup> | — | 27.9&nbsp;ns<br><sup>(35.9M/s)</sup> | 31.1&nbsp;ns<br><sup>(32.1M/s)</sup> | N/A |
+| `std::collections::HashMap`* | 13.3&nbsp;ns<br><sup>(74.9M/s)</sup> | — | 18.8&nbsp;ns<br><sup>(53.3M/s)</sup> | 21.1&nbsp;ns<br><sup>(47.3M/s)</sup> | N/A |
 
 <sup>* `dashmap::DashMap`, `papaya::HashMap`, `scc::HashIndex`, and `std::collections::HashMap` are marked with `*` as unordered $O(1)$ reference baselines and do not support range queries, sorted scans, or ordered traversals. The rocket icon marks the fastest ordered (range-scannable) map in each column. The sequential insert time for `arenaskiplist::SkipList` uses its sequential inserter cache (`Inserter`).</sup>
 
@@ -60,20 +60,20 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 | Data Structure | Concurrent&nbsp;Writes<br><sup>(8&nbsp;Threads,&nbsp;100k&nbsp;Ops)</sup> | Mixed&nbsp;Workload<br><sup>(4R&nbsp;+&nbsp;4W,&nbsp;100k&nbsp;Ops)</sup> | Concurrency&nbsp;Model |
 | :--- | ---: | ---: | :--- |
-| **`artmap::ArtMap`** | **2.03&nbsp;ms**<br><sup>(49.4M/s)</sup> | **2.06&nbsp;ms**<br><sup>(48.6M/s)</sup> | Non-Blocking Reads + OLC Node Latching |
-| **`artmap::VersionedArtMap`** | **3.00&nbsp;ms**<br><sup>(33.3M/s)</sup> | **2.70&nbsp;ms**<br><sup>(37.1M/s)</sup> | Non-Blocking Reads + OLC + Per-Key Chain Latch |
-| **`artmap::ArenaArtMap`** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.74&nbsp;ms**<br><sup>(57.6M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.98&nbsp;ms**<br><sup>(50.5M/s)</sup> | OLC Node Latching + 32-Bit Offsets + Atomic Bump Allocation |
-| **`artmap::ArenaVersionedArtMap`** | **2.12&nbsp;ms**<br><sup>(47.1M/s)</sup> | **2.24&nbsp;ms**<br><sup>(44.6M/s)</sup> | OLC Node Latching + 32-Bit Offsets + Per-Key Chain Latch |
-| `arenaskiplist::SkipList` | 39.26&nbsp;ms<br><sup>(2.5M/s)</sup> | 28.19&nbsp;ms<br><sup>(3.5M/s)</sup> | Lock-Free Atomic CAS (Contiguous Arena) |
-| `concread::bptree::BPTree` | 8.67&nbsp;ms<br><sup>(11.5M/s)</sup> | 4.64&nbsp;ms<br><sup>(21.6M/s)</sup> | Lock-Free Reads + Single-Writer CoW (MVCC) |
-| `crossbeam_skiplist::SkipMap` | 10.47&nbsp;ms<br><sup>(9.5M/s)</sup> | 9.61&nbsp;ms<br><sup>(10.4M/s)</sup> | Lock-Free Atomic CAS |
-| `parking_lot::RwLock<BTreeMap>` | 67.76&nbsp;ms<br><sup>(1.5M/s)</sup> | 37.07&nbsp;ms<br><sup>(2.7M/s)</sup> | Coarse Exclusive Lock |
-| `parking_lot::RwLock<imbl::OrdMap>` | 76.88&nbsp;ms<br><sup>(1.3M/s)</sup> | 56.56&nbsp;ms<br><sup>(1.8M/s)</sup> | Coarse Exclusive Lock |
-| `parking_lot::RwLock<vart::Tree>` | 82.61&nbsp;ms<br><sup>(1.2M/s)</sup> | 52.32&nbsp;ms<br><sup>(1.9M/s)</sup> | Coarse Exclusive Lock (Persistent CoW) |
-| `dashmap::DashMap`* | 3.35&nbsp;ms<br><sup>(29.8M/s)</sup> | 3.58&nbsp;ms<br><sup>(27.9M/s)</sup> | Fine-Grained Sharded RwLock |
-| `papaya::HashMap`* | 7.66&nbsp;ms<br><sup>(13.1M/s)</sup> | 7.98&nbsp;ms<br><sup>(12.5M/s)</sup> | Lock-Free Reads + Fine-Grained Latching (EBR) |
-| `parking_lot::RwLock<HashMap>`* | 76.00&nbsp;ms<br><sup>(1.3M/s)</sup> | 45.11&nbsp;ms<br><sup>(2.2M/s)</sup> | Coarse Exclusive Lock |
-| `scc::HashIndex`* | 2.99&nbsp;ms<br><sup>(33.4M/s)</sup> | 3.12&nbsp;ms<br><sup>(32.0M/s)</sup> | Lock-Free Reads + Bucket Latching |
+| **`artmap::ArtMap`** | **2.00&nbsp;ms**<br><sup>(50.1M/s)</sup> | **2.07&nbsp;ms**<br><sup>(48.2M/s)</sup> | Non-Blocking Reads + OLC Node Latching |
+| **`artmap::VersionedArtMap`** | **2.34&nbsp;ms**<br><sup>(42.8M/s)</sup> | **2.32&nbsp;ms**<br><sup>(43.1M/s)</sup> | Non-Blocking Reads + OLC + Per-Key Chain Latch |
+| **`artmap::ArenaArtMap`** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.76&nbsp;ms**<br><sup>(56.8M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**2.02&nbsp;ms**<br><sup>(49.6M/s)</sup> | OLC Node Latching + 32-Bit Offsets + Atomic Bump Allocation |
+| **`artmap::ArenaVersionedArtMap`** | **2.23&nbsp;ms**<br><sup>(44.9M/s)</sup> | **2.23&nbsp;ms**<br><sup>(44.9M/s)</sup> | OLC Node Latching + 32-Bit Offsets + Per-Key Chain Latch |
+| `arenaskiplist::SkipList` | 40.80&nbsp;ms<br><sup>(2.5M/s)</sup> | 28.81&nbsp;ms<br><sup>(3.5M/s)</sup> | Lock-Free Atomic CAS (Contiguous Arena) |
+| `concread::bptree::BPTree` | 8.86&nbsp;ms<br><sup>(11.3M/s)</sup> | 4.59&nbsp;ms<br><sup>(21.8M/s)</sup> | Lock-Free Reads + Single-Writer CoW (MVCC) |
+| `crossbeam_skiplist::SkipMap` | 10.10&nbsp;ms<br><sup>(9.9M/s)</sup> | 9.49&nbsp;ms<br><sup>(10.5M/s)</sup> | Lock-Free Atomic CAS |
+| `parking_lot::RwLock<BTreeMap>` | 66.53&nbsp;ms<br><sup>(1.5M/s)</sup> | 39.01&nbsp;ms<br><sup>(2.6M/s)</sup> | Coarse Exclusive Lock |
+| `parking_lot::RwLock<imbl::OrdMap>` | 78.35&nbsp;ms<br><sup>(1.3M/s)</sup> | 57.88&nbsp;ms<br><sup>(1.7M/s)</sup> | Coarse Exclusive Lock |
+| `parking_lot::RwLock<vart::Tree>` | 77.81&nbsp;ms<br><sup>(1.3M/s)</sup> | 51.67&nbsp;ms<br><sup>(1.9M/s)</sup> | Coarse Exclusive Lock (Persistent CoW) |
+| `dashmap::DashMap`* | 3.37&nbsp;ms<br><sup>(29.6M/s)</sup> | 3.60&nbsp;ms<br><sup>(27.7M/s)</sup> | Fine-Grained Sharded RwLock |
+| `papaya::HashMap`* | 7.69&nbsp;ms<br><sup>(13.0M/s)</sup> | 8.12&nbsp;ms<br><sup>(12.3M/s)</sup> | Lock-Free Reads + Fine-Grained Latching (EBR) |
+| `parking_lot::RwLock<HashMap>`* | 76.98&nbsp;ms<br><sup>(1.3M/s)</sup> | 44.66&nbsp;ms<br><sup>(2.2M/s)</sup> | Coarse Exclusive Lock |
+| `scc::HashIndex`* | 3.00&nbsp;ms<br><sup>(33.3M/s)</sup> | 3.14&nbsp;ms<br><sup>(31.8M/s)</sup> | Lock-Free Reads + Bucket Latching |
 
 ### Memory Footprint & Allocation Overhead
 
@@ -82,9 +82,9 @@ Benchmarked with 100,000 keys (64-bit integer keys and 64-bit values), measuring
 | Data Structure | Idle&nbsp;Memory<br><sup>(100k&nbsp;items)</sup> | Peak&nbsp;Memory<br><sup>(during&nbsp;ingest)</sup> | Allocations<br><sup>(per&nbsp;insert)</sup> | Teardown&nbsp;/&nbsp;Reset<br><sup>(deallocation&nbsp;cost)</sup> |
 | :--- | ---: | ---: | ---: | :--- |
 | **`artmap::ArtMap`** | **5.46&nbsp;MB**<br><sup>(54.6 B/item)</sup> | **5.47&nbsp;MB** | **1.32** | $O(N)$ epoch-deferred reclamation |
-| **`artmap::VersionedArtMap`** | **12.65&nbsp;MB**<br><sup>(126.5 B/item)</sup> | **12.65&nbsp;MB** | **1.32** | $O(N)$ epoch-deferred reclamation |
+| **`artmap::VersionedArtMap`** | **10.25&nbsp;MB**<br><sup>(102.5 B/item)</sup> | **10.25&nbsp;MB** | **1.32** | $O(N)$ epoch-deferred reclamation |
 | **`artmap::ArenaArtMap`** | **4.92&nbsp;MB**<br><sup>(49.2 B/item)</sup> | **4.92&nbsp;MB** | **0** | **$O(1)$** when `K` and `V` need no `Drop` |
-| **`artmap::ArenaVersionedArtMap`** | **8.12&nbsp;MB**<br><sup>(81.2 B/item)</sup> | **8.12&nbsp;MB** | **0** | **$O(1)$** when `K` and `V` need no `Drop` |
+| **`artmap::ArenaVersionedArtMap`** | **6.52&nbsp;MB**<br><sup>(65.2 B/item)</sup> | **6.52&nbsp;MB** | **0** | **$O(1)$** when `K` and `V` need no `Drop` |
 | `arenaskiplist::SkipList` | 5.77&nbsp;MB<br><sup>(57.7 B/item)</sup> | 5.77&nbsp;MB | **0** | **$O(1)$ zero-cost reset** |
 | `concread::bptree::BPTree` | 6.69&nbsp;MB<br><sup>(66.9 B/item)</sup> | 7.22&nbsp;MB | 0.52 | $O(N)$ CoW heap drop |
 | `crossbeam_skiplist::SkipMap` | 4.00&nbsp;MB<br><sup>(40.0 B/item)</sup> | 4.00&nbsp;MB | 1.00 | $O(N)$ epoch-deferred reclamation |
@@ -93,14 +93,14 @@ Benchmarked with 100,000 keys (64-bit integer keys and 64-bit values), measuring
 | `vart::Tree` | 27.55&nbsp;MB<br><sup>(275.5 B/item)</sup> | 27.55&nbsp;MB | 1.31 | $O(N)$ recursive Arc drop |
 | `dashmap::DashMap`* | 2.23&nbsp;MB<br><sup>(22.3 B/item)</sup> | 2.24&nbsp;MB | 0.02 | $O(N)$ heap drop |
 | `papaya::HashMap`* | 3.96&nbsp;MB<br><sup>(39.6 B/item)</sup> | 3.96&nbsp;MB | 1.00 | $O(N)$ epoch-deferred reclamation |
-| `scc::HashIndex`* | 2.40&nbsp;MB<br><sup>(24.0 B/item)</sup> | 3.60&nbsp;MB | 0.01 | $O(N)$ epoch-deferred reclamation |
+| `scc::HashIndex`* | 2.40&nbsp;MB<br><sup>(24.0 B/item)</sup> | 3.59&nbsp;MB | 0.01 | $O(N)$ epoch-deferred reclamation |
 | `std::collections::HashMap`* | 2.23&nbsp;MB<br><sup>(22.3 B/item)</sup> | 3.34&nbsp;MB | 0 | $O(N)$ heap drop |
 
-<sup>* For sequential keys (e.g. monotonically increasing timestamps or auto-incrementing IDs), radix prefix compression reduces `ArenaArtMap`'s net size to **3.11 MB** (31.1 B/item) and `ArenaVersionedArtMap` to **6.31 MB** (63.1 B/item).</sup>
+<sup>* For sequential keys (e.g. monotonically increasing timestamps or auto-incrementing IDs), radix prefix compression reduces `ArenaArtMap`'s net size to **3.11 MB** (31.1 B/item) and `ArenaVersionedArtMap` to **4.71 MB** (47.1 B/item).</sup>
 
-- **Point reads**: radix path resolution in `ArenaArtMap` completes random point lookups in **13.8 ns**, against **182 ns** for `arenaskiplist` and **165 ns** for `crossbeam-skiplist::SkipMap`.
-- **Concurrent writes**: 8 threads insert 100,000 keys into `ArenaArtMap` in **1.74 ms** (57.6M ops/s), against **2.99 ms** for `scc::HashIndex`, **3.35 ms** for `dashmap` and **10.47 ms** for `crossbeam-skiplist::SkipMap`.
-- **Range scans**: bitmapped child navigation on `Node48` and `Node256` scans 100 contiguous items in **840 ns** in `ArenaArtMap`, level with `arenaskiplist` (**808 ns**) and 2.8× faster than `crossbeam-skiplist::SkipMap` (**2.38 µs**). `scan(range, callback)` skips the per-entry handle.
+- **Point reads**: radix path resolution in `ArenaArtMap` completes random point lookups in **13.4 ns**, against **181 ns** for `arenaskiplist` and **160 ns** for `crossbeam-skiplist::SkipMap`.
+- **Concurrent writes**: 8 threads insert 100,000 keys into `ArenaArtMap` in **1.76 ms** (56.8M ops/s), against **3.00 ms** for `scc::HashIndex`, **3.37 ms** for `dashmap` and **10.1 ms** for `crossbeam-skiplist::SkipMap`.
+- **Range scans**: bitmapped child navigation on `Node48` and `Node256` scans 100 contiguous items in **574 ns** in `ArenaArtMap`, against **809 ns** for `arenaskiplist` and **2.39 µs** for `crossbeam-skiplist::SkipMap`. `scan(range, callback)` skips the per-entry handle.
 - **No per-insert heap allocations** in the arena maps, and an $O(1)$ drop when `K` and `V` need no `Drop`.
 
 ## Features
