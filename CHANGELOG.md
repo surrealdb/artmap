@@ -88,12 +88,12 @@ For the old `insert` behaviour when `V: Clone`, use `insert_cloned(k, v) -> Opti
 - The `Node256` lock-free insert path is removed. All inserts take the node latch.
 
 ### Performance
-Compared with 0.5.0 on an AMD Threadripper 9970X:
-- 8-thread writes are 30–49% faster, and mixed 4R+4W workloads 14–29% faster. The live-key count is striped by thread, so writers no longer contend on one cache line.
+Compared with 0.5.0 on an AMD Threadripper 9970X (runs on either side of a reboot, so differences within about 10% are noise):
+- 8-thread writes are 35–50% faster, and mixed 4R+4W workloads 17–28% faster. The live-key count is striped by thread, so writers no longer contend on one cache line.
 - Point gets are within about 10%.
-- 100-item range scans are slower: about 30% for the arena maps, 72% for `ArtMap` and about 3× for `VersionedArtMap`. `scan(range, callback)` avoids the per-entry handle.
+- 100-item range scans are level for the arena maps (−10% to 0%), 18% slower for `ArtMap` and 32% slower for `VersionedArtMap`. `scan(range, callback)` avoids the per-entry handle.
 - Single-threaded inserts are within about 15%. Arena inserts now pay their page faults as they touch memory, because creating an arena no longer zeroes it up front: `with_capacity(256 MiB)` takes microseconds instead of tens of milliseconds.
-- Memory per key is unchanged for `ArtMap` and `ArenaArtMap`. It is about 7% higher for `VersionedArtMap` and 24% higher for `ArenaVersionedArtMap`.
+- Memory per key is unchanged for `ArtMap`, `ArenaArtMap` and `ArenaVersionedArtMap`, and 14% lower for `VersionedArtMap`: version flags live in the low bits of the chain link, and the chain latch is one byte.
 - Overwrites are 45–55% slower (measured on aarch64), because each allocates a new leaf and retires the old one through EBR.
 
 See `benches/comparison_bench.rs`, `benches/safety_bench.rs` and `benches/memory_bench.rs`.
