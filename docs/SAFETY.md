@@ -66,9 +66,10 @@ flushes or repins while holding a latch. Discarded keys and values are dropped
 after unlocking. Latch guards are RAII.
 
 **Inv 7 — Structural moves, obsolescence and lock order.** An operation that
-detaches a node (growth, `clear`) or changes its absolute key path (prefix
-split) holds that node's latch and bumps or obsoletes its version before the
-parent's latch is released. `OBSOLETE` is set only on nodes already unlinked.
+detaches a node (growth, compaction, `clear`) or changes its depth or absolute
+key path (prefix split, merge) holds that node's latch and bumps or obsoletes
+its version before the parent's latch is released. `OBSOLETE` is set only on
+nodes already unlinked.
 The lock order is `root_latch` → parent → child → `chain_latch`. Parents and
 `root_latch` are taken with a blocking `lock()` while holding nothing,
 followed by a pointer re-check; nodes below a held latch are taken only by a
@@ -156,6 +157,9 @@ displaced objects. Retries reuse prepared nodes.
 disarms it, so a discarded leaf is freed after the install returns, outside
 any latch, and after the last use of the key bytes derived from it.
 
+§9.4 `remove`: as above, locking only the leaf's node `N` when it keeps two or
+more entries; otherwise it compacts `N` in the same critical section (§13).
+
 §9.8 `clear()`: swap the root under `root_latch`, then walk the detached tree
 holding one node latch at a time, marking each node obsolete, retiring nodes
 and leaves individually, and subtracting the number of leaves found.
@@ -189,3 +193,41 @@ drop every key and value exactly once when dropped: the live tree, the
 version chains, and a retired list of every leaf or version node unlinked
 while the map was alive. Allocation happens only in prepare phases; a failed
 allocation releases every latch and returns the caller's key and value.
+
+## §13 Delete-side compaction
+
+A remove that would leave its leaf's node `N` with at most one entry compacts
+`N` in the same critical section. If nothing is left, `N` is unlinked from its
+parent `P`. If one leaf is left, that leaf takes `N`'s place in `P`. If one
+inner child `C` is left, `N` is merged into `C` in place: `C`'s prefix becomes
+`N.prefix + byte + C.prefix` and `C` takes `N`'s place. The merge happens only
+if that prefix fits in `MAX_PREFIX_LEN`; when it does not, or when `C` is
+contended, the merge is declined and `N` keeps its single child.
+
+- **Order.** `P` (or `root_latch`) by blocking `lock()` while holding nothing,
+  then a re-check that it still points at `N`; `N` by `try_upgrade(v_N)`,
+  restarting on failure; `C` by `try_upgrade` of a version read while holding
+  `N`, declining the merge on failure. This is the grow and split order.
+- **Commit.** Publish in `P`; for a merge, rewrite `C`'s prefix under `C`'s
+  latch, whose unlock bumps its version; account `len` (Inv 12); mark `N`
+  obsolete; then release `P`. `N`'s slots are not cleared: whoever is still
+  inside `N` fails its next validation or upgrade. `N` is retired after `P` is
+  released.
+- **Follow-up.** If the commit leaves `P` empty or holding a single leaf, the
+  remover releases every latch and compacts `P` as a new top-down operation:
+  it descends from the root along the removed key, then works upwards, taking
+  each parent by `lock()` and a pointer re-check and each node by `try_upgrade`
+  of the version its previous step unlocked it at. Any failure restarts the
+  descent. At most two latches are held at a time. Follow-ups never merge.
+- **No allocation.** Compaction only unlinks and rewrites, so a remove never
+  fails. The arena maps compact too; an unlinked node's bytes stay in the
+  arena, like a replaced leaf's.
+- **Correctness does not depend on it.** An empty node, a node holding one
+  leaf, and a leaf in a shallower slot than it needs are all states that
+  readers, writers and the cursor handle. At quiescence, `validate` asserts
+  that no inner node is empty or holds a single leaf, and that no
+  `prefix_len` exceeds `MAX_PREFIX_LEN`. A node with a single inner child is
+  allowed: prefix chains are built that way, and merges can be declined.
+
+The versioned maps never unlink a leaf (a delete is a tombstone), so their
+nodes are never emptied and this section does not apply to them.

@@ -228,6 +228,126 @@ fn fresh_inserts_and_removes_are_exact_during_prefix_splits() {
     map.validate_invariants();
 }
 
+/// Key families whose nodes delete-side compaction reshapes (§13). Sentinels
+/// are never removed; removing the churn keys next to them collapses a node
+/// into its last leaf ('a'), merges a node into its only child ('b'),
+/// collapses a prefix chain and follows up through it ('c'), or empties a
+/// whole subtree ('d'). Re-inserting them rebuilds each shape.
+fn compaction_family(group: u8) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let chain = |last: u8| {
+        let mut k = vec![group, b'c'];
+        k.extend_from_slice(&[b'-'; 30]);
+        k.push(last);
+        k
+    };
+    let sentinels = vec![
+        vec![group, b'a', b's'],
+        vec![group, b'b', b'x', b'1'],
+        vec![group, b'b', b'x', b'2'],
+        chain(1),
+    ];
+    let mut churn = vec![vec![group, b'a', b'c'], vec![group, b'b', b'y'], chain(2)];
+    churn.extend((0..6).map(|i| vec![group, b'd', i]));
+    (sentinels, churn)
+}
+
+#[test]
+fn compaction_churn_never_hides_a_sentinel() {
+    // Writers toggle the churn keys, so nodes collapse, merge and are rebuilt
+    // around the sentinels, while readers look every sentinel up and scan
+    // them in both directions.
+    const GROUPS: u8 = 6;
+    let map = Arc::new(ArtMap::<Vec<u8>, u64>::new());
+    let mut sentinels = Vec::new();
+    let mut churn = Vec::new();
+    for g in 0..GROUPS {
+        let (s, c) = compaction_family(g);
+        sentinels.extend(s);
+        churn.extend(c);
+    }
+    sentinels.sort();
+    for k in sentinels.iter().chain(&churn) {
+        map.insert(k.clone(), 0);
+    }
+    let (sentinels, churn) = (Arc::new(sentinels), Arc::new(churn));
+    let m = Arc::clone(&map);
+    let s = Arc::clone(&sentinels);
+    run(threads(), move |t, stop| {
+        let mut rng = StdRng::seed_from_u64(700 + t as u64);
+        let is_sentinel = |k: &Vec<u8>| s.binary_search(k).is_ok();
+        while !stop.load(Ordering::Relaxed) {
+            if t % 2 == 0 {
+                let k = &churn[rng.gen_range(0..churn.len())];
+                if rng.gen() {
+                    m.insert(k.clone(), 1);
+                } else {
+                    m.remove(k);
+                }
+            } else {
+                for k in s.iter() {
+                    assert!(m.get(k).is_some(), "sentinel {k:?} missed by get");
+                }
+                let fwd: Vec<Vec<u8>> = m
+                    .iter()
+                    .map(|e| e.key().clone())
+                    .filter(is_sentinel)
+                    .collect();
+                assert_eq!(&fwd, &*s, "every sentinel exactly once, in order");
+                let mut rev: Vec<Vec<u8>> = m
+                    .iter()
+                    .rev()
+                    .map(|e| e.key().clone())
+                    .filter(is_sentinel)
+                    .collect();
+                rev.reverse();
+                assert_eq!(&rev, &*s, "every sentinel exactly once, reversed");
+                let g = rng.gen_range(0..GROUPS);
+                let got = m
+                    .range(vec![g]..vec![g + 1])
+                    .filter(|e| is_sentinel(e.key()))
+                    .count();
+                assert_eq!(got, 4, "a group's range sees its sentinels");
+            }
+        }
+    });
+    let mut map = Arc::try_unwrap(map).ok().unwrap();
+    assert_eq!(map.len(), map.iter().count());
+    // No node is left empty or holding a single leaf.
+    map.validate_invariants();
+}
+
+#[test]
+fn sliding_windows_on_every_thread_stay_compact() {
+    // Queue-style use: each thread appends keys under its own prefix and
+    // removes them a window later, so every node it fills is later emptied.
+    let n = threads();
+    let map = Arc::new(ArtMap::<Vec<u8>, u64>::new());
+    let m = Arc::clone(&map);
+    let totals = Arc::new(AtomicUsize::new(0));
+    let tot = Arc::clone(&totals);
+    run(n, move |t, stop| {
+        let window = 1 + 17 * t as u64;
+        let k = |i: u64| {
+            let mut k = format!("queue:{t}:").into_bytes();
+            k.extend_from_slice(&i.to_be_bytes());
+            k
+        };
+        let mut i = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+            assert!(m.insert(k(i), i).is_none());
+            if i >= window {
+                assert_eq!(m.remove(&k(i - window)).map(|e| *e), Some(i - window));
+            }
+            assert_eq!(m.get(&k(i)).map(|e| *e), Some(i));
+            i += 1;
+        }
+        tot.fetch_add(i.min(window) as usize, Ordering::Relaxed);
+    });
+    let mut map = Arc::try_unwrap(map).ok().unwrap();
+    assert_eq!(map.len(), totals.load(Ordering::Relaxed));
+    map.validate_invariants();
+}
+
 #[test]
 fn clear_against_writers_keeps_len_exact() {
     let map = Arc::new(ArtMap::<[u8; 8], u64>::new());

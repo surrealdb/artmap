@@ -106,6 +106,7 @@ Benchmarked with 100,000 keys (64-bit integer keys and 64-bit values), measuring
 ## Features
 
 - **Adaptive Radix Tree**: inner nodes resize between four layouts (`Node4`, `Node16`, `Node48` and `Node256`) for cache locality. Prefix compression collapses single-child paths.
+- **Delete-side compaction**: removes unlink the inner nodes they empty, so memory follows the live keys under delete churn.
 - **Optimistic lock coupling**: readers validate per-node version counters and retry on conflict. They never block and never write to shared memory.
 - **MVCC**: per-key chains of 64-bit versions with snapshot reads, tombstones and pruning.
 - **SIMD `Node16` search**: SSE2 on x86_64 and NEON on aarch64.
@@ -315,16 +316,27 @@ for i in 0..1000 {
 assert_eq!(map.len(), 1001);
 ```
 
-The arena's capacity is fixed. Updates and removes do not free arena memory: replaced leaves and versions stay in the arena until the map is dropped. When `K` and `V` need `Drop`, dropping the map runs their destructors; otherwise it is $O(1)$. `Arena::reset` needs exclusive access, so it can only run once no map is using the arena.
+The arena's capacity is fixed. Updates and removes do not free arena memory: replaced leaves and versions, and inner nodes that removes unlink, stay in the arena until the map is dropped. When `K` and `V` need `Drop`, dropping the map runs their destructors; otherwise it is $O(1)$. `Arena::reset` needs exclusive access, so it can only run once no map is using the arena.
 
 ## Memory retention
 
-Removed and replaced **entries** are reclaimed: once no guard can still see them in the EBR maps, or when the map is dropped in the arena maps. **Inner nodes are not yet reclaimed on delete.** A node emptied by removes stays in the tree until `clear()` or drop, so a workload that keeps deleting and inserting keys under ever-new prefixes grows. Delete-side compaction is planned for a release after 0.6.
+Removed and replaced entries are reclaimed once no guard can still see them in the EBR maps, and when the map is dropped in the arena maps.
+
+Removes also compact the tree. A node that a remove leaves empty is unlinked; a node left with a single leaf is replaced by that leaf; and a node left with a single inner child is merged into it, when their two prefixes fit in one node. So `ArtMap`'s memory follows its live keys, which matters for queues and registries whose keys keep changing:
+
+| After 2M inserts and 2M − 1,000 removes (1,000 live keys) | 0.6.0 | With compaction |
+| :--- | ---: | ---: |
+| `ArtMap<[u8; 8], u64>` used as a queue | 16.7 MB | 49 KB |
+
+Nodes are not shrunk to a smaller layout as they lose children: a `Node256` left with a few children keeps its size until it is down to one.
+
+- **Arena maps** compact too, so scans never walk dead nodes, but arena memory is only freed when the map is dropped.
+- **Versioned maps** never unlink a key: `delete` writes a tombstone and `prune_key` keeps the key, so a deleted key keeps its leaf and a tombstone, and their nodes are never emptied.
 
 ## Verification
 
 - **Miri**, under Tree Borrows: the EBR suites, and the arena suites leak-checked with strict provenance and symbolic alignment checks, on x86_64 and aarch64.
-- **loom** models of the real latch and node protocol, with mutants that must fail: a missing writer fence, a missing validation fence, and missing lock coupling.
+- **loom** models of the real latch and node protocol, including delete-side compaction against lookups, inserts, cached-node inserts and `clear`. Each protocol has mutants that must fail: a missing writer fence, a missing validation fence, missing lock coupling, a node unlinked without its own latch, and a merge that does not bump the merged node's version.
 - **ThreadSanitizer and AddressSanitizer** over the race and stress tests.
 - **Model tests** of every map and iterator against `BTreeMap`. Property tests over arbitrary byte keys, and a linearizability checker for point operations and `clear`.
 - **Fault injection**: panicking `AsBytes`, `Clone` and closures, and re-entrant user code, at every call site.

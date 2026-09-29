@@ -29,6 +29,8 @@
 //!
 //! A failed upgrade or re-check retries from the root. There is no lock-free
 //! insert path (Inv 8, §9.9): every publication happens under the owning latch.
+//!
+//! Removes, and the compaction they trigger, are in [`remove`](super::remove).
 
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
@@ -53,21 +55,35 @@ pub(crate) struct Hint<R> {
 
 /// Where the parent of the node being modified keeps it.
 #[derive(Copy, Clone)]
-enum Parent<R> {
+pub(super) enum Parent<R> {
     Root,
     Node { raw: R, version: u64, byte: u8 },
 }
 
 /// A held parent latch, re-checked to still point at the child.
-enum ParentGuard<'t, A> {
+pub(super) enum ParentGuard<'t, A> {
     Root(WriteGuard<'t>),
     Node(&'t NodeHeader<A>, WriteGuard<'t>, u8),
+}
+
+impl<A> ParentGuard<'_, A> {
+    /// Releases the latch. For a node parent, returns its new version, so a
+    /// follow-up can upgrade it without a re-descent (§13 3a).
+    pub(super) fn unlock(self) -> Option<u64> {
+        match self {
+            ParentGuard::Root(w) => {
+                drop(w);
+                None
+            }
+            ParentGuard::Node(_, w, _) => Some(w.unlock()),
+        }
+    }
 }
 
 impl<S: Storage> RawTree<S> {
     /// Acquires the latch that owns the pointer to `child` (Inv 7): blocking,
     /// while holding nothing, followed by a pointer re-check.
-    fn lock_parent(
+    pub(super) fn lock_parent(
         &self,
         parent: Parent<Raw<S>>,
         child: Raw<S>,
@@ -88,10 +104,18 @@ impl<S: Storage> RawTree<S> {
     }
 
     /// Publishes `new` in place of the child the parent guard protects.
-    fn publish_in_parent(&self, pg: &ParentGuard<'_, S::Atomic>, new: Raw<S>) {
+    pub(super) fn publish_in_parent(&self, pg: &ParentGuard<'_, S::Atomic>, new: Raw<S>) {
         match pg {
             ParentGuard::Root(w) => self.set_root(w, new),
             ParentGuard::Node(p, w, byte) => p.replace_child(w, *byte, new),
+        }
+    }
+
+    /// Removes the child the parent guard protects (§13).
+    pub(super) fn unlink_in_parent(&self, pg: &ParentGuard<'_, S::Atomic>) {
+        match pg {
+            ParentGuard::Root(w) => self.set_root(w, Raw::<S>::NULL),
+            ParentGuard::Node(p, w, byte) => p.remove_child(w, *byte),
         }
     }
 
@@ -495,7 +519,7 @@ impl<S: Storage> RawTree<S> {
     /// R4 coupling check after reading a child's version: the parent is
     /// unchanged, or (at the root) `root` still points at the child.
     #[inline]
-    fn still_parent(&self, parent: Parent<Raw<S>>, child: Raw<S>) -> bool {
+    pub(super) fn still_parent(&self, parent: Parent<Raw<S>>, child: Raw<S>) -> bool {
         match parent {
             Parent::Root => self.root() == child,
             Parent::Node { raw, version, .. } => {
@@ -506,13 +530,13 @@ impl<S: Storage> RawTree<S> {
     }
 
     #[inline]
-    fn storage_leaf(&self, raw: Raw<S>) -> NonNull<S::Leaf> {
+    pub(super) fn storage_leaf(&self, raw: Raw<S>) -> NonNull<S::Leaf> {
         // SAFETY: `raw` is a protected leaf slot value of this tree.
         unsafe { self.storage.leaf(raw) }
     }
 
     #[inline]
-    fn node_ptr(&self, raw: Raw<S>) -> NodePtr<S> {
+    pub(super) fn node_ptr(&self, raw: Raw<S>) -> NodePtr<S> {
         // SAFETY: `raw` is a protected inner-node slot value of this tree.
         unsafe { self.storage.node(raw) }
     }
@@ -561,134 +585,5 @@ impl<S: Storage> RawTree<S> {
             below = self.storage.node_raw(n);
         }
         Ok((below, bottom))
-    }
-
-    /// Removes the leaf for `key`, if `matches` accepts it. Returns it
-    /// unlinked, marked removed and already retired (§9.4).
-    ///
-    /// `matches` runs before any latch: it compares keys (user code) for
-    /// `remove`, or pointer identity for `remove_leaf`.
-    pub(crate) fn remove(
-        &self,
-        key: &[u8],
-        matches: impl Fn(NonNull<S::Leaf>) -> bool,
-        guard: &S::Guard,
-    ) -> Option<NonNull<S::Leaf>> {
-        let mut backoff = SpinBackoff::new();
-        'retry: loop {
-            let root = self.root();
-            if root.is_null() {
-                return None;
-            }
-            if root.is_leaf() {
-                let leaf = self.storage_leaf(root);
-                if !matches(leaf) {
-                    return None;
-                }
-                let Some(w) = self.root_latch.lock() else {
-                    unreachable!("root latch is never obsolete")
-                };
-                if self.root() != root {
-                    drop(w);
-                    continue 'retry;
-                }
-                let bomb = AbortOnUnwind;
-                self.set_root(&w, Raw::<S>::NULL);
-                // SAFETY: protected leaf read from `root`.
-                unsafe { leaf.as_ref() }.mark_removed();
-                self.len_add(-1);
-                bomb.defuse();
-                drop(w);
-                // SAFETY: unlinked under `root_latch` and marked.
-                unsafe { self.storage.retire_leaf(leaf, guard) };
-                return Some(leaf);
-            }
-
-            let mut parent = Parent::Root;
-            let mut node_raw = root;
-            let mut depth = 0usize;
-            loop {
-                // SAFETY: protected inner node read from the tree.
-                let node = unsafe { self.node_ref(node_raw) };
-                let Some(v) = node.latch.read_version() else {
-                    backoff.spin();
-                    continue 'retry;
-                };
-                if !self.still_parent(parent, node_raw) {
-                    continue 'retry;
-                }
-                let prefix = node.load_prefix();
-                let rest = key.get(depth..).unwrap_or(&[]);
-                if !prefix.is_prefix_of(rest) {
-                    if !node.latch.validate(v) {
-                        continue 'retry;
-                    }
-                    return None;
-                }
-                let node_depth = depth + prefix.len;
-                if node_depth == key.len() {
-                    let exact = node.exact_leaf();
-                    if !node.latch.validate(v) {
-                        continue 'retry;
-                    }
-                    if exact.is_null() {
-                        return None;
-                    }
-                    let leaf = self.storage_leaf(exact);
-                    if !matches(leaf) {
-                        return None;
-                    }
-                    let Some(nw) = node.latch.try_upgrade(v) else {
-                        backoff.spin();
-                        continue 'retry;
-                    };
-                    let bomb = AbortOnUnwind;
-                    node.set_exact_leaf(&nw, Raw::<S>::NULL);
-                    // SAFETY: protected leaf read from a validated slot.
-                    unsafe { leaf.as_ref() }.mark_removed();
-                    self.len_add(-1);
-                    bomb.defuse();
-                    drop(nw);
-                    // SAFETY: unlinked under the node latch and marked.
-                    unsafe { self.storage.retire_leaf(leaf, guard) };
-                    return Some(leaf);
-                }
-                let byte = key[node_depth];
-                let child = node.find_child(byte);
-                if let Some(c) = child.filter(|c| !c.is_leaf()) {
-                    // Coupled at the next level (R4).
-                    parent = Parent::Node {
-                        raw: node_raw,
-                        version: v,
-                        byte,
-                    };
-                    node_raw = c;
-                    depth = node_depth + 1;
-                    continue;
-                }
-                if !node.latch.validate(v) {
-                    continue 'retry;
-                }
-                // A leaf child (inner children were descended above).
-                let leaf = self.storage_leaf(child?);
-                if !matches(leaf) {
-                    return None;
-                }
-                let Some(nw) = node.latch.try_upgrade(v) else {
-                    backoff.spin();
-                    continue 'retry;
-                };
-                let bomb = AbortOnUnwind;
-                node.remove_child(&nw, byte);
-                // SAFETY: protected leaf read from a validated slot.
-                unsafe { leaf.as_ref() }.mark_removed();
-                self.len_add(-1);
-                bomb.defuse();
-                drop(nw);
-                // SAFETY: unlinked under the node latch and marked.
-                unsafe { self.storage.retire_leaf(leaf, guard) };
-                return Some(leaf);
-            }
-        }
     }
 }

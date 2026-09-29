@@ -116,6 +116,63 @@ fn bench_churn(c: &mut Criterion) {
             black_box(map.insert(k, i as u64).is_some());
         });
     });
+    // Keys in pairs under their own Node4: every remove collapses the pair's
+    // node into the other leaf, and every re-insert splits it again. The
+    // worst case for delete-side compaction.
+    group.bench_function("1t_pairs", |b| {
+        let map = ArtMap::<[u8; 8], u64>::new();
+        for i in 0..N {
+            let _ = map.insert(((i / 2) << 8 | (i % 2)).to_be_bytes(), i);
+        }
+        let keys: Vec<[u8; 8]> = random_keys(4096, 3)
+            .into_iter()
+            .map(|k| {
+                let i = u64::from_be_bytes(k);
+                ((i / 2) << 8 | (i % 2)).to_be_bytes()
+            })
+            .collect();
+        let mut i = 0usize;
+        b.iter(|| {
+            let k = keys[i & 4095];
+            i += 1;
+            black_box(map.remove(&k).is_some());
+            black_box(map.insert(k, i as u64).is_some());
+        });
+    });
+    group.finish();
+
+    // A queue: append one key and remove the oldest, 1,000 keys apart.
+    let mut group = c.benchmark_group("queue");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("push_pop", |b| {
+        let map = ArtMap::<[u8; 8], u64>::new();
+        let mut i = 0u64;
+        b.iter(|| {
+            let _ = map.insert(i.to_be_bytes(), i);
+            if i >= 1_000 {
+                black_box(map.remove(&(i - 1_000).to_be_bytes()).is_some());
+            }
+            i += 1;
+        });
+    });
+    // Scanning the 1,000 live keys of a queue that has seen 1M pushes.
+    group.bench_function("scan_after_1m", |b| {
+        let map = ArtMap::<[u8; 8], u64>::new();
+        for i in 0..1_000_000u64 {
+            let _ = map.insert(i.to_be_bytes(), i);
+            if i >= 1_000 {
+                let _ = map.remove(&(i - 1_000).to_be_bytes());
+            }
+        }
+        b.iter(|| {
+            let mut n = 0u64;
+            map.scan::<_, [u8; 8], _>(.., |_, v| {
+                n += *v;
+                true
+            });
+            black_box(n)
+        });
+    });
     group.finish();
 }
 

@@ -581,3 +581,164 @@ fn contended_inserts_stay_within_max_insert_bytes() {
         "{vused} bytes for {inserts} inserts (bound {vbound})"
     );
 }
+
+/// Key families whose nodes delete-side compaction reshapes (§13); see
+/// `tests/concurrent_correctness.rs`.
+fn compaction_family(group: u8) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let chain = |last: u8| {
+        let mut k = vec![group, b'c'];
+        k.extend_from_slice(&[b'-'; 30]);
+        k.push(last);
+        k
+    };
+    let sentinels = vec![
+        vec![group, b'a', b's'],
+        vec![group, b'b', b'x', b'1'],
+        vec![group, b'b', b'x', b'2'],
+        chain(1),
+    ];
+    let mut churn = vec![vec![group, b'a', b'c'], vec![group, b'b', b'y'], chain(2)];
+    churn.extend((0..6).map(|i| vec![group, b'd', i]));
+    (sentinels, churn)
+}
+
+#[test]
+fn removes_compact_without_allocating() {
+    // [core-write-5] Every compaction (collapse into a leaf, merge into a
+    // child, a prefix chain's follow-up, an emptied subtree) only unlinks.
+    let mut m = ArenaArtMap::<Vec<u8>, u64>::with_capacity(1 << 20);
+    let (sentinels, churn) = compaction_family(0);
+    for k in sentinels.iter().chain(&churn) {
+        m.insert(k.clone(), 0);
+    }
+    let before = m.arena().remaining();
+    for k in &churn {
+        assert!(m.remove(&k[..]).is_some());
+    }
+    assert_eq!(m.arena().remaining(), before, "a remove allocated");
+    let keys: Vec<Vec<u8>> = m.iter().map(|e| e.key().clone()).collect();
+    assert_eq!(keys, sentinels);
+    m.validate_invariants();
+    // The compacted shapes take inserts again.
+    for k in &churn {
+        assert!(m.insert(k.clone(), 1).is_none());
+    }
+    assert_eq!(m.len(), sentinels.len() + churn.len());
+    m.validate_invariants();
+}
+
+#[test]
+fn an_inserter_whose_node_is_compacted_falls_back() {
+    // §12.4: the cached node is unlinked (obsolete) or merged (its version
+    // bumped), so the fast path fails and the full insert places the key.
+    let mut m = ArenaArtMap::<Vec<u8>, u64>::with_capacity(1 << 20);
+    {
+        let mut ins = m.inserter();
+        ins.insert(b"q".to_vec(), 9);
+        ins.insert(b"k0".to_vec(), 0);
+        ins.insert(b"k1".to_vec(), 1);
+        // The cached node {0, 1} collapses into its last leaf.
+        assert!(m.remove(&b"k0"[..]).is_some());
+        ins.insert(b"k2".to_vec(), 2);
+        assert!(m.remove(&b"k1"[..]).is_some());
+        ins.insert(b"k3".to_vec(), 3);
+        // A merge: the cached node {x: {1, 2}, y} merges into its child.
+        ins.insert(b"kx1".to_vec(), 4);
+        ins.insert(b"kx2".to_vec(), 5);
+        assert!(m.remove(&b"k2"[..]).is_some());
+        assert!(m.remove(&b"k3"[..]).is_some());
+        ins.insert(b"kx3".to_vec(), 6);
+    }
+    let got: Vec<(Vec<u8>, u64)> = m.iter().map(|e| (e.key().clone(), *e.value())).collect();
+    assert_eq!(
+        got,
+        [
+            (b"kx1".to_vec(), 4),
+            (b"kx2".to_vec(), 5),
+            (b"kx3".to_vec(), 6),
+            (b"q".to_vec(), 9)
+        ]
+    );
+    m.validate_invariants();
+}
+
+#[test]
+fn concurrent_compaction_keeps_every_sentinel() {
+    // Writers toggle churn keys (inserting through a cached inserter), so
+    // nodes collapse, merge and are rebuilt under the readers.
+    const GROUPS: u8 = 4;
+    let map = Arc::new(ArenaArtMap::<Vec<u8>, u64>::with_capacity(64 << 20));
+    let mut sentinels = Vec::new();
+    let mut churn = Vec::new();
+    for g in 0..GROUPS {
+        let (s, c) = compaction_family(g);
+        sentinels.extend(s);
+        churn.extend(c);
+    }
+    sentinels.sort();
+    for k in sentinels.iter().chain(&churn) {
+        map.insert(k.clone(), 0);
+    }
+    let (sentinels, churn) = (Arc::new(sentinels), Arc::new(churn));
+    let writers_left = Arc::new(AtomicUsize::new(2));
+    let barrier = Arc::new(Barrier::new(4));
+    let handles: Vec<_> = (0..4u64)
+        .map(|t| {
+            let (m, s, c) = (Arc::clone(&map), Arc::clone(&sentinels), Arc::clone(&churn));
+            let (left, barrier) = (Arc::clone(&writers_left), Arc::clone(&barrier));
+            std::thread::spawn(move || {
+                barrier.wait();
+                let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ t;
+                let mut next = move || {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x
+                };
+                if t < 2 {
+                    let mut ins = m.inserter();
+                    for i in 0..n(20_000, 60) as u64 {
+                        let k = &c[next() as usize % c.len()];
+                        if next() % 2 == 0 {
+                            ins.insert(k.clone(), i);
+                        } else {
+                            m.remove(&k[..]);
+                        }
+                    }
+                    left.fetch_sub(1, Ordering::Release);
+                } else {
+                    let is_sentinel = |k: &Vec<u8>| s.binary_search(k).is_ok();
+                    loop {
+                        let done = left.load(Ordering::Acquire) == 0;
+                        for k in s.iter() {
+                            assert!(m.contains_key(&k[..]), "sentinel {k:?} missed");
+                        }
+                        let fwd: Vec<Vec<u8>> = m
+                            .iter()
+                            .map(|e| e.key().clone())
+                            .filter(is_sentinel)
+                            .collect();
+                        assert_eq!(&fwd, &*s, "every sentinel exactly once, in order");
+                        let mut rev: Vec<Vec<u8>> = m
+                            .iter()
+                            .rev()
+                            .map(|e| e.key().clone())
+                            .filter(is_sentinel)
+                            .collect();
+                        rev.reverse();
+                        assert_eq!(&rev, &*s, "every sentinel exactly once, reversed");
+                        if done {
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let mut map = Arc::try_unwrap(map).ok().unwrap();
+    assert_eq!(map.len(), map.iter().count());
+    map.validate_invariants();
+}

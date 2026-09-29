@@ -195,6 +195,78 @@ fn deep_keys_do_not_overflow_the_stack() {
 }
 
 #[test]
+fn deep_chains_collapse_when_their_keys_are_removed() {
+    // [core-write-5] Two keys sharing 1 MiB build a chain of ~60k Node4s.
+    // Removing one collapses the whole chain, iteratively (Inv 13) and in one
+    // pass up it: a re-descent per link would take minutes.
+    let prefix = if cfg!(miri) { 2_000 } else { 1 << 20 };
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            let mut m = ArtMap::<Vec<u8>, u32>::new();
+            let key = |last: u8| {
+                let mut k = vec![7u8; prefix];
+                k.push(last);
+                k
+            };
+            m.insert(key(1), 1);
+            m.insert(key(2), 2);
+            m.insert(vec![7u8; prefix / 2], 3);
+            let start = std::time::Instant::now();
+            assert_eq!(m.remove(&key(1)[..]).as_deref(), Some(&1));
+            assert_eq!(m.remove(&vec![7u8; prefix / 2][..]).as_deref(), Some(&3));
+            if !cfg!(miri) {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(10),
+                    "collapsing a chain took {:?}",
+                    start.elapsed()
+                );
+            }
+            assert_eq!(m.get(&key(2)[..]).as_deref(), Some(&2));
+            m.validate_invariants();
+            assert_eq!(m.remove(&key(2)[..]).as_deref(), Some(&2));
+            assert!(m.is_empty());
+            m.validate_invariants();
+            m.insert(key(1), 1);
+            assert_eq!(m.iter().count(), 1);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn a_registry_emptied_by_removes_is_compact() {
+    // [core-write-5] Removes left every emptied inner node in the tree.
+    let mut m = ArtMap::<Vec<u8>, u64>::new();
+    let keys: Vec<Vec<u8>> = (0..n(5_000, 200) as u64)
+        .map(|i| {
+            let h = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            format!("registry:{}:{h:x}", h % 13).into_bytes()
+        })
+        .collect();
+    for (i, k) in keys.iter().enumerate() {
+        m.insert(k.clone(), i as u64);
+    }
+    // Remove every other key, then the rest in reverse.
+    for k in keys.iter().step_by(2) {
+        assert!(m.remove(&k[..]).is_some());
+    }
+    m.validate_invariants();
+    for k in keys.iter().skip(1).step_by(2).rev() {
+        assert!(m.remove(&k[..]).is_some());
+    }
+    assert!(m.is_empty());
+    assert!(m.iter().next().is_none());
+    m.validate_invariants();
+    for k in &keys {
+        m.insert(k.clone(), 0);
+    }
+    assert_eq!(m.len(), keys.len());
+    m.validate_invariants();
+}
+
+#[test]
 fn inserting_existing_keys_frees_the_discarded_leaf_safely() {
     // [core-write-7, robustness-9] The new leaf was freed while key bytes
     // derived from it were still a protected argument (Miri UAF).

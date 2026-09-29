@@ -19,7 +19,7 @@
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
 use crate::latch::AbortOnUnwind;
-use crate::raw::node::MAX_PREFIX_LEN;
+use crate::raw::node::{Rest, Taken, MAX_PREFIX_LEN};
 use crate::raw::slot::{AtomicSlot, Slot};
 use crate::raw::{Layout, LeafNode, Raw, RawTree, Storage};
 
@@ -130,6 +130,10 @@ impl<S: Storage> RawTree<S> {
 
     /// Checks the structural invariants of a quiescent tree and returns the
     /// number of reachable leaves. Panics on a violation.
+    ///
+    /// Includes delete-side compaction (§13): no inner node is empty or holds
+    /// a single leaf. A node with a single inner child is allowed: prefix
+    /// chains are built that way, and a merge can be declined.
     pub(crate) fn validate(&mut self) -> usize {
         let root = self.root();
         let mut count = 0usize;
@@ -161,8 +165,17 @@ impl<S: Storage> RawTree<S> {
                 node.latch.read_version().is_some(),
                 "a node is locked at quiescence"
             );
+            // The unclamped length: `load_prefix` would hide an overlong one.
+            assert!(
+                node.raw_prefix_len() <= MAX_PREFIX_LEN,
+                "prefix_len exceeds MAX_PREFIX_LEN"
+            );
+            match node.rest(Taken::Nothing) {
+                Rest::Empty => panic!("an inner node is empty (compaction missed it)"),
+                Rest::Leaf(_) => panic!("an inner node holds a single leaf (compaction missed it)"),
+                Rest::Inner(..) | Rest::Many => {}
+            }
             let prefix = node.load_prefix();
-            assert!(prefix.len <= MAX_PREFIX_LEN);
             path.extend_from_slice(prefix.as_slice());
             let exact = node.exact_leaf();
             if !exact.is_null() {
