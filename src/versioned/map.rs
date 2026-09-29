@@ -35,7 +35,8 @@ use crate::versioned::tree::{chain, find_le, VersionedTree};
 /// ## Semantics
 ///
 /// - `len()` is the number of keys whose newest version is live (not a
-///   tombstone). It is exact when no operation is in flight.
+///   tombstone). It is exact when no operation is in flight, and approximate
+///   while several threads write.
 /// - `get_latest`/`get` return `None` when the newest version is a tombstone;
 ///   `get_version_le` returns `None` when the selected version is one.
 ///   Older snapshots are unaffected by later deletes.
@@ -122,7 +123,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
         let leaf = self.tree.raw.get(key)?;
         // SAFETY: protected by `_g`.
         let head = unsafe { leaf.as_ref() }.head();
-        head.value.clone()
+        head.value().cloned()
     }
 
     /// The newest version and value of `key`, if live.
@@ -137,7 +138,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
         let leaf = self.tree.raw.get(key.as_bytes())?;
         // SAFETY: protected by `_g`.
         let head = unsafe { leaf.as_ref() }.head();
-        head.value.clone().map(|v| (head.version, v))
+        head.value().cloned().map(|v| (head.version, v))
     }
 
     /// A handle on the newest live version of `key`, without cloning.
@@ -198,7 +199,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
         let leaf = self.tree.raw.get(key)?;
         // SAFETY: protected by `_g`.
         let n = find_le(unsafe { leaf.as_ref() }.head(), max)?;
-        n.value.clone().map(|v| (n.version, v))
+        n.value().cloned().map(|v| (n.version, v))
     }
 
     /// `true` if the newest version of `key` is live.
@@ -295,7 +296,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
         match self.tree.raw.get(key.as_bytes()) {
             // SAFETY: protected by `_g`.
             Some(l) => chain(unsafe { l.as_ref() }.head())
-                .map(|n| (n.version, n.value.clone()))
+                .map(|n| (n.version, n.value().cloned()))
                 .collect(),
             None => Vec::new(),
         }
@@ -392,13 +393,17 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
 
     /// Calls `callback(key, value, version)` for the latest live version of
     /// each key in `range`, until it returns `false`.
+    ///
+    /// One pin covers the whole scan, and no per-entry handle is created, so
+    /// this is the cheapest way to visit a range.
     pub fn scan<R, Q, F>(&self, range: R, mut callback: F)
     where
         R: RangeBounds<Q>,
         Q: AsBytes + ?Sized,
         F: FnMut(&K, &V, u64) -> bool,
     {
-        for e in self.range(range) {
+        let guard = self.pin();
+        for e in self.range_with_guard(range, &guard) {
             if !callback(e.key(), e.value(), e.version()) {
                 break;
             }

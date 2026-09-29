@@ -62,7 +62,7 @@
 //! Point operations are linearizable. Iterators guarantee that every key
 //! present for the whole scan is yielded exactly once, in order; keys inserted
 //! or removed during the scan may or may not appear. `len()` is exact when no
-//! operation is in flight.
+//! operation is in flight; while several threads write, it is approximate.
 //!
 //! ## Public surface
 //!
@@ -162,8 +162,10 @@ impl<K, V> ArtMap<K, V> {
         Self::new()
     }
 
-    /// The number of entries. Exact when no operation is in flight; during a
-    /// concurrent `clear()` it may briefly exceed the live count.
+    /// The number of entries. Exact when no operation is in flight. While
+    /// writes on several threads (or a `clear()`) are in flight it is
+    /// approximate: the count is striped by thread so that writers do not
+    /// contend on one cache line.
     #[inline]
     pub fn len(&self) -> usize {
         self.tree.len()
@@ -426,6 +428,38 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
             owned_bound(range.start_bound()),
             owned_bound(range.end_bound()),
         )
+    }
+
+    /// Calls `callback(key, value)` for each entry in `range`, in key order,
+    /// until it returns `false`.
+    ///
+    /// One pin covers the whole scan, and no per-entry handle is created, so
+    /// this is the cheapest way to visit a range.
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<String, u32>::new();
+    /// for (i, k) in ["a", "b", "c", "d"].into_iter().enumerate() {
+    ///     map.insert(k.to_string(), i as u32);
+    /// }
+    /// let mut seen = Vec::new();
+    /// map.scan("b".."d", |k, v| {
+    ///     seen.push((k.clone(), *v));
+    ///     true
+    /// });
+    /// assert_eq!(seen, [("b".to_string(), 1), ("c".to_string(), 2)]);
+    /// ```
+    pub fn scan<R, Q, F>(&self, range: R, mut callback: F)
+    where
+        R: RangeBounds<Q>,
+        Q: AsBytes + ?Sized,
+        F: FnMut(&K, &V) -> bool,
+    {
+        let guard = self.pin();
+        for e in self.range_with_guard(range, &guard) {
+            if !callback(e.key(), e.value()) {
+                break;
+            }
+        }
     }
 
     /// An iterator over every entry, in key order.

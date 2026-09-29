@@ -67,9 +67,21 @@ pub struct Arena {
     id: u64,
     /// Offsets `[0, ARENA_ALIGN)` are the null region.
     cursor: AtomicU64,
+    /// The first `ARENA_ALIGN`-aligned byte of the allocation.
     base: NonNull<u8>,
+    /// The allocation itself, as returned by the allocator (see `raw_layout`).
+    raw: NonNull<u8>,
     /// `ARENA_ALIGN <= capacity <= MAX_ARENA_SIZE`, a multiple of `ARENA_ALIGN`.
     capacity: usize,
+}
+
+/// The layout of an arena's backing allocation. The alignment is kept at or
+/// below the allocator's minimum, so `alloc_zeroed` is `calloc`: large arenas
+/// get lazily zeroed pages from the OS instead of an O(capacity) `memset`.
+/// The extra `ARENA_ALIGN` bytes leave room to align `base` by hand.
+fn raw_layout(capacity: usize) -> Layout {
+    Layout::from_size_align(capacity + ARENA_ALIGN, std::mem::align_of::<u64>())
+        .expect("arena layout")
 }
 
 // SAFETY: `Arena` owns its buffer. The atomic cursor hands out each byte range
@@ -94,14 +106,20 @@ impl Arena {
         // null region, so clamping up only changes `capacity()` for requests
         // below `ARENA_ALIGN`; no allocation that fitted before fails now.
         let capacity = capacity.clamp(ARENA_ALIGN, MAX_ARENA_SIZE) & !(ARENA_ALIGN - 1);
-        let layout = Layout::from_size_align(capacity, ARENA_ALIGN).expect("arena layout");
-        // SAFETY: `layout.size() >= ARENA_ALIGN > 0`.
-        let base = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })
+        let layout = raw_layout(capacity);
+        // SAFETY: `layout.size() > ARENA_ALIGN > 0`.
+        let raw = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })
             .unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        let pad = raw.as_ptr().align_offset(ARENA_ALIGN);
+        assert!(pad < ARENA_ALIGN, "arena base cannot be aligned");
+        // SAFETY: `pad < ARENA_ALIGN`, so `base..base + capacity` lies inside the
+        // `capacity + ARENA_ALIGN`-byte allocation; `base` keeps its provenance.
+        let base = unsafe { raw.add(pad) };
         Self {
             id: next_arena_id(),
             cursor: AtomicU64::new(ARENA_ALIGN as u64),
             base,
+            raw,
             capacity,
         }
     }
@@ -313,13 +331,8 @@ mod tlab {
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        // SAFETY: allocated in `new` with exactly this (non-zero) layout.
-        unsafe {
-            std::alloc::dealloc(
-                self.base.as_ptr(),
-                Layout::from_size_align_unchecked(self.capacity, ARENA_ALIGN),
-            )
-        }
+        // SAFETY: `raw` was allocated in `new` with exactly this layout.
+        unsafe { std::alloc::dealloc(self.raw.as_ptr(), raw_layout(self.capacity)) }
     }
 }
 

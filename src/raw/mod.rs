@@ -39,7 +39,7 @@ pub(crate) mod write;
 use std::cell::Cell;
 use std::ptr::NonNull;
 
-use crate::latch::{CachePadded, HybridLatch, WriteGuard};
+use crate::latch::{HybridLatch, WriteGuard};
 use crate::sync::atomic::{AtomicIsize, Ordering};
 
 use node::{Node16, Node256, Node4, Node48, NodeHeader, NodeType};
@@ -139,9 +139,69 @@ pub(crate) unsafe trait Storage: Layout<Leaf: LeafNode> {
 pub(crate) struct RawTree<S: Layout> {
     root: S::Atomic,
     root_latch: HybridLatch,
-    /// Inv 12: signed, so a transient negative (a bug) is clamped in `len()`.
-    len: CachePadded<AtomicIsize>,
+    /// Inv 12: a striped, signed count of live leaves.
+    len: Counter,
     pub(crate) storage: S,
+}
+
+/// The number of stripes in a [`Counter`].
+const STRIPES: usize = 8;
+
+/// One stripe, on its own pair of cache lines (the adjacent-line prefetcher
+/// pairs 64-byte lines, so 64-byte padding still shares).
+#[repr(align(128))]
+struct Stripe(AtomicIsize);
+
+/// A signed counter striped by thread (Inv 12). A single shared counter is a
+/// cache line that every insert and remove on every thread writes, which
+/// dominated concurrent write throughput. Each thread adds to its own stripe;
+/// the value is the sum of the stripes.
+///
+/// The sum is exact when no update is in flight. While updates from different
+/// threads are in flight, a sum read stripe by stripe may observe one thread's
+/// decrement but not another thread's matching increment, so it can be
+/// transiently low or high; [`RawTree::len`] clamps it at zero.
+struct Counter {
+    stripes: [Stripe; STRIPES],
+}
+
+impl Counter {
+    #[cfg(not(loom))]
+    const fn new() -> Self {
+        Self {
+            stripes: [const { Stripe(AtomicIsize::new(0)) }; STRIPES],
+        }
+    }
+
+    #[cfg(loom)]
+    fn new() -> Self {
+        Self {
+            stripes: std::array::from_fn(|_| Stripe(AtomicIsize::new(0))),
+        }
+    }
+
+    #[inline]
+    fn add(&self, n: isize) {
+        self.stripes[stripe()].0.fetch_add(n, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn sum(&self) -> isize {
+        self.stripes.iter().fold(0isize, |acc, s| {
+            acc.wrapping_add(s.0.load(Ordering::Relaxed))
+        })
+    }
+}
+
+/// This thread's stripe, assigned round-robin on first use.
+#[inline]
+fn stripe() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    std::thread_local! {
+        static STRIPE: usize = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % STRIPES;
+    }
+    // During TLS teardown any stripe is correct: only the sum matters.
+    STRIPE.try_with(|s| *s).unwrap_or(0)
 }
 
 impl<S: Layout> RawTree<S> {
@@ -153,7 +213,7 @@ impl<S: Layout> RawTree<S> {
         Self {
             root: <S::Atomic as slot::ConstNull>::NULL,
             root_latch: HybridLatch::new(),
-            len: CachePadded(AtomicIsize::new(0)),
+            len: Counter::new(),
             storage,
         }
     }
@@ -163,21 +223,22 @@ impl<S: Layout> RawTree<S> {
         Self {
             root: S::Atomic::new(Raw::<S>::NULL),
             root_latch: HybridLatch::new(),
-            len: CachePadded(AtomicIsize::new(0)),
+            len: Counter::new(),
             storage,
         }
     }
 
-    /// Exact at quiescence; clamped at zero.
+    /// Exact at quiescence; clamped at zero. See [`Counter`] for what it
+    /// may read while updates on several threads are in flight.
     #[inline]
     pub(crate) fn len(&self) -> usize {
-        self.len.load(Ordering::Relaxed).max(0) as usize
+        self.len.sum().max(0) as usize
     }
 
-    /// The raw signed counter, for regression tests (the clamp would hide bugs).
+    /// The raw signed sum, for regression tests (the clamp would hide bugs).
     #[cfg(test)]
     pub(crate) fn raw_len(&self) -> isize {
-        self.len.load(Ordering::Relaxed)
+        self.len.sum()
     }
 
     /// Inv 8: every load of `root` is `Acquire`.
@@ -195,9 +256,9 @@ impl<S: Layout> RawTree<S> {
 
     #[inline]
     pub(crate) fn len_add(&self, n: isize) {
-        // Skipped for 0: the counter is a shared cache line.
+        // Skipped for 0: no need to touch the stripe.
         if n != 0 {
-            self.len.fetch_add(n, Ordering::Relaxed);
+            self.len.add(n);
         }
     }
 
@@ -395,4 +456,35 @@ pub(crate) fn boxed<T>(v: T) -> NonNull<T> {
 #[inline]
 pub(crate) fn common_prefix(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+#[cfg(all(test, not(loom)))]
+mod counter_tests {
+    use super::{Counter, STRIPES};
+
+    /// The striped sum is exact once every thread's updates are done, even
+    /// when increments and decrements land on different stripes.
+    #[test]
+    fn striped_sum_is_exact_at_quiescence() {
+        let c = std::sync::Arc::new(Counter::new());
+        let threads = STRIPES * 2;
+        let per = if cfg!(miri) { 50 } else { 20_000 };
+        let hs: Vec<_> = (0..threads)
+            .map(|t| {
+                let c = std::sync::Arc::clone(&c);
+                std::thread::spawn(move || {
+                    for _ in 0..per {
+                        // Even threads only add, odd threads only subtract:
+                        // every stripe drifts, the sum must not.
+                        c.add(if t % 2 == 0 { 1 } else { -1 });
+                    }
+                    c.add(1);
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(c.sum(), threads as isize);
+    }
 }

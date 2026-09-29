@@ -215,19 +215,6 @@ impl Drop for AbortOnUnwind {
     }
 }
 
-/// 64-byte cache-line aligned wrapper to avoid false sharing.
-#[repr(align(64))]
-#[derive(Debug, Default)]
-pub(crate) struct CachePadded<T>(pub(crate) T);
-
-impl<T> std::ops::Deref for CachePadded<T> {
-    type Target = T;
-    #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 /// Exponential backoff for spinning writers and retrying readers.
 ///
 /// Uses the `crate::sync` shims, so loom models of a contended `lock()`

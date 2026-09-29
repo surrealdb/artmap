@@ -31,30 +31,47 @@ use crate::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
 #[repr(C, align(8))]
 pub(crate) struct VersionNode<V> {
     pub(crate) version: u64,
-    /// `None` is a tombstone.
-    pub(crate) value: Option<V>,
     next: AtomicPtr<VersionNode<V>>,
+    /// Initialised if and only if `!tombstone`. Immutable after publication.
+    /// A separate flag instead of `Option<V>` saves the discriminant's word
+    /// for values without a niche.
+    value: MaybeUninit<V>,
     /// Set by the chain-latch holder when the node is unlinked (superseded or
     /// pruned). Distinct from tombstone state; never a retirement guard.
     superseded: AtomicBool,
+    /// This version is a deletion and has no value. Immutable.
+    tombstone: bool,
     /// A leaf-owned inline slot, never retired independently (D5).
     pub(crate) inline: bool,
 }
 
 impl<V> VersionNode<V> {
     fn new(version: u64, value: Option<V>, inline: bool) -> Self {
+        let (value, tombstone) = match value {
+            Some(v) => (MaybeUninit::new(v), false),
+            None => (MaybeUninit::uninit(), true),
+        };
         Self {
             version,
-            value,
             next: AtomicPtr::new(ptr::null_mut()),
+            value,
             superseded: AtomicBool::new(false),
+            tombstone,
             inline,
         }
     }
 
     #[inline]
     pub(crate) fn is_tombstone(&self) -> bool {
-        self.value.is_none()
+        self.tombstone
+    }
+
+    /// The value, or `None` for a tombstone.
+    #[inline]
+    pub(crate) fn value(&self) -> Option<&V> {
+        // SAFETY: `value` is initialised whenever `tombstone` is false, and
+        // neither changes after publication (Inv 1).
+        (!self.tombstone).then(|| unsafe { self.value.assume_init_ref() })
     }
 
     #[inline]
@@ -83,6 +100,15 @@ impl<V> VersionNode<V> {
     #[inline]
     pub(crate) fn mark_superseded(&self, _w: &WriteGuard<'_>) {
         self.superseded.store(true, Ordering::Release);
+    }
+}
+
+impl<V> Drop for VersionNode<V> {
+    fn drop(&mut self) {
+        if !self.tombstone {
+            // SAFETY: initialised (not a tombstone), dropped exactly once here.
+            unsafe { self.value.assume_init_drop() };
+        }
     }
 }
 
@@ -196,7 +222,12 @@ impl<K, V> VersionedLeaf<K, V> {
             let leaf = this.as_ptr();
             let slot0 = (*leaf).slot0.get().cast::<VersionNode<V>>();
             let version = (*slot0).version;
-            let value = ptr::read(&(*slot0).value);
+            // Moved out: clearing `slots_init` stops the leaf dropping slot0.
+            let value = if (*slot0).tombstone {
+                None
+            } else {
+                Some(ptr::read((*slot0).value.as_ptr()))
+            };
             (*leaf).slots_init.store(0, Ordering::Relaxed);
             (version, value)
         }
@@ -321,6 +352,15 @@ mod tests {
         );
         drop(value);
         assert_eq!(n.load(Ordering::SeqCst), 1);
+    }
+
+    /// A tombstone flag instead of `Option<V>`: 32 bytes for a `u64` value,
+    /// not 40 (the leaf holds two inline nodes).
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn version_nodes_stay_compact() {
+        assert_eq!(std::mem::size_of::<VersionNode<u64>>(), 32);
+        assert_eq!(std::mem::size_of::<VersionedLeaf<[u8; 8], u64>>(), 96);
     }
 
     #[test]

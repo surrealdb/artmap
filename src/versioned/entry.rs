@@ -84,8 +84,7 @@ impl<'a, K, V> VersionedEntryRef<'a, K, V> {
     #[inline]
     pub fn value(&self) -> &V {
         self.node()
-            .value
-            .as_ref()
+            .value()
             .expect("a VersionedEntryRef never captures a tombstone")
     }
 
@@ -119,7 +118,7 @@ impl<'a, K, V> VersionedEntryRef<'a, K, V> {
     /// A fresh walk of the key's chain for the newest version `<= max_version`.
     pub fn get_version_le(&self, max_version: u64) -> Option<(u64, &V)> {
         let n = find_le(self.leaf().head(), max_version)?;
-        n.value.as_ref().map(|v| (n.version, v))
+        n.value().map(|v| (n.version, v))
     }
 
     #[inline]

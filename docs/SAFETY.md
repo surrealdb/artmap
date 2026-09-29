@@ -21,7 +21,9 @@ key length or tree depth. Dropping a map releases every key and value.
 
 Consistency: point operations are linearizable; iterators yield every key
 present for the whole scan exactly once, in order; `clear()` is linearizable
-at its root swap; `len()` is exact at quiescence and never underflows.
+at its root swap; `len()` is exact at quiescence and never underflows. While
+writers on several threads are in flight, `len()` may be transiently low or
+high (Inv 12).
 
 ## §4 Invariants
 
@@ -98,7 +100,12 @@ accept only `artmap::Guard<'m>`, which always wraps a real pin.
 **Inv 12 — Accounting inside the critical section.** `len` is incremented
 before the `Release` store that makes a new live entry reachable, and
 decremented after the store that unlinks one, inside the same critical
-section. `len` is a signed counter, clamped at zero only as a defensive net.
+section. `len` is a signed counter striped by thread: each thread adds to its
+own stripe, and `len()` is the sum, clamped at zero. The sum is exact at
+quiescence. A read that overlaps updates on several threads can pair one
+thread's decrement with another's not-yet-seen increment, so it is only
+approximate while those are in flight; a single writer thread never makes it
+undercount.
 
 **Inv 13 — Bounded stack.** No algorithm recurses in proportion to key length
 or tree depth.

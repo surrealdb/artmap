@@ -130,7 +130,7 @@ impl<K, V> ArenaVersionedTree<K, V> {
             .alloc_value(VersionNode::new(version, value))
         {
             Ok(p) => Ok(self.arena().offset_of(p)),
-            Err((_, n)) => Err(n.value),
+            Err((_, n)) => Err(n.into_value()),
         }
     }
 }
@@ -184,7 +184,7 @@ impl<K: AsBytes, V> ArenaVersionedTree<K, V> {
             Err((_, l)) => {
                 // SAFETY: the node was never published: take its value back.
                 let n = unsafe { self.arena().ptr::<VersionNode<V>>(node).read() };
-                return Err((l.key, n.value));
+                return Err((l.key, n.into_value()));
             }
         };
         // SAFETY: freshly written and exclusively ours.
@@ -229,7 +229,7 @@ impl<K: AsBytes, V> ArenaVersionedTree<K, V> {
                 // the key and value back out and abandon their bytes.
                 let (l, n) =
                     unsafe { (leaf.read(), self.arena().ptr::<VersionNode<V>>(node).read()) };
-                Err((l.key, n.value))
+                Err((l.key, n.into_value()))
             }
         }
     }

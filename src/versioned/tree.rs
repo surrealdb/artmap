@@ -284,7 +284,7 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedTree<K, V> {
             // SAFETY: live.
             let t = unsafe { &*t_ptr };
             let is_head = t_ptr == head;
-            let dead = is_head && t.value.as_ref().is_none_or(is_tombstone);
+            let dead = is_head && t.value().is_none_or(is_tombstone);
 
             // 2. Re-check under the latch.
             let Some(w) = leaf.chain_latch.lock() else {
