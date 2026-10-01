@@ -18,6 +18,7 @@
 //! (ART) with **optimistic lock coupling** (OLC):
 //!
 //! - [`ArtMap`]: a key-value map with epoch-based reclamation (EBR).
+//! - [`ArtSet`]: an ordered set of keys, a thin wrapper over `ArtMap<K, ()>`.
 //! - [`VersionedArtMap`]: a map with a chain of 64-bit MVCC versions per key.
 //! - [`ArenaArtMap`] and [`ArenaVersionedArtMap`]: the same, allocated from a
 //!   bump [`Arena`] and reclaimed only when the map is dropped.
@@ -100,6 +101,7 @@ mod latch;
 mod loom_tests;
 mod node;
 mod raw;
+mod set;
 mod simd;
 mod sync;
 mod tree;
@@ -113,6 +115,7 @@ pub use entry::EntryRef;
 pub use guard::Guard;
 pub use iter::{GuardKeys, GuardValues, Iter, KeyRef, Keys, Range, ValueRef, Values};
 pub use key::AsBytes;
+pub use set::ArtSet;
 pub use versioned::{VersionedArtMap, VersionedEntryRef};
 
 use guard::{pin, GuardHandle};
@@ -124,6 +127,7 @@ use tree::Tree;
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ArtMap<String, u64>>();
+    assert_send_sync::<ArtSet<String>>();
     assert_send_sync::<VersionedArtMap<String, u64>>();
     assert_send_sync::<ArenaArtMap<String, u64>>();
     assert_send_sync::<ArenaVersionedArtMap<String, u64>>();
@@ -361,6 +365,24 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
         {
             Outcome::Inserted(leaf) => EntryRef::new(leaf, &self.tree, guard),
             Outcome::Existing(existing) => EntryRef::new(existing, &self.tree, guard),
+            Outcome::Replaced(_) => unreachable!("InsertIfAbsent never replaces"),
+        }
+    }
+
+    /// Inserts `(key, value)` only if `key` is absent, and reports whether it
+    /// did. An existing entry is left untouched and nothing is retired.
+    ///
+    /// Like [`get_or_insert_with`](Self::get_or_insert_with), it checks for the
+    /// key first, so a present key costs a lookup and no allocation.
+    pub(crate) fn insert_if_absent(&self, key: K, value: V) -> bool {
+        let guard = pin();
+        // A hint only (Inv 10): the install below decides.
+        if self.tree.raw.get(key.as_bytes()).is_some() {
+            return false;
+        }
+        match self.tree.insert(key, value, Mode::InsertIfAbsent, &guard) {
+            Outcome::Inserted(_) => true,
+            Outcome::Existing(_) => false,
             Outcome::Replaced(_) => unreachable!("InsertIfAbsent never replaces"),
         }
     }

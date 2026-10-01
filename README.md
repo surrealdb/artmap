@@ -22,6 +22,8 @@ There are four map types:
 - **`artmap::ArenaArtMap`**: a key-value map allocated from a fixed-size bump arena with 32-bit offsets. Inserts make no heap allocations, and nothing is freed until the map is dropped.
 - **`artmap::ArenaVersionedArtMap`**: the versioned map on an arena, designed for LSM memtables.
 
+There is also **`artmap::ArtSet`**, an ordered set of keys. It is a thin wrapper over `ArtMap<K, ()>` with an insert-if-absent `insert` and `bool` results, and costs no more memory than the keys.
+
 ### Variant Selection Matrix
 
 | Memory Model | Unversioned (General Purpose) | Versioned / MVCC (Storage Engines) |
@@ -252,6 +254,29 @@ assert_eq!(reverse.first(), Some(&99));
 ```
 
 Iterators guarantee that every key present for the whole scan is yielded exactly once, in order. Keys inserted or removed during the scan may or may not appear.
+
+### Sets
+
+`ArtSet<K>` is an ordered set. `insert` adds a key only if it is absent, and `insert`, `remove` and `contains` return a `bool`:
+
+```rust
+use artmap::ArtSet;
+
+let set = ArtSet::<String>::new();
+assert!(set.insert("user:2".to_string()));
+assert!(set.insert("user:1".to_string()));
+// A key that is already present is left alone.
+assert!(!set.insert("user:1".to_string()));
+
+assert!(set.contains("user:1"));
+assert!(set.remove("user:2"));
+assert!(!set.remove("user:2"));
+
+// Keys come back in order, and ranges work as they do for the maps.
+set.insert("user:3".to_string());
+let keys: Vec<String> = set.range("user:1"..).map(|k| k.clone()).collect();
+assert_eq!(keys, ["user:1", "user:3"]);
+```
 
 ### Versioned maps
 
