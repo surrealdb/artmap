@@ -14,15 +14,14 @@
     <a href="https://github.com/surrealdb/artmap"><img src="https://img.shields.io/badge/license-Apache_License_2.0-00bfff.svg?style=flat-square"></a>
 </p>
 
-`artmap` is a concurrent, ordered, in-memory map backed by an **Adaptive Radix Tree (ART)**. It uses **optimistic lock coupling (OLC)**: readers never block and never write to shared memory, and writers latch only the nodes they change. Memory is reclaimed with **epoch-based reclamation (EBR)**, or, for the arena variants, all at once when the map is dropped.
+`artmap` provides a concurrent, ordered, in-memory map and set backed by an **Adaptive Radix Tree (ART)**. It uses **optimistic lock coupling (OLC)**: readers never block and never write to shared memory, and writers latch only the nodes they change. Memory is reclaimed with **epoch-based reclamation (EBR)**, or, for the arena variants, all at once when the map is dropped.
 
-There are four map types:
+There are four map types and a set type:
 - **`artmap::ArtMap`**: a key-value map. Removed and replaced entries are reclaimed through `crossbeam-epoch`.
 - **`artmap::VersionedArtMap`**: a map with a chain of 64-bit MVCC versions per key, snapshot reads (`get_version_le`, `get_latest`), tombstones (`delete`) and pruning (`prune_key`, `prune_all`).
 - **`artmap::ArenaArtMap`**: a key-value map allocated from a fixed-size bump arena with 32-bit offsets. Inserts make no heap allocations, and nothing is freed until the map is dropped.
 - **`artmap::ArenaVersionedArtMap`**: the versioned map on an arena, designed for LSM memtables.
-
-There is also **`artmap::ArtSet`**, an ordered set of keys. It is a thin wrapper over `ArtMap<K, ()>` with an insert-if-absent `insert` and `bool` results, and costs no more memory than the keys.
+- **`artmap::ArtSet`**: an ordered set of keys, a thin wrapper over `ArtMap<K, ()>`. `insert` only adds a key that is absent, and `insert`, `remove` and `contains` return a `bool`. It costs no more memory than the keys.
 
 ### Variant Selection Matrix
 
@@ -113,7 +112,7 @@ Benchmarked with 100,000 keys (64-bit integer keys and 64-bit values), measuring
 - **SIMD `Node16` search**: SSE2 on x86_64 and NEON on aarch64.
 - **Slice lookups**: query with `&[u8]` or `&str` without building a key (`get_by_slice`, `contains_key_slice`).
 - **Double-ended iterators**: forward and reverse scans over any range (`map.range(a..b).rev()`).
-- **Thread safety**: every map is `Send + Sync` when `K` and `V` are `Send + Sync`. Compile-time assertions check this, and compile-fail tests check that handles and iterators are `!Send`.
+- **Thread safety**: every map and `ArtSet` is `Send + Sync` when its key and value types are. Compile-time assertions check this, and compile-fail tests check that handles and iterators are `!Send`.
 
 ## Quick Start
 
