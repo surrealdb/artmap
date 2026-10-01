@@ -371,6 +371,132 @@
 //! m.insert(vec![1], 1, std::rc::Rc::new(1));
 //! ```
 //!
+//! ## `ArtSet` keeps the map's guarantees
+//!
+//! `ArtSet` wraps an `ArtMap`, so it should inherit the contract above. These
+//! pin it, so that a later edit to the wrapper cannot quietly lose it.
+//!
+//! Key handles and iterators cannot outlive the set:
+//!
+//! ```compile_fail,E0597
+//! let keys: Vec<_> = {
+//!     let s = artmap::ArtSet::<Vec<u8>>::new();
+//!     s.insert(vec![1]);
+//!     s.iter().collect()
+//! };
+//! drop(keys);
+//! ```
+//!
+//! ```compile_fail,E0597
+//! let keys: Vec<_> = {
+//!     let s = artmap::ArtSet::<Vec<u8>>::new();
+//!     s.insert(vec![1]);
+//!     s.range(vec![0u8]..).collect()
+//! };
+//! drop(keys);
+//! ```
+//!
+//! ```
+//! let s = artmap::ArtSet::<Vec<u8>>::new();
+//! s.insert(vec![1]);
+//! let keys: Vec<_> = s.iter().collect();
+//! s.remove(&[1u8][..]);
+//! // Still valid: each item keeps the iterator's guard alive.
+//! assert_eq!(**keys[0], [1u8]);
+//! ```
+//!
+//! `scan` cannot leak a key out of its callback:
+//!
+//! ```compile_fail
+//! let s = artmap::ArtSet::<Vec<u8>>::new();
+//! s.insert(vec![1]);
+//! let mut leaked = None;
+//! s.scan::<_, [u8], _>(.., |k| {
+//!     leaked = Some(k);
+//!     true
+//! });
+//! drop(leaked);
+//! ```
+//!
+//! ```
+//! let s = artmap::ArtSet::<Vec<u8>>::new();
+//! s.insert(vec![1]);
+//! let mut copied = None;
+//! s.scan::<_, [u8], _>(.., |k| {
+//!     copied = Some(k.clone());
+//!     true
+//! });
+//! assert_eq!(copied, Some(vec![1]));
+//! ```
+//!
+//! `validate_invariants` needs exclusive access:
+//!
+//! ```compile_fail,E0596
+//! let s = std::sync::Arc::new(artmap::ArtSet::<Vec<u8>>::new());
+//! s.validate_invariants();
+//! ```
+//!
+//! The set is invariant in `K`:
+//!
+//! ```compile_fail
+//! fn shrink<'a>(s: &'a artmap::ArtSet<&'static str>) -> &'a artmap::ArtSet<&'a str> {
+//!     s
+//! }
+//! ```
+//!
+//! ```
+//! fn same<'a>(s: &'a artmap::ArtSet<&'static str>) -> &'a artmap::ArtSet<&'static str> {
+//!     s
+//! }
+//! ```
+//!
+//! Key handles and iterators are `!Send`, but the set itself is `Send`:
+//!
+//! ```compile_fail,E0277
+//! fn send<T: Send>(_: T) {}
+//! let s = artmap::ArtSet::<Vec<u8>>::new();
+//! send(s.iter());
+//! ```
+//!
+//! ```compile_fail,E0277
+//! fn send<T: Send>(_: T) {}
+//! let s = artmap::ArtSet::<Vec<u8>>::new();
+//! s.insert(vec![1]);
+//! send(s.iter().next());
+//! ```
+//!
+//! ```
+//! fn send<T: Send>(_: T) {}
+//! let s = artmap::ArtSet::<Vec<u8>>::new();
+//! s.insert(vec![1]);
+//! send(s);
+//! ```
+//!
+//! Keys that are not `Send` cannot be inserted, because a removed key is
+//! destroyed on whichever thread reclaims it:
+//!
+//! ```compile_fail,E0599
+//! struct Key(std::rc::Rc<Vec<u8>>);
+//! impl artmap::AsBytes for Key {
+//!     fn as_bytes(&self) -> &[u8] {
+//!         &self.0
+//!     }
+//! }
+//! let s = artmap::ArtSet::<Key>::new();
+//! s.insert(Key(std::rc::Rc::new(vec![1])));
+//! ```
+//!
+//! ```
+//! struct Key(Vec<u8>);
+//! impl artmap::AsBytes for Key {
+//!     fn as_bytes(&self) -> &[u8] {
+//!         &self.0
+//!     }
+//! }
+//! let s = artmap::ArtSet::<Key>::new();
+//! assert!(s.insert(Key(vec![1])));
+//! ```
+//!
 //! ## Sealed internals are not nameable (§8.1)
 //!
 //! ```compile_fail,E0603

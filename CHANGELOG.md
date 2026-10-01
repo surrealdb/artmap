@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `ArtSet<K>`: an ordered, concurrent set, a thin wrapper over `ArtMap<K, ()>`. `insert` is insert-if-absent and returns a `bool`, as do `remove` and `contains`. Iterators, `range` and `scan` yield keys.
+
 ## 0.6.0 (2026-09-29)
 
 0.6 rebuilds all four maps on one shared ART core. The goal is a safe API that is sound, with memory safety checked by Miri, loom and the sanitizers. `docs/SAFETY.md` states the invariants that the code relies on.
