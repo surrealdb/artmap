@@ -120,7 +120,7 @@ Add `artmap` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-artmap = "0.6"
+artmap = "0.7"
 ```
 
 ```rust
@@ -343,7 +343,7 @@ The arena's capacity is fixed. Updates and removes do not free arena memory: rep
 
 ## Memory retention
 
-Removed and replaced **entries** are reclaimed: once no guard can still see them in the EBR maps, or when the map is dropped in the arena maps. **Inner nodes are not yet reclaimed on delete.** A node emptied by removes stays in the tree until `clear()` or drop, so a workload that keeps deleting and inserting keys under ever-new prefixes grows. Delete-side compaction is planned for a release after 0.6.
+Removed and replaced **entries** are reclaimed: once no guard can still see them in the EBR maps, or when the map is dropped in the arena maps. **Inner nodes are not yet reclaimed on delete.** A node emptied by removes stays in the tree until `clear()` or drop, so a workload that keeps deleting and inserting keys under ever-new prefixes grows. Delete-side compaction is planned for a release after 0.7.
 
 ## Verification
 
