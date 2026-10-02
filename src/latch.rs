@@ -47,12 +47,15 @@ pub(crate) mod mutants {
         pub(crate) static SKIP_R4_COUPLING: Cell<bool> = const { Cell::new(false) };
         /// Finds a version-chain position before taking `chain_latch` (§11.4).
         pub(crate) static CHAIN_POSITION_UNLATCHED: Cell<bool> = const { Cell::new(false) };
-        /// Unlinks a collapsing node holding only its parent's latch, so the
+        /// Unlinks an emptied node holding only its parent's latch, so the
         /// node is neither locked nor obsoleted (§13, Inv 7).
-        pub(crate) static COLLAPSE_WITHOUT_NODE_LATCH: Cell<bool> = const { Cell::new(false) };
-        /// Merges a node into its child without bumping the child's version
-        /// (§13, Inv 7).
-        pub(crate) static MERGE_WITHOUT_CHILD_BUMP: Cell<bool> = const { Cell::new(false) };
+        pub(crate) static UNLINK_WITHOUT_NODE_LATCH: Cell<bool> = const { Cell::new(false) };
+        /// `shrink_to_fit` copies a node into a smaller one without its latch
+        /// (Inv 7).
+        pub(crate) static FIT_WITHOUT_NODE_LATCH: Cell<bool> = const { Cell::new(false) };
+        /// `shrink_to_fit` merges a node into a copy of its child without the
+        /// child's latch (Inv 7).
+        pub(crate) static MERGE_WITHOUT_CHILD_LATCH: Cell<bool> = const { Cell::new(false) };
     }
 }
 
@@ -171,14 +174,6 @@ impl WriteGuard<'_> {
         self.latch
             .version
             .store(self.v | OBSOLETE_BIT, Ordering::Release);
-        std::mem::forget(self);
-    }
-
-    /// Loom mutant only: releases the latch *without* bumping the version, so
-    /// optimistic readers that read the old version still validate.
-    #[cfg(loom)]
-    pub(crate) fn unlock_unbumped(self) {
-        self.latch.version.store(self.v, Ordering::Release);
         std::mem::forget(self);
     }
 

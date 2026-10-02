@@ -582,11 +582,13 @@ fn contended_inserts_stay_within_max_insert_bytes() {
     );
 }
 
-/// Key families whose nodes delete-side compaction reshapes (§13); see
-/// `tests/concurrent_correctness.rs`.
+/// Key families whose nodes removes reshape (§13); see
+/// `tests/concurrent_correctness.rs`. In the arena, which has no
+/// `shrink_to_fit`, only the subtrees that empty ('d', and the prefix chain
+/// 'e') are unlinked; the other families keep their single-entry nodes.
 fn compaction_family(group: u8) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
-    let chain = |last: u8| {
-        let mut k = vec![group, b'c'];
+    let chain = |tag: u8, last: u8| {
+        let mut k = vec![group, tag];
         k.extend_from_slice(&[b'-'; 30]);
         k.push(last);
         k
@@ -595,17 +597,25 @@ fn compaction_family(group: u8) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         vec![group, b'a', b's'],
         vec![group, b'b', b'x', b'1'],
         vec![group, b'b', b'x', b'2'],
-        chain(1),
+        chain(b'c', 1),
+        vec![group, b'f', 0xFF],
     ];
-    let mut churn = vec![vec![group, b'a', b'c'], vec![group, b'b', b'y'], chain(2)];
+    let mut churn = vec![
+        vec![group, b'a', b'c'],
+        vec![group, b'b', b'y'],
+        chain(b'c', 2),
+        chain(b'e', 1),
+        chain(b'e', 2),
+    ];
     churn.extend((0..6).map(|i| vec![group, b'd', i]));
+    churn.extend((0..40).map(|i| vec![group, b'f', i]));
     (sentinels, churn)
 }
 
 #[test]
-fn removes_compact_without_allocating() {
-    // [core-write-5] Every compaction (collapse into a leaf, merge into a
-    // child, a prefix chain's follow-up, an emptied subtree) only unlinks.
+fn removes_unlink_emptied_nodes_without_allocating() {
+    // [core-write-5] Removing the churn keys empties the 'd' subtree and the
+    // 'e' chain, which removes unlink; unlinking allocates nothing.
     let mut m = ArenaArtMap::<Vec<u8>, u64>::with_capacity(1 << 20);
     let (sentinels, churn) = compaction_family(0);
     for k in sentinels.iter().chain(&churn) {
@@ -618,8 +628,9 @@ fn removes_compact_without_allocating() {
     assert_eq!(m.arena().remaining(), before, "a remove allocated");
     let keys: Vec<Vec<u8>> = m.iter().map(|e| e.key().clone()).collect();
     assert_eq!(keys, sentinels);
+    // No node is left empty.
     m.validate_invariants();
-    // The compacted shapes take inserts again.
+    // The shapes take inserts again.
     for k in &churn {
         assert!(m.insert(k.clone(), 1).is_none());
     }
@@ -628,36 +639,29 @@ fn removes_compact_without_allocating() {
 }
 
 #[test]
-fn an_inserter_whose_node_is_compacted_falls_back() {
-    // §12.4: the cached node is unlinked (obsolete) or merged (its version
-    // bumped), so the fast path fails and the full insert places the key.
+fn an_inserter_whose_node_is_changed_or_unlinked_falls_back() {
+    // §12.4: a remove bumps the cached node's version, or unlinks it once
+    // empty (obsolete), so the fast path fails and the full insert places
+    // the key.
     let mut m = ArenaArtMap::<Vec<u8>, u64>::with_capacity(1 << 20);
     {
         let mut ins = m.inserter();
         ins.insert(b"q".to_vec(), 9);
         ins.insert(b"k0".to_vec(), 0);
         ins.insert(b"k1".to_vec(), 1);
-        // The cached node {0, 1} collapses into its last leaf.
+        // The cached node {0, 1} changes.
         assert!(m.remove(&b"k0"[..]).is_some());
         ins.insert(b"k2".to_vec(), 2);
+        // It empties, and is unlinked.
         assert!(m.remove(&b"k1"[..]).is_some());
-        ins.insert(b"k3".to_vec(), 3);
-        // A merge: the cached node {x: {1, 2}, y} merges into its child.
-        ins.insert(b"kx1".to_vec(), 4);
-        ins.insert(b"kx2".to_vec(), 5);
         assert!(m.remove(&b"k2"[..]).is_some());
-        assert!(m.remove(&b"k3"[..]).is_some());
-        ins.insert(b"kx3".to_vec(), 6);
+        ins.insert(b"k3".to_vec(), 3);
+        ins.insert(b"k4".to_vec(), 4);
     }
     let got: Vec<(Vec<u8>, u64)> = m.iter().map(|e| (e.key().clone(), *e.value())).collect();
     assert_eq!(
         got,
-        [
-            (b"kx1".to_vec(), 4),
-            (b"kx2".to_vec(), 5),
-            (b"kx3".to_vec(), 6),
-            (b"q".to_vec(), 9)
-        ]
+        [(b"k3".to_vec(), 3), (b"k4".to_vec(), 4), (b"q".to_vec(), 9)]
     );
     m.validate_invariants();
 }
@@ -665,7 +669,7 @@ fn an_inserter_whose_node_is_compacted_falls_back() {
 #[test]
 fn concurrent_compaction_keeps_every_sentinel() {
     // Writers toggle churn keys (inserting through a cached inserter), so
-    // nodes collapse, merge and are rebuilt under the readers.
+    // subtrees are emptied, unlinked and rebuilt under the readers.
     const GROUPS: u8 = 4;
     let map = Arc::new(ArenaArtMap::<Vec<u8>, u64>::with_capacity(64 << 20));
     let mut sentinels = Vec::new();

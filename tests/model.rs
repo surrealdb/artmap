@@ -129,6 +129,10 @@ fn artmap_matches_btreemap() {
         let mut model = BTreeMap::<Vec<u8>, u64>::new();
         for i in 0..ops() as u64 {
             let k = gen_key(&mut rng);
+            if rng.gen_ratio(1, 40) {
+                // Fitting changes no entry.
+                map.shrink_to_fit();
+            }
             match rng.gen_range(0..10) {
                 0..=3 => {
                     let old = map.insert(k.clone(), i).map(|e| *e.value());
@@ -181,6 +185,10 @@ fn artmap_matches_btreemap() {
         let all: Vec<_> = map.iter().map(|e| (e.key().clone(), *e.value())).collect();
         let want: Vec<_> = model.iter().map(|(k, v)| (k.clone(), *v)).collect();
         assert_eq!(all, want);
+        map.validate_invariants();
+        map.shrink_to_fit();
+        let fitted: Vec<_> = map.iter().map(|e| (e.key().clone(), *e.value())).collect();
+        assert_eq!(fitted, want, "shrink_to_fit, seed {seed}");
         map.validate_invariants();
         map.clear();
         assert_eq!(map.len(), 0);

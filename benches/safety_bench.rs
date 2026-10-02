@@ -139,6 +139,47 @@ fn bench_churn(c: &mut Criterion) {
             black_box(map.insert(k, i as u64).is_some());
         });
     });
+    // Eight threads removing and re-inserting random keys of one map.
+    group.bench_function("8t", |b| {
+        let map = Arc::new(filled_map());
+        b.iter_custom(|iters| {
+            let map = Arc::clone(&map);
+            run_threads(iters, move |t, iters| {
+                let keys = random_keys(4096, 30 + t as u64);
+                for i in 0..iters as usize {
+                    let k = keys[i & 4095];
+                    black_box(map.remove(&k).is_some());
+                    black_box(map.insert(k, i as u64).is_some());
+                }
+            })
+        });
+    });
+    // As `1t_pairs`, on eight threads: every collapse also latches the
+    // pair's parent, which the other threads' pairs share.
+    group.bench_function("8t_pairs", |b| {
+        let map = ArtMap::<[u8; 8], u64>::new();
+        for i in 0..N {
+            let _ = map.insert(((i / 2) << 8 | (i % 2)).to_be_bytes(), i);
+        }
+        let map = Arc::new(map);
+        b.iter_custom(|iters| {
+            let map = Arc::clone(&map);
+            run_threads(iters, move |t, iters| {
+                let keys: Vec<[u8; 8]> = random_keys(4096, 40 + t as u64)
+                    .into_iter()
+                    .map(|k| {
+                        let i = u64::from_be_bytes(k);
+                        ((i / 2) << 8 | (i % 2)).to_be_bytes()
+                    })
+                    .collect();
+                for i in 0..iters as usize {
+                    let k = keys[i & 4095];
+                    black_box(map.remove(&k).is_some());
+                    black_box(map.insert(k, i as u64).is_some());
+                }
+            })
+        });
+    });
     group.finish();
 
     // A queue: append one key and remove the oldest, 1,000 keys apart.
@@ -153,6 +194,28 @@ fn bench_churn(c: &mut Criterion) {
                 black_box(map.remove(&(i - 1_000).to_be_bytes()).is_some());
             }
             i += 1;
+        });
+    });
+    // Eight queues, one per thread, under disjoint prefixes of one map.
+    group.bench_function("push_pop_8t", |b| {
+        let map = Arc::new(ArtMap::<[u8; 8], u64>::new());
+        let next: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
+            (0..THREADS)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+        );
+        b.iter_custom(|iters| {
+            let (map, next) = (Arc::clone(&map), Arc::clone(&next));
+            run_threads(iters, move |t, iters| {
+                let key = |i: u64| ((t as u64) << 56 | i).to_be_bytes();
+                let start = next[t].fetch_add(iters, Ordering::Relaxed);
+                for i in start..start + iters {
+                    let _ = map.insert(key(i), i);
+                    if i >= 1_000 {
+                        black_box(map.remove(&key(i - 1_000)).is_some());
+                    }
+                }
+            })
         });
     });
     // Scanning the 1,000 live keys of a queue that has seen 1M pushes.
@@ -453,6 +516,29 @@ fn bench_arena_create(c: &mut Criterion) {
     group.finish();
 }
 
+/// `shrink_to_fit` on a map of 100,000 random keys thinned to 1,000.
+fn bench_shrink(c: &mut Criterion) {
+    let mut group = c.benchmark_group("shrink_to_fit");
+    group.bench_function("thinned_100k", |b| {
+        b.iter_batched(
+            || {
+                let map = ArtMap::<[u8; 8], u64>::new();
+                let key = |i: u64| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes();
+                for i in 0..100_000u64 {
+                    let _ = map.insert(key(i), i);
+                }
+                for i in (0..100_000u64).filter(|i| i % 100 != 0) {
+                    let _ = map.remove(&key(i));
+                }
+                map
+            },
+            |map| map.shrink_to_fit(),
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
 fn config() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_millis(500))
@@ -464,6 +550,6 @@ criterion_group! {
     name = benches;
     config = config();
     targets = bench_gets, bench_overwrite, bench_churn, bench_scan, bench_hot_node256, bench_versioned,
-        bench_arena_create
+        bench_arena_create, bench_shrink
 }
 criterion_main!(benches);

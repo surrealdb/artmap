@@ -412,166 +412,121 @@ fn clear_against_remover_never_underflows() {
 }
 
 // ---------------------------------------------------------------------------
-// Delete-side compaction (§13).
+// Removes that empty a node (§13).
+
+/// A tree of `keys`, then `removed` taken out again before the model runs.
+fn tree_less(keys: &[&[u8]], removed: &[&[u8]]) -> Arc<T> {
+    let t = tree(keys);
+    for k in removed {
+        assert!(remove(&t, k));
+    }
+    t
+}
 
 #[test]
-fn collapse_to_leaf_against_get() {
-    // Root {a: N {1, 2}, b}: removing "a1" moves "a2" up into the root.
+fn unlink_against_get() {
+    // Root {a: N {1}, b, c}: removing "a1" unlinks N, shifting the root's
+    // keys under a reader looking up "c".
     model(|| {
-        let t = tree(&[b"a1", b"a2", b"b"]);
+        let t = tree_less(&[b"a1", b"a2", b"b", b"c"], &[b"a2"]);
         let (w, r) = (Arc::clone(&t), Arc::clone(&t));
         par(
             move || assert!(remove(&w, b"a1")),
-            move || {
-                assert!(
-                    r.get(b"a2").is_some(),
-                    "false negative while a leaf moves up"
-                )
-            },
+            move || assert!(r.get(b"c").is_some(), "false negative during an unlink"),
         );
         assert_eq!(quiescent_check(t), 2);
     });
 }
 
-fn merge_against_get_model() {
-    // Root "a" {x, b: C "c" {1, 2}}: removing "ax" merges the root into C,
-    // whose prefix becomes "abc" in place.
-    let t = tree(&[b"ax", b"abc1", b"abc2"]);
-    let (w, r) = (Arc::clone(&t), Arc::clone(&t));
-    par(
-        move || assert!(remove(&w, b"ax")),
-        move || assert!(r.get(b"abc1").is_some(), "false negative during a merge"),
-    );
-    assert_eq!(quiescent_check(t), 2);
-}
-
-#[test]
-fn merge_against_get() {
-    model(merge_against_get_model);
-}
-
-#[test]
-fn merge_mutant_without_child_bump() {
-    // A reader inside C at C's old depth must fail validation.
-    assert_mutant_fails(&mutants::MERGE_WITHOUT_CHILD_BUMP, merge_against_get_model);
-}
-
-#[test]
-fn merge_against_insert_into_child() {
-    // The insert may hold C when the merge wants it: the merge is declined
-    // and the root keeps its single child.
-    model(|| {
-        let t = tree(&[b"ax", b"abc1", b"abc2"]);
-        let (w, r) = (Arc::clone(&t), Arc::clone(&t));
-        par(
-            move || assert!(insert(&w, b"abc3")),
-            move || assert!(remove(&r, b"ax")),
-        );
-        for k in [&b"abc1"[..], b"abc2", b"abc3"] {
-            assert!(t.get(k).is_some(), "{k:?} lost");
-        }
-        assert_eq!(quiescent_check(t), 3);
-    });
-}
-
-fn collapse_against_insert_model() {
-    // Root "k" {a, b}: removing "ka" collapses the root to "kb" while "kc" is
-    // inserted into it, locking only the root node.
-    let t = tree(&[b"ka", b"kb"]);
+fn unlink_against_insert_model() {
+    // Root "k" {a}: removing "ka" empties the root node while "kc" is
+    // inserted into it, locking only that node.
+    let t = tree_less(&[b"ka", b"kb"], &[b"kb"]);
     let (w, r) = (Arc::clone(&t), Arc::clone(&t));
     par(
         move || assert!(insert(&w, b"kc")),
         move || assert!(remove(&r, b"ka")),
     );
-    assert!(t.get(b"kb").is_some(), "the survivor was lost");
     assert!(t.get(b"kc").is_some(), "the insert was lost");
-    assert_eq!(quiescent_check(t), 2);
+    assert_eq!(quiescent_check(t), 1);
 }
 
 #[test]
-fn collapse_against_insert_into_node() {
-    model(collapse_against_insert_model);
+fn unlink_against_insert_into_node() {
+    model(unlink_against_insert_model);
 }
 
 #[test]
-fn collapse_mutant_without_node_latch() {
+fn unlink_mutant_without_node_latch() {
     assert_mutant_fails(
-        &mutants::COLLAPSE_WITHOUT_NODE_LATCH,
-        collapse_against_insert_model,
+        &mutants::UNLINK_WITHOUT_NODE_LATCH,
+        unlink_against_insert_model,
     );
 }
 
-fn collapse_against_cached_insert_model() {
+#[test]
+fn unlink_against_cached_insert() {
     // An inserter-style cached node (§12.4): the leaf split that built
-    // N {a, b} under the root cached N at version 0. Removing "ka" collapses
-    // N while the cached insert of "kc" upgrades N directly, without a
-    // descent. The leak-only storage never frees N, as the arena does not.
-    let t = RawTree::new_in(Leak(PhantomData));
-    insert(&t, b"ka");
-    insert(&t, b"x");
-    let mut hint = None;
-    let kb = new_leaf(b"kb");
-    let owner = unsafe { Unpublished::new(&t.storage, kb) };
-    let key = unsafe { kb.as_ref() }.key.clone();
-    assert!(matches!(
-        t.insert_hinted(&owner, &key, Mode::InsertIfAbsent, 1, &(), &mut hint),
-        Ok(Outcome::Inserted(_))
-    ));
-    drop(owner);
-    let hint = hint.expect("the leaf split caches N");
-    let t = Arc::new(t);
-    let (w, r) = (Arc::clone(&t), Arc::clone(&t));
-    par(
-        move || {
-            let mut hint = hint;
-            let kc = new_leaf(b"kc");
-            let owner = unsafe { Unpublished::new(&w.storage, kc) };
-            let key = unsafe { kc.as_ref() }.key.clone();
-            let fast = unsafe { w.insert_at_hint(&mut hint, &owner, &key, 1) };
-            if fast.is_none() {
-                assert!(matches!(
-                    w.insert(&owner, &key, Mode::InsertIfAbsent, 1, &()),
-                    Ok(Outcome::Inserted(_))
-                ));
-            }
-        },
-        move || assert!(remove(&r, b"ka")),
-    );
-    assert!(t.get(b"kb").is_some(), "the survivor was lost");
-    assert!(t.get(b"kc").is_some(), "the cached insert was lost");
-    assert_eq!(quiescent_check(t), 3);
-}
-
-#[test]
-fn collapse_against_cached_insert() {
-    model(collapse_against_cached_insert_model);
-}
-
-#[test]
-fn collapse_mutant_without_node_latch_against_cached_insert() {
-    assert_mutant_fails(
-        &mutants::COLLAPSE_WITHOUT_NODE_LATCH,
-        collapse_against_cached_insert_model,
-    );
-}
-
-#[test]
-fn two_collapsing_removes_in_one_node() {
-    // Root "k" {a, b, c}: whichever remove runs second collapses the root.
+    // N {a, b} under the root cached N. Two removes empty N while the cached
+    // insert of "kc" upgrades N directly, without a descent. The leak-only
+    // storage never frees N, as the arena does not.
     model(|| {
-        let t = tree(&[b"ka", b"kb", b"kc"]);
+        let t = RawTree::new_in(Leak(PhantomData));
+        insert(&t, b"ka");
+        insert(&t, b"x");
+        let mut hint = None;
+        let kb = new_leaf(b"kb");
+        let owner = unsafe { Unpublished::new(&t.storage, kb) };
+        let key = unsafe { kb.as_ref() }.key.clone();
+        assert!(matches!(
+            t.insert_hinted(&owner, &key, Mode::InsertIfAbsent, 1, &(), &mut hint),
+            Ok(Outcome::Inserted(_))
+        ));
+        drop(owner);
+        let hint = hint.expect("the leaf split caches N");
+        let t = Arc::new(t);
+        let (w, r) = (Arc::clone(&t), Arc::clone(&t));
+        par(
+            move || {
+                let mut hint = hint;
+                let kc = new_leaf(b"kc");
+                let owner = unsafe { Unpublished::new(&w.storage, kc) };
+                let key = unsafe { kc.as_ref() }.key.clone();
+                let fast = unsafe { w.insert_at_hint(&mut hint, &owner, &key, 1) };
+                if fast.is_none() {
+                    assert!(matches!(
+                        w.insert(&owner, &key, Mode::InsertIfAbsent, 1, &()),
+                        Ok(Outcome::Inserted(_))
+                    ));
+                }
+            },
+            move || {
+                assert!(remove(&r, b"ka"));
+                assert!(remove(&r, b"kb"));
+            },
+        );
+        assert!(t.get(b"kc").is_some(), "the cached insert was lost");
+        assert_eq!(quiescent_check(t), 2);
+    });
+}
+
+#[test]
+fn two_removes_empty_one_node() {
+    // Root {k: N {a, b}, x}: whichever remove runs second unlinks N.
+    model(|| {
+        let t = tree(&[b"ka", b"kb", b"x"]);
         let (a, b) = (Arc::clone(&t), Arc::clone(&t));
         par(
             move || assert!(remove(&a, b"ka")),
             move || assert!(remove(&b, b"kb")),
         );
-        assert!(t.get(b"kc").is_some());
-        assert_eq!(quiescent_check(t), 1, "the root is the last leaf");
+        assert!(t.get(b"x").is_some());
+        assert_eq!(quiescent_check(t), 1);
     });
 }
 
-/// A 17-byte shared prefix: the root is a chain link (16 prefix bytes and
-/// one child) above the fork `{1, 2}`.
+/// A 17-byte shared prefix: a chain link (16 prefix bytes and one child)
+/// above the fork `{1, 2}`, under a root that also holds "x".
 fn chain_key(last: u8) -> Vec<u8> {
     let mut k = b"0123456789abcdefg".to_vec();
     k.push(last);
@@ -579,44 +534,38 @@ fn chain_key(last: u8) -> Vec<u8> {
 }
 
 #[test]
-fn chain_follow_up_against_get() {
-    // Removing one key collapses the fork into the chain link, and the
-    // follow-up collapses the link into the root.
+fn chain_unlink_follow_up_against_get() {
+    // Removing the chain's last key empties the fork, and the follow-up
+    // unlinks the emptied link above it.
     model(|| {
-        let t = tree(&[&chain_key(1), &chain_key(2)]);
+        let t = tree_less(&[&chain_key(1), &chain_key(2), b"x"], &[&chain_key(2)]);
         let (w, r) = (Arc::clone(&t), Arc::clone(&t));
         par(
             move || assert!(remove(&w, &chain_key(1))),
-            move || {
-                assert!(
-                    r.get(&chain_key(2)).is_some(),
-                    "false negative during a follow-up"
-                )
-            },
+            move || assert!(r.get(b"x").is_some(), "false negative during a follow-up"),
         );
         assert_eq!(quiescent_check(t), 1);
     });
 }
 
 #[test]
-fn chain_follow_up_against_insert() {
+fn chain_unlink_follow_up_against_insert() {
     model(|| {
-        let t = tree(&[&chain_key(1), &chain_key(2)]);
+        let t = tree_less(&[&chain_key(1), &chain_key(2), b"x"], &[&chain_key(2)]);
         let (w, r) = (Arc::clone(&t), Arc::clone(&t));
         par(
             move || assert!(remove(&w, &chain_key(1))),
             move || assert!(insert(&r, &chain_key(3))),
         );
-        assert!(t.get(&chain_key(2)).is_some());
-        assert!(t.get(&chain_key(3)).is_some());
+        assert!(t.get(&chain_key(3)).is_some(), "the insert was lost");
         assert_eq!(quiescent_check(t), 2);
     });
 }
 
 #[test]
-fn clear_against_collapse_never_underflows() {
+fn clear_against_unlink_never_underflows() {
     model(|| {
-        let t = tree(&[b"ka", b"kb"]);
+        let t = tree_less(&[b"ka", b"kb"], &[b"kb"]);
         let (w, c) = (Arc::clone(&t), Arc::clone(&t));
         par(
             move || {
@@ -630,6 +579,130 @@ fn clear_against_collapse_never_underflows() {
         );
         assert_eq!(quiescent_check(t), 0);
     });
+}
+
+// ---------------------------------------------------------------------------
+// `shrink_to_fit` (§13): replacements are built out of place and published
+// under the parent's latch, with the replaced nodes latched and obsoleted.
+
+fn fit(t: &T) {
+    t.shrink_to_fit(&());
+}
+
+fn root_type(t: &T) -> NodeType {
+    unsafe { t.node_ref(t.root()) }.node_type
+}
+
+/// Root "k" as a Node16 left with `{0, 1}`.
+fn node16_pair() -> Arc<T> {
+    tree_less(&[b"k0", b"k1", b"k2", b"k3", b"k4"], &[b"k2", b"k3", b"k4"])
+}
+
+#[test]
+fn fit_shrink_against_get() {
+    model(|| {
+        let t = node16_pair();
+        assert_eq!(root_type(&t), NodeType::Node16);
+        let (w, r) = (Arc::clone(&t), Arc::clone(&t));
+        par(
+            move || fit(&w),
+            move || assert!(r.get(b"k1").is_some(), "false negative during a shrink"),
+        );
+        assert_eq!(
+            root_type(&t),
+            NodeType::Node4,
+            "an uncontended shrink happens"
+        );
+        assert_eq!(quiescent_check(t), 2);
+    });
+}
+
+fn fit_shrink_against_insert_model() {
+    // The insert locks only the Node16 (it has room) while it is copied.
+    let t = node16_pair();
+    let (w, r) = (Arc::clone(&t), Arc::clone(&t));
+    par(move || fit(&w), move || assert!(insert(&r, b"k5")));
+    assert!(t.get(b"k5").is_some(), "the insert was lost");
+    assert_eq!(quiescent_check(t), 3);
+}
+
+#[test]
+fn fit_shrink_against_insert_into_node() {
+    model(fit_shrink_against_insert_model);
+}
+
+#[test]
+fn fit_mutant_without_node_latch() {
+    assert_mutant_fails(
+        &mutants::FIT_WITHOUT_NODE_LATCH,
+        fit_shrink_against_insert_model,
+    );
+}
+
+#[test]
+fn fit_shrink_against_remove() {
+    model(|| {
+        let t = node16_pair();
+        let (w, r) = (Arc::clone(&t), Arc::clone(&t));
+        par(move || fit(&w), move || assert!(remove(&r, b"k0")));
+        assert!(t.get(b"k1").is_some());
+        assert_eq!(quiescent_check(t), 1);
+    });
+}
+
+#[test]
+fn fit_collapse_against_get() {
+    // Root {a: N {1}, b}: N gives way to its leaf under a reader.
+    model(|| {
+        let t = tree_less(&[b"a1", b"a2", b"b"], &[b"a2"]);
+        let (w, r) = (Arc::clone(&t), Arc::clone(&t));
+        par(
+            move || fit(&w),
+            move || assert!(r.get(b"a1").is_some(), "false negative during a collapse"),
+        );
+        assert_eq!(quiescent_check(t), 2);
+    });
+}
+
+/// Root "a" with the single child C "c" {1, 2}.
+fn single_child() -> Arc<T> {
+    tree_less(&[b"ax", b"abc1", b"abc2"], &[b"ax"])
+}
+
+#[test]
+fn fit_merge_against_get() {
+    // The root merges into a copy of C with the prefix "abc".
+    model(|| {
+        let t = single_child();
+        let (w, r) = (Arc::clone(&t), Arc::clone(&t));
+        par(
+            move || fit(&w),
+            move || assert!(r.get(b"abc1").is_some(), "false negative during a merge"),
+        );
+        assert_eq!(quiescent_check(t), 2);
+    });
+}
+
+fn fit_merge_against_insert_model() {
+    // The insert locks only C (it has room) while C is copied.
+    let t = single_child();
+    let (w, r) = (Arc::clone(&t), Arc::clone(&t));
+    par(move || fit(&w), move || assert!(insert(&r, b"abc3")));
+    assert!(t.get(b"abc3").is_some(), "the insert was lost");
+    assert_eq!(quiescent_check(t), 3);
+}
+
+#[test]
+fn fit_merge_against_insert_into_child() {
+    model(fit_merge_against_insert_model);
+}
+
+#[test]
+fn fit_mutant_merge_without_child_latch() {
+    assert_mutant_fails(
+        &mutants::MERGE_WITHOUT_CHILD_LATCH,
+        fit_merge_against_insert_model,
+    );
 }
 
 // ---------------------------------------------------------------------------

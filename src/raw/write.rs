@@ -30,7 +30,9 @@
 //! A failed upgrade or re-check retries from the root. There is no lock-free
 //! insert path (Inv 8, §9.9): every publication happens under the owning latch.
 //!
-//! Removes, and the compaction they trigger, are in [`remove`](super::remove).
+//! Removes, and the unlinking of the nodes they empty, are in
+//! [`remove`](super::remove); fitting nodes to their entries is in
+//! [`shrink`](super::shrink).
 
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 

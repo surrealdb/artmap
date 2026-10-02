@@ -195,10 +195,11 @@ fn deep_keys_do_not_overflow_the_stack() {
 }
 
 #[test]
-fn deep_chains_collapse_when_their_keys_are_removed() {
+fn deep_chains_are_unlinked_with_their_last_key() {
     // [core-write-5] Two keys sharing 1 MiB build a chain of ~60k Node4s.
-    // Removing one collapses the whole chain, iteratively (Inv 13) and in one
-    // pass up it: a re-descent per link would take minutes.
+    // Removing the last key under it unlinks the whole chain, iteratively
+    // (Inv 13) and in one pass up it: a re-descent per link would take
+    // minutes. `shrink_to_fit` collapses it the same way while a key remains.
     let prefix = if cfg!(miri) { 2_000 } else { 1 << 20 };
     std::thread::Builder::new()
         .stack_size(2 << 20)
@@ -209,26 +210,40 @@ fn deep_chains_collapse_when_their_keys_are_removed() {
                 k.push(last);
                 k
             };
+            let mid = vec![7u8; prefix / 2];
             m.insert(key(1), 1);
             m.insert(key(2), 2);
-            m.insert(vec![7u8; prefix / 2], 3);
-            let start = std::time::Instant::now();
+            m.insert(mid.clone(), 3);
             assert_eq!(m.remove(&key(1)[..]).as_deref(), Some(&1));
-            assert_eq!(m.remove(&vec![7u8; prefix / 2][..]).as_deref(), Some(&3));
+            assert_eq!(m.remove(&mid[..]).as_deref(), Some(&3));
+            m.validate_invariants();
+            let start = std::time::Instant::now();
+            assert_eq!(m.remove(&key(2)[..]).as_deref(), Some(&2));
             if !cfg!(miri) {
                 assert!(
                     start.elapsed() < std::time::Duration::from_secs(10),
-                    "collapsing a chain took {:?}",
+                    "unlinking a chain took {:?}",
+                    start.elapsed()
+                );
+            }
+            assert!(m.is_empty());
+            assert!(m.iter().next().is_none());
+            m.validate_invariants();
+            // With one key left, fitting collapses the chain into it.
+            m.insert(key(1), 1);
+            m.insert(key(2), 2);
+            assert_eq!(m.remove(&key(1)[..]).as_deref(), Some(&1));
+            let start = std::time::Instant::now();
+            m.shrink_to_fit();
+            if !cfg!(miri) {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(10),
+                    "fitting a chain took {:?}",
                     start.elapsed()
                 );
             }
             assert_eq!(m.get(&key(2)[..]).as_deref(), Some(&2));
             m.validate_invariants();
-            assert_eq!(m.remove(&key(2)[..]).as_deref(), Some(&2));
-            assert!(m.is_empty());
-            m.validate_invariants();
-            m.insert(key(1), 1);
-            assert_eq!(m.iter().count(), 1);
         })
         .unwrap()
         .join()
@@ -252,6 +267,8 @@ fn a_registry_emptied_by_removes_is_compact() {
     for k in keys.iter().step_by(2) {
         assert!(m.remove(&k[..]).is_some());
     }
+    m.validate_invariants();
+    m.shrink_to_fit();
     m.validate_invariants();
     for k in keys.iter().skip(1).step_by(2).rev() {
         assert!(m.remove(&k[..]).is_some());

@@ -228,14 +228,16 @@ fn fresh_inserts_and_removes_are_exact_during_prefix_splits() {
     map.validate_invariants();
 }
 
-/// Key families whose nodes delete-side compaction reshapes (§13). Sentinels
-/// are never removed; removing the churn keys next to them collapses a node
-/// into its last leaf ('a'), merges a node into its only child ('b'),
-/// collapses a prefix chain and follows up through it ('c'), or empties a
-/// whole subtree ('d'). Re-inserting them rebuilds each shape.
+/// Key families whose nodes removes and `shrink_to_fit` reshape (§13).
+/// Sentinels are never removed. Removing the churn keys beside them leaves a
+/// node with one leaf ('a'), a node with one child node ('b'), a prefix chain
+/// above one leaf ('c') and a node far larger than its entries ('f'), which
+/// `shrink_to_fit` collapses, merges and shrinks; and it empties whole
+/// subtrees ('d', and the prefix chain 'e'), which removes unlink.
+/// Re-inserting them rebuilds each shape.
 fn compaction_family(group: u8) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
-    let chain = |last: u8| {
-        let mut k = vec![group, b'c'];
+    let chain = |tag: u8, last: u8| {
+        let mut k = vec![group, tag];
         k.extend_from_slice(&[b'-'; 30]);
         k.push(last);
         k
@@ -244,18 +246,27 @@ fn compaction_family(group: u8) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         vec![group, b'a', b's'],
         vec![group, b'b', b'x', b'1'],
         vec![group, b'b', b'x', b'2'],
-        chain(1),
+        chain(b'c', 1),
+        vec![group, b'f', 0xFF],
     ];
-    let mut churn = vec![vec![group, b'a', b'c'], vec![group, b'b', b'y'], chain(2)];
+    let mut churn = vec![
+        vec![group, b'a', b'c'],
+        vec![group, b'b', b'y'],
+        chain(b'c', 2),
+        chain(b'e', 1),
+        chain(b'e', 2),
+    ];
     churn.extend((0..6).map(|i| vec![group, b'd', i]));
+    churn.extend((0..40).map(|i| vec![group, b'f', i]));
     (sentinels, churn)
 }
 
 #[test]
 fn compaction_churn_never_hides_a_sentinel() {
-    // Writers toggle the churn keys, so nodes collapse, merge and are rebuilt
-    // around the sentinels, while readers look every sentinel up and scan
-    // them in both directions.
+    // Writers toggle the churn keys, so subtrees are emptied, unlinked and
+    // rebuilt around the sentinels, and one thread fits the tree over and
+    // over (collapsing, merging and shrinking nodes), while readers look every
+    // sentinel up and scan them in both directions.
     const GROUPS: u8 = 6;
     let map = Arc::new(ArtMap::<Vec<u8>, u64>::new());
     let mut sentinels = Vec::new();
@@ -272,11 +283,14 @@ fn compaction_churn_never_hides_a_sentinel() {
     let (sentinels, churn) = (Arc::new(sentinels), Arc::new(churn));
     let m = Arc::clone(&map);
     let s = Arc::clone(&sentinels);
-    run(threads(), move |t, stop| {
+    let n = threads();
+    run(n + 1, move |t, stop| {
         let mut rng = StdRng::seed_from_u64(700 + t as u64);
         let is_sentinel = |k: &Vec<u8>| s.binary_search(k).is_ok();
         while !stop.load(Ordering::Relaxed) {
-            if t % 2 == 0 {
+            if t == n {
+                m.shrink_to_fit();
+            } else if t % 2 == 0 {
                 let k = &churn[rng.gen_range(0..churn.len())];
                 if rng.gen() {
                     m.insert(k.clone(), 1);
@@ -306,13 +320,15 @@ fn compaction_churn_never_hides_a_sentinel() {
                     .range(vec![g]..vec![g + 1])
                     .filter(|e| is_sentinel(e.key()))
                     .count();
-                assert_eq!(got, 4, "a group's range sees its sentinels");
+                assert_eq!(got, 5, "a group's range sees its sentinels");
             }
         }
     });
     let mut map = Arc::try_unwrap(map).ok().unwrap();
     assert_eq!(map.len(), map.iter().count());
-    // No node is left empty or holding a single leaf.
+    // No node is left empty.
+    map.validate_invariants();
+    map.shrink_to_fit();
     map.validate_invariants();
 }
 

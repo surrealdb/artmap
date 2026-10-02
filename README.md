@@ -106,7 +106,7 @@ Benchmarked with 100,000 keys (64-bit integer keys and 64-bit values), measuring
 ## Features
 
 - **Adaptive Radix Tree**: inner nodes resize between four layouts (`Node4`, `Node16`, `Node48` and `Node256`) for cache locality. Prefix compression collapses single-child paths.
-- **Delete-side compaction**: removes unlink the inner nodes they empty, so memory follows the live keys under delete churn.
+- **Delete-side reclamation**: removes unlink the inner nodes they empty, so memory follows the live keys under delete churn, and `shrink_to_fit()` fits the nodes that removes leave oversized.
 - **Optimistic lock coupling**: readers validate per-node version counters and retry on conflict. They never block and never write to shared memory.
 - **MVCC**: per-key chains of 64-bit versions with snapshot reads, tombstones and pruning.
 - **SIMD `Node16` search**: SSE2 on x86_64 and NEON on aarch64.
@@ -322,21 +322,38 @@ The arena's capacity is fixed. Updates and removes do not free arena memory: rep
 
 Removed and replaced entries are reclaimed once no guard can still see them in the EBR maps, and when the map is dropped in the arena maps.
 
-Removes also compact the tree. A node that a remove leaves empty is unlinked; a node left with a single leaf is replaced by that leaf; and a node left with a single inner child is merged into it, when their two prefixes fit in one node. So `ArtMap`'s memory follows its live keys, which matters for queues and registries whose keys keep changing:
+Removes also unlink the inner nodes they empty, so `ArtMap`'s memory follows its live keys, which matters for queues and registries whose keys keep changing:
 
-| After 2M inserts and 2M − 1,000 removes (1,000 live keys) | 0.6.0 | With compaction |
+| After 2M inserts and 2M − 1,000 removes (1,000 live keys) | 0.6.0 | With unlinking |
 | :--- | ---: | ---: |
 | `ArtMap<[u8; 8], u64>` used as a queue | 16.7 MB | 49 KB |
 
-Nodes are not shrunk to a smaller layout as they lose children: a `Node256` left with a few children keeps its size until it is down to one.
+A node that still holds an entry is left as it is, so after many removes a node can keep a layout sized for far more entries than it has: a `Node256` left with one child keeps its 2 KiB. `shrink_to_fit()` fits every node on demand, while readers and writers carry on: a node left with one leaf gives way to it, one left with a single child node is merged into it, and every other node is shrunk to the smallest layout that holds its entries.
 
-- **Arena maps** compact too, so scans never walk dead nodes, but arena memory is only freed when the map is dropped.
+```rust
+use artmap::ArtMap;
+
+let map = ArtMap::<[u8; 8], u64>::new();
+for i in 0..100_000u64 {
+    map.insert(i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes(), i);
+}
+// Keep one key in a hundred.
+for i in (0..100_000u64).filter(|i| i % 100 != 0) {
+    map.remove(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
+}
+map.shrink_to_fit();
+assert_eq!(map.len(), 1_000);
+```
+
+A registry of 200,000 random keys thinned to 2,000 holds 735 KB after its removes, and 94 KB after `shrink_to_fit()`.
+
+- **Arena maps** unlink emptied nodes too, so scans never walk dead nodes, but arena memory is only freed when the map is dropped, and they have no `shrink_to_fit()`: its smaller copies would only add to the arena.
 - **Versioned maps** never unlink a key: `delete` writes a tombstone and `prune_key` keeps the key, so a deleted key keeps its leaf and a tombstone, and their nodes are never emptied.
 
 ## Verification
 
 - **Miri**, under Tree Borrows: the EBR suites, and the arena suites leak-checked with strict provenance and symbolic alignment checks, on x86_64 and aarch64.
-- **loom** models of the real latch and node protocol, including delete-side compaction against lookups, inserts, cached-node inserts and `clear`. Each protocol has mutants that must fail: a missing writer fence, a missing validation fence, missing lock coupling, a node unlinked without its own latch, and a merge that does not bump the merged node's version.
+- **loom** models of the real latch and node protocol, including removes that empty nodes and `shrink_to_fit` against lookups, inserts, cached-node inserts, removes and `clear`. Each protocol has mutants that must fail: a missing writer fence, a missing validation fence, missing lock coupling, a node unlinked or fitted without its own latch, and a merge without the child's latch.
 - **ThreadSanitizer and AddressSanitizer** over the race and stress tests.
 - **Model tests** of every map and iterator against `BTreeMap`. Property tests over arbitrary byte keys, and a linearizability checker for point operations and `clear`.
 - **Fault injection**: panicking `AsBytes`, `Clone` and closures, and re-entrant user code, at every call site.

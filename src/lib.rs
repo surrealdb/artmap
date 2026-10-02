@@ -500,6 +500,41 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> ArtMap<K, V> {
         self.tree.raw.clear(&g);
     }
 
+    /// Fits the tree to its entries, releasing the memory that removes leave
+    /// in nodes too large for what they still hold.
+    ///
+    /// A remove unlinks the nodes it empties, but leaves a node that still
+    /// has an entry as it is, so after many removes a node can keep a layout
+    /// sized for far more entries: a `Node256` left with one child keeps its
+    /// 2 KiB. This visits every node once and fits it: a node left with a
+    /// single leaf is replaced by that leaf, a node left with a single child
+    /// node is merged into it when their key prefixes fit in one node, and
+    /// every other node is shrunk to the smallest layout that holds its
+    /// entries (`Node4`, `Node16`, `Node48` or `Node256`). The nodes it
+    /// replaces are reclaimed through EBR, like removed entries.
+    ///
+    /// It runs in O(n) on the calling thread, under one epoch pin, holding at
+    /// most three node latches at a time, while readers and writers carry on.
+    /// It is best effort: a node that concurrent writers keep changing may be
+    /// left as it is.
+    ///
+    /// ```
+    /// let map = artmap::ArtMap::<[u8; 2], u32>::new();
+    /// for i in 0..=255u8 {
+    ///     map.insert([0, i], i as u32);
+    /// }
+    /// for i in 1..=255u8 {
+    ///     map.remove(&[0, i]);
+    /// }
+    /// // The last key's node is a Node256; fitting replaces it by the key.
+    /// map.shrink_to_fit();
+    /// assert_eq!(map.get_value(&[0, 0]), Some(0));
+    /// ```
+    pub fn shrink_to_fit(&self) {
+        let g = pin();
+        self.tree.raw.shrink_to_fit(&g);
+    }
+
     /// Checks the tree's structural invariants and that `len()` equals the
     /// number of reachable entries. Panics on a violation. Requires exclusive
     /// access, so it never races with writers.

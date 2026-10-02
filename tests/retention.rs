@@ -117,13 +117,37 @@ fn registry_to_empty() -> usize {
     held(base)
 }
 
+/// A registry thinned to one key in a hundred: removes leave the large nodes
+/// that still hold an entry, and `shrink_to_fit` fits them. Returns the held
+/// bytes before and after fitting, and with no map at all for the live keys.
+fn thinned_registry() -> (usize, usize) {
+    settle();
+    let base = live();
+    let map = ArtMap::<[u8; 8], u64>::new();
+    let key = |i: u64| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i >> 7)).to_be_bytes();
+    for i in 0..200_000u64 {
+        map.insert(key(i), i);
+    }
+    for i in (0..200_000u64).filter(|i| i % 100 != 0) {
+        assert!(map.remove(&key(i)).is_some());
+    }
+    assert_eq!(map.len(), 2_000);
+    let thinned = held(base);
+    map.shrink_to_fit();
+    (thinned, held(base))
+}
+
 #[test]
 fn delete_churn_does_not_retain_inner_nodes() {
     let queue = sliding_window(b"");
     // A 40-byte shared prefix: the keys sit under a chain of Node4s.
     let chained = sliding_window(&[b'q'; 40]);
     let registry = registry_to_empty();
-    eprintln!("held bytes: queue {queue}, chained queue {chained}, emptied registry {registry}");
+    let (thinned, fitted) = thinned_registry();
+    eprintln!(
+        "held bytes: queue {queue}, chained queue {chained}, emptied registry {registry}, \
+         thinned registry {thinned} then {fitted} after shrink_to_fit"
+    );
     // 1,000 live keys need about 50 KB. The bounds leave room for the
     // destructors still deferred in a thread's epoch bag.
     assert!(queue < 1 << 20, "queue holds {queue} bytes for 1,000 keys");
@@ -132,4 +156,10 @@ fn delete_churn_does_not_retain_inner_nodes() {
         registry < 256 << 10,
         "an emptied registry holds {registry} bytes"
     );
+    // 2,000 live keys; fitting releases the nodes sized for 200,000.
+    assert!(
+        fitted * 2 < thinned,
+        "shrink_to_fit kept {fitted} of {thinned} bytes"
+    );
+    assert!(fitted < 512 << 10, "a fitted registry holds {fitted} bytes");
 }

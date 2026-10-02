@@ -36,9 +36,9 @@ pub(crate) const MAX_PREFIX_LEN: usize = 16;
 /// treated as absent (R2).
 pub(crate) const NODE48_EMPTY: u8 = 48;
 
-/// Discriminated node type; immutable after construction.
+/// Discriminated node type; immutable after construction. Ordered by size.
 #[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum NodeType {
     Node4 = 0,
     Node16 = 1,
@@ -54,6 +54,17 @@ impl NodeType {
             NodeType::Node16 => 16,
             NodeType::Node48 => 48,
             NodeType::Node256 => 256,
+        }
+    }
+
+    /// The smallest layout that holds `children` children.
+    #[inline]
+    pub(crate) fn fitting(children: usize) -> NodeType {
+        match children {
+            0..=4 => NodeType::Node4,
+            5..=16 => NodeType::Node16,
+            17..=48 => NodeType::Node48,
+            _ => NodeType::Node256,
         }
     }
 
@@ -619,6 +630,16 @@ impl<A: AtomicSlot> NodeHeader<A> {
         }
     }
 
+    /// `true` if taking out `taken` leaves this node with no entry (§13). Two
+    /// loads and no scan: without the latch the caller validates the node's
+    /// version before acting on it (R3); under the latch it is exact.
+    #[inline]
+    pub(crate) fn emptied_by(&self, taken: Taken) -> bool {
+        let has_exact = !self.exact_leaf().is_null() && taken != Taken::Exact;
+        let taken_child = usize::from(matches!(taken, Taken::Child(_)));
+        (self.num_children() + usize::from(has_exact)).saturating_sub(taken_child) == 0
+    }
+
     /// What this node holds besides `taken` (§13).
     ///
     /// Without the latch the answer is optimistic, and the caller validates
@@ -816,7 +837,8 @@ impl<A: AtomicSlot> NodeHeader<A> {
     }
 
     /// Copies this node's prefix, exact leaf and children into `dst`, an
-    /// unpublished node of a larger type. Caller holds this node's latch, so
+    /// unpublished node of a type that holds them (a larger one for growth, a
+    /// smaller one for `shrink_to_fit`). Caller holds this node's latch, so
     /// the copy is exact.
     pub(crate) fn copy_into(&self, dst: &mut NodeHeader<A>) {
         dst.init_prefix(self.load_prefix().as_slice());
