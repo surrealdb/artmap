@@ -126,16 +126,18 @@ fn test_versioned_artmap_range_and_scan() {
 
 #[test]
 fn test_versioned_artmap_concurrent_writes() {
+    // Miri interprets every thread on one core: fewer threads and keys.
+    let (threads, per) = if cfg!(miri) { (4, 50) } else { (8, 500) };
     let map = Arc::new(VersionedArtMap::<String, usize>::new());
-    let barrier = Arc::new(Barrier::new(8));
+    let barrier = Arc::new(Barrier::new(threads));
 
     let mut handles = Vec::new();
-    for thread_id in 0..8 {
+    for thread_id in 0..threads {
         let map = Arc::clone(&map);
         let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
             barrier.wait();
-            for i in 0..500 {
+            for i in 0..per {
                 let k = format!("thread:{thread_id}:item:{i:04}");
                 map.insert(k, 1, i);
             }
@@ -146,10 +148,10 @@ fn test_versioned_artmap_concurrent_writes() {
         h.join().unwrap();
     }
 
-    assert_eq!(map.len(), 4000);
+    assert_eq!(map.len(), threads * per);
 
-    for thread_id in 0..8 {
-        for i in 0..500 {
+    for thread_id in 0..threads {
+        for i in 0..per {
             let k = format!("thread:{thread_id}:item:{i:04}");
             assert_eq!(map.get(&k), Some(i));
             assert_eq!(map.get_version_le(&k, 1), Some((1, i)));

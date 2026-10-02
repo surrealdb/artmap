@@ -358,15 +358,15 @@ A node that still holds an entry is left as it is, so after many removes a node 
 use artmap::ArtMap;
 
 let map = ArtMap::<[u8; 8], u64>::new();
-for i in 0..100_000u64 {
+for i in 0..1_000u64 {
     map.insert(i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes(), i);
 }
 // Keep one key in a hundred.
-for i in (0..100_000u64).filter(|i| i % 100 != 0) {
+for i in (0..1_000u64).filter(|i| i % 100 != 0) {
     map.remove(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
 }
 map.shrink_to_fit();
-assert_eq!(map.len(), 1_000);
+assert_eq!(map.len(), 10);
 ```
 
 A registry of 200,000 random keys thinned to 2,000 holds 735 KB after its removes, and 94 KB after `shrink_to_fit()`.
