@@ -60,4 +60,9 @@ impl<K: AsBytes, V> LeafNode for Leaf<K, V> {
     fn mark_removed(&self) {
         self.removed.store(true, Ordering::Release);
     }
+
+    #[inline]
+    fn is_removed(&self) -> bool {
+        Leaf::is_removed(self)
+    }
 }

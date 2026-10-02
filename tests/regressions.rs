@@ -469,13 +469,15 @@ fn concurrent_prunes_with_different_watermarks() {
 fn prune_all_includes_deleted_keys() {
     // [gap-heap-versioned-parity-5] prune_all iterated with Range, which
     // skips deleted keys, so their chains were never pruned.
-    let m = VersionedArtMap::<Vec<u8>, u64>::new();
+    let mut m = VersionedArtMap::<Vec<u8>, u64>::new();
     for v in 1..=5 {
         m.insert(b"gone".to_vec(), v, v);
     }
     m.delete(b"gone".to_vec(), 6);
-    assert_eq!(m.prune_all(6, |_| false), 5);
-    assert_eq!(m.version_count(&b"gone"[..]), 1);
+    // No snapshot at or above 6 sees the key: it goes, with all six versions.
+    assert_eq!(m.prune_all(6, |_| false), 6);
+    assert_eq!(m.version_count(&b"gone"[..]), 0);
+    m.validate_invariants();
 }
 
 #[test]
@@ -516,15 +518,15 @@ fn cloning_a_handle_in_a_thread_local_destructor_never_uafs() {
 #[test]
 fn pruning_a_user_tombstone_in_the_only_inline_slot() {
     // The key's only version lives in slot0 and is a user tombstone: prune
-    // replaces it out of place with a built-in tombstone and only marks the
-    // inline head superseded (§11.4).
+    // unlinks the whole leaf, and the leaf's own drop releases the slot
+    // (§11.4, §13).
     let map = VersionedArtMap::<Vec<u8>, u64>::new();
     map.insert(b"k".to_vec(), 1, 0);
     assert_eq!(map.len(), 1);
-    map.prune_key(&b"k"[..], u64::MAX, |v| *v == 0);
+    assert_eq!(map.prune_key(&b"k"[..], u64::MAX, |v| *v == 0), 1);
     assert_eq!(map.len(), 0);
     assert!(map.get(&b"k"[..]).is_none());
-    assert_eq!(map.get_all_versions(&b"k"[..]), vec![(1, None)]);
+    assert!(map.get_all_versions(&b"k"[..]).is_empty());
     // The key comes back with a newer version.
     map.insert(b"k".to_vec(), 2, 5);
     assert_eq!(map.get(&b"k"[..]), Some(5));

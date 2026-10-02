@@ -45,9 +45,12 @@ use crate::versioned::tree::{chain, find_le, VersionedTree};
 ///   is a tombstone are skipped.
 /// - After `prune_key(k, min, ..)` or `prune_all(min, ..)`, `get_version_le(k, v)`
 ///   is exact for `v >= min` and unsupported for `v < min` (the watermark
-///   contract).
-/// - Deleted keys keep their leaf and one tombstone until pruned; leaves are
-///   never unlinked in this release.
+///   contract). Writes at or below `min` are unsupported too: a key that
+///   pruning removed is created afresh by such a write, which then shows as
+///   its newest version.
+/// - A deleted key keeps its leaf and tombstone until a prune at or above the
+///   tombstone's version unlinks it, or `remove_key` does. `remove_key` and
+///   `remove_version` change history for every snapshot; `delete` does not.
 pub struct VersionedArtMap<K, V> {
     tree: VersionedTree<K, V>,
 }
@@ -271,6 +274,78 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
         VersionedEntryRef::new(leaf, unsafe { old.as_ref() }, &self.tree, guard)
     }
 
+    /// Removes `key` and every version of it, for every snapshot, unlike
+    /// [`delete`](Self::delete). Returns `true` if the key had any version,
+    /// live or not.
+    ///
+    /// ```
+    /// let map = artmap::VersionedArtMap::<String, u32>::new();
+    /// map.insert("k".to_string(), 1, 7);
+    /// map.delete("k".to_string(), 2);
+    /// assert!(map.remove_key("k"));
+    /// assert_eq!(map.get_version_le("k", 1), None);
+    /// assert_eq!(map.version_count("k"), 0);
+    /// assert!(!map.remove_key("k"));
+    /// ```
+    pub fn remove_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        let g = &pin();
+        self.tree.remove_key(key.as_bytes(), g)
+    }
+
+    /// Removes exactly `version` of `key`, a value or a tombstone, for every
+    /// snapshot, for example to roll back a write. The key goes with its last
+    /// version. Returns `true` if that version existed.
+    ///
+    /// ```
+    /// let map = artmap::VersionedArtMap::<String, u32>::new();
+    /// map.insert("k".to_string(), 1, 10);
+    /// map.insert("k".to_string(), 2, 20);
+    /// assert!(map.remove_version("k", 2));
+    /// assert_eq!(map.get("k"), Some(10));
+    /// assert!(map.remove_version("k", 1));
+    /// assert_eq!(map.version_count("k"), 0);
+    /// assert!(!map.remove_version("k", 1));
+    /// ```
+    pub fn remove_version<Q>(&self, key: &Q, version: u64) -> bool
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        let g = &pin();
+        self.tree.remove_version(key.as_bytes(), version, g)
+    }
+
+    /// Removes every key and version. Linearizable with respect to point
+    /// operations: the linearization point is the swap of the root. Runs in
+    /// O(n) on the calling thread, holding at most one node latch at a time.
+    pub fn clear(&self) {
+        let g = &pin();
+        self.tree.clear(g);
+    }
+
+    /// Fits the tree to its keys, releasing the memory that removes and
+    /// prunes leave in nodes too large for what they still hold. As
+    /// [`ArtMap::shrink_to_fit`](crate::ArtMap::shrink_to_fit): a node left
+    /// with one key gives way to it, one left with a single child node is
+    /// merged into it when their prefixes fit, and every other node is shrunk
+    /// to the smallest layout that holds its entries. Keys and their versions
+    /// are not touched, so it runs alongside readers and writers.
+    pub fn shrink_to_fit(&self) {
+        let g = &pin();
+        self.tree.raw.shrink_to_fit(g);
+    }
+
+    /// Checks the tree's structural invariants, and that `len()` equals the
+    /// number of reachable keys whose newest version is live. Panics on a
+    /// violation. Requires exclusive access, so it never races with writers.
+    pub fn validate_invariants(&mut self) {
+        self.tree.validate();
+    }
+
     /// The number of versions of `key`, including tombstones.
     pub fn version_count<Q>(&self, key: &Q) -> usize
     where
@@ -303,12 +378,14 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
     }
 
     /// Unlinks every version of `key` older than its newest version
-    /// `<= min_version`. If that version is the newest one and `is_tombstone`
-    /// says its value is a tombstone, it is replaced by a built-in tombstone.
-    /// Returns the number of versions unlinked. The key itself stays in the
-    /// map (with a tombstone) in this release.
+    /// `<= min_version`. If that version is the key's newest one and is a
+    /// tombstone (a `delete`, or a value that `is_tombstone` accepts), no
+    /// snapshot at or above `min_version` can see the key, so the key itself
+    /// is unlinked with all its versions. Returns the number of versions
+    /// unlinked.
     ///
-    /// `is_tombstone` runs without any latch held.
+    /// `is_tombstone` runs without any latch held. See the type's docs for the
+    /// watermark contract.
     ///
     /// ```
     /// let map = artmap::VersionedArtMap::<String, u32>::new();
@@ -332,8 +409,20 @@ impl<K: AsBytes + Send + 'static, V: Send + 'static> VersionedArtMap<K, V> {
         }
     }
 
-    /// [`prune_key`](Self::prune_key) for every key, including deleted ones.
-    /// Repins periodically so a long prune does not stall reclamation.
+    /// [`prune_key`](Self::prune_key) for every key, including deleted ones,
+    /// which it unlinks once `min_version` passes their tombstone. Repins
+    /// periodically so a long prune does not stall reclamation.
+    ///
+    /// ```
+    /// let map = artmap::VersionedArtMap::<String, u32>::new();
+    /// map.insert("a".to_string(), 1, 1);
+    /// map.insert("b".to_string(), 1, 2);
+    /// map.delete("b".to_string(), 2);
+    /// assert_eq!(map.prune_all(2, |_| false), 2);
+    /// // "b" is gone with both its versions; "a" keeps its only version.
+    /// assert_eq!(map.version_count("b"), 0);
+    /// assert_eq!(map.version_count("a"), 1);
+    /// ```
     pub fn prune_all<F>(&self, min_version: u64, is_tombstone: F) -> usize
     where
         F: Fn(&V) -> bool,

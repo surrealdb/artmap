@@ -131,3 +131,66 @@ fn every_heap_key_and_value_is_dropped_exactly_once() {
         "leaked or double-dropped"
     );
 }
+
+#[test]
+fn versioned_removes_prunes_and_clears_drop_everything_once() {
+    // §13: an unlinked versioned leaf is retired whole, with every version
+    // still in its chain; versions unlinked from a live chain are retired one
+    // by one. Nothing leaks and nothing drops twice.
+    #[derive(Clone)]
+    struct K(Vec<u8>, Arc<AtomicUsize>);
+    impl Drop for K {
+        fn drop(&mut self) {
+            self.1.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    impl AsBytes for K {
+        fn as_bytes(&self) -> &[u8] {
+            &self.0
+        }
+    }
+    impl std::borrow::Borrow<[u8]> for K {
+        fn borrow(&self) -> &[u8] {
+            &self.0
+        }
+    }
+    let drops = Arc::new(AtomicUsize::new(0));
+    let d = Arc::clone(&drops);
+    let created = std::thread::spawn(move || {
+        let mut created = 0;
+        let m = VersionedArtMap::<K, Counted>::new();
+        for i in 0..n(1500, 60) as u64 {
+            let k = format!("k{:02}", i % 23).into_bytes();
+            m.insert(K(k.clone(), Arc::clone(&d)), i, Counted(Arc::clone(&d)));
+            created += 2;
+            match i % 9 {
+                0 => {
+                    m.delete(K(k.clone(), Arc::clone(&d)), i + 1);
+                    created += 1;
+                }
+                1 => {
+                    m.remove_key(&k[..]);
+                }
+                2 => {
+                    m.remove_version(&k[..], i);
+                }
+                3 => {
+                    m.prune_key(&k[..], i, |_| false);
+                }
+                4 if i % 4 == 0 => {
+                    m.prune_all(i.saturating_sub(5), |_| i % 8 == 0);
+                }
+                5 if i % 50 == 5 => m.clear(),
+                _ => {}
+            }
+        }
+        created
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        await_drops(&drops, created),
+        created,
+        "leaked or double-dropped"
+    );
+}

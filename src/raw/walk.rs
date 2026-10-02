@@ -61,6 +61,19 @@ impl<S: Storage> RawTree<S> {
     ///
     /// The caller has pinned before calling (Inv 6).
     pub(crate) fn clear(&self, guard: &S::Guard) {
+        self.clear_counting(guard, |_| 1);
+    }
+
+    /// As [`clear`](Self::clear), where `count` returns the `len` each
+    /// detached leaf accounts for (for a versioned leaf, after killing its
+    /// chain, whether its newest version is live). It runs under the leaf's
+    /// node latch, or after the root swap for a root leaf, with the same
+    /// restrictions as `remove_confirmed`'s `confirm`.
+    pub(crate) fn clear_counting(
+        &self,
+        guard: &S::Guard,
+        count: impl Fn(std::ptr::NonNull<S::Leaf>) -> isize,
+    ) {
         let old = {
             let Some(w) = self.root_latch.lock() else {
                 unreachable!("root latch is never obsolete")
@@ -77,16 +90,16 @@ impl<S: Storage> RawTree<S> {
         // The walk allocates (worklist, deferred bags); an unwind mid-walk would
         // leave detached nodes un-obsoleted and `len` wrong.
         let bomb = AbortOnUnwind;
-        let mut count = 0isize;
+        let mut total = 0isize;
         let mut work = vec![old];
         while let Some(raw) = work.pop() {
             if raw.is_leaf() {
                 // A detached root leaf, published before the swap.
                 // SAFETY: protected leaf, now unreachable from the root.
                 let leaf = unsafe { self.storage.leaf(raw) };
+                total += count(leaf);
                 // SAFETY: as above.
                 unsafe { leaf.as_ref() }.mark_removed();
-                count += 1;
                 // SAFETY: unreachable for new readers, retired once.
                 unsafe { self.storage.retire_leaf(leaf, guard) };
                 continue;
@@ -113,10 +126,11 @@ impl<S: Storage> RawTree<S> {
             });
             for &l in &leaves {
                 // SAFETY: protected leaf held by a node whose latch we hold.
+                total += count(unsafe { self.storage.leaf(l) });
+                // SAFETY: as above.
                 unsafe { self.leaf_ref(l) }.mark_removed();
             }
             w.mark_obsolete();
-            count += leaves.len() as isize;
             for l in leaves {
                 // SAFETY: its only home is an obsolete, unlinked node.
                 unsafe { self.storage.retire_leaf(self.storage.leaf(l), guard) };
@@ -124,7 +138,7 @@ impl<S: Storage> RawTree<S> {
             // SAFETY: unlinked and obsolete, retired once.
             unsafe { self.storage.retire_node(self.storage.node(raw), guard) };
         }
-        self.len_add(-count);
+        self.len_add(-total);
         bomb.defuse();
     }
 
@@ -135,6 +149,17 @@ impl<S: Storage> RawTree<S> {
     /// with a single entry is allowed: removes leave them, and prefix chains
     /// are built that way.
     pub(crate) fn validate(&mut self) -> usize {
+        self.validate_counting(|_| 1)
+    }
+
+    /// As [`validate`](Self::validate), where `live` is the `len` each
+    /// reachable leaf accounts for (for a versioned leaf, whether its newest
+    /// version is live). Returns the number of reachable leaves.
+    pub(crate) fn validate_counting(
+        &mut self,
+        live: impl Fn(std::ptr::NonNull<S::Leaf>) -> usize,
+    ) -> usize {
+        let mut live_total = 0usize;
         let root = self.root();
         let mut count = 0usize;
         // (node, path length before this node's prefix)
@@ -150,12 +175,16 @@ impl<S: Storage> RawTree<S> {
             }
             if raw.is_leaf() {
                 // SAFETY: exclusive access (`&mut self`); live leaf.
-                let k = unsafe { self.leaf_ref(raw) }.key_bytes();
+                let l = unsafe { self.leaf_ref(raw) };
+                assert!(!l.is_removed(), "a reachable leaf is marked removed");
+                let k = l.key_bytes();
                 assert!(
                     k.starts_with(&path),
                     "leaf key {k:?} does not start with its path {path:?}"
                 );
                 count += 1;
+                // SAFETY: as above.
+                live_total += live(unsafe { self.storage.leaf(raw) });
                 continue;
             }
             // SAFETY: exclusive access; live node.
@@ -180,9 +209,13 @@ impl<S: Storage> RawTree<S> {
             if !exact.is_null() {
                 assert!(exact.is_leaf(), "exact_leaf holds an inner node");
                 // SAFETY: exclusive access; live leaf.
-                let k = unsafe { self.leaf_ref(exact) }.key_bytes();
+                let l = unsafe { self.leaf_ref(exact) };
+                assert!(!l.is_removed(), "a reachable leaf is marked removed");
+                let k = l.key_bytes();
                 assert_eq!(k, path.as_slice(), "exact leaf key must equal its path");
                 count += 1;
+                // SAFETY: as above.
+                live_total += live(unsafe { self.storage.leaf(exact) });
             }
             let n = node.num_children();
             let mut seen = 0usize;
@@ -199,7 +232,11 @@ impl<S: Storage> RawTree<S> {
             // Reverse, so the worklist pops children in key order.
             work.extend(children.into_iter().rev());
         }
-        assert_eq!(count, self.len(), "len must equal the reachable leaf count");
+        assert_eq!(
+            live_total,
+            self.len(),
+            "len must equal the reachable live count"
+        );
         count
     }
 }

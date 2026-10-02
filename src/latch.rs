@@ -31,7 +31,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
-use crate::sync::atomic::{fence, AtomicU64, AtomicU8, Ordering};
+use crate::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 
 /// Switches for the loom mutant self-checks (§16.3): each model must fail
 /// with the fence it depends on removed, which proves the model explores.
@@ -56,6 +56,8 @@ pub(crate) mod mutants {
         /// `shrink_to_fit` merges a node into a copy of its child without the
         /// child's latch (Inv 7).
         pub(crate) static MERGE_WITHOUT_CHILD_LATCH: Cell<bool> = const { Cell::new(false) };
+        /// Unlinks a versioned leaf without killing its chain lock (§13).
+        pub(crate) static CHAIN_NOT_KILLED: Cell<bool> = const { Cell::new(false) };
     }
 }
 
@@ -200,18 +202,27 @@ impl Drop for WriteGuard<'_> {
     }
 }
 
-/// A one-byte lock that serialises the writers of one version chain. It is
-/// terminal in the lock order (Inv 7).
+/// The lock that serialises the writers of one version chain. It is terminal
+/// in the lock order (Inv 7).
 ///
 /// Chain readers never validate it: they load `head` and `next` with
 /// `Acquire`, paired with the writers' `Release` stores. So, unlike a
-/// [`HybridLatch`], it needs no version and cannot become obsolete: plain
-/// mutual exclusion (`Acquire` on lock, `Release` on unlock) is enough, in one
-/// byte instead of eight.
+/// [`HybridLatch`], it needs no version: plain mutual exclusion (`Acquire` on
+/// lock, `Release` on unlock) is enough.
+///
+/// It can die (§11, §13): the thread that unlinks the leaf kills it while
+/// holding it, and every later [`lock`](Self::lock) fails, so a writer that
+/// found the leaf before the unlink retries from the tree instead of writing
+/// into an unlinked chain. A dead lock is never locked again, so the arena
+/// reuses its word as the leaf's retired-list link: dead, with the next
+/// retired leaf's (8-aligned) offset in the other bits.
 #[repr(transparent)]
 pub(crate) struct ChainLock {
-    locked: AtomicU8,
+    state: AtomicU32,
 }
+
+const CHAIN_LOCKED: u32 = 0b01;
+const CHAIN_DEAD: u32 = 0b10;
 
 /// Proof that this thread holds a [`ChainLock`]. Dropping it unlocks.
 #[must_use = "dropping a ChainGuard immediately releases the lock"]
@@ -221,32 +232,67 @@ pub(crate) struct ChainGuard<'l> {
 
 impl ChainLock {
     crate::sync::const_fn_unless_loom! {
-        /// Creates an unlocked lock.
+        /// Creates an unlocked, live lock.
         #[inline]
         pub(crate) fn new() -> Self {
             Self {
-                locked: AtomicU8::new(0),
+                state: AtomicU32::new(0),
             }
         }
     }
 
-    /// Blocking acquire (test and test-and-set, with backoff).
+    /// Blocking acquire (test and test-and-set, with backoff). `None` once the
+    /// lock is dead: its leaf is unlinked, and the caller looks the key up
+    /// again.
     #[must_use = "binding the guard is what holds the lock"]
     #[inline]
-    pub(crate) fn lock(&self) -> ChainGuard<'_> {
+    pub(crate) fn lock(&self) -> Option<ChainGuard<'_>> {
         let mut backoff = SpinBackoff::new();
         loop {
             if self
-                .locked
-                .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .state
+                .compare_exchange_weak(0, CHAIN_LOCKED, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                return ChainGuard { lock: self };
+                return Some(ChainGuard { lock: self });
             }
-            while self.locked.load(Ordering::Relaxed) != 0 {
+            loop {
+                let s = self.state.load(Ordering::Relaxed);
+                if s & CHAIN_DEAD != 0 {
+                    return None;
+                }
+                if s == 0 {
+                    break;
+                }
                 backoff.spin();
             }
         }
+    }
+
+    /// `true` once the lock is dead: its leaf has been unlinked (removed,
+    /// pruned or cleared).
+    #[inline]
+    pub(crate) fn is_dead(&self) -> bool {
+        self.state.load(Ordering::Acquire) & CHAIN_DEAD != 0
+    }
+
+    /// The retired-list link of a dead lock (arena leaves).
+    #[inline]
+    pub(crate) fn retired_link(&self) -> u32 {
+        self.state.load(Ordering::Relaxed) & !(CHAIN_LOCKED | CHAIN_DEAD)
+    }
+
+    /// Sets the retired-list link of a dead lock. Only the thread that
+    /// retires the leaf calls it; nothing else writes a dead lock.
+    #[inline]
+    pub(crate) fn set_retired_link(&self, next: u32) {
+        debug_assert!(self.is_dead(), "only a dead chain is retired");
+        debug_assert_eq!(
+            next & (CHAIN_LOCKED | CHAIN_DEAD),
+            0,
+            "leaves are 8-aligned"
+        );
+        self.state.store(CHAIN_DEAD | next, Ordering::Relaxed);
     }
 }
 
@@ -256,12 +302,25 @@ impl ChainGuard<'_> {
     pub(crate) fn holds(&self, lock: &ChainLock) -> bool {
         std::ptr::eq(self.lock, lock)
     }
+
+    /// Kills the lock and releases it: every later `lock` fails. Only for a
+    /// chain whose leaf the caller is about to unlink (§13).
+    #[inline]
+    pub(crate) fn kill(self) {
+        #[cfg(loom)]
+        if mutants::CHAIN_NOT_KILLED.with(|m| m.get()) {
+            // The mutant: release the lock alive.
+            return;
+        }
+        self.lock.state.store(CHAIN_DEAD, Ordering::Release);
+        std::mem::forget(self);
+    }
 }
 
 impl Drop for ChainGuard<'_> {
     #[inline]
     fn drop(&mut self) {
-        self.lock.locked.store(0, Ordering::Release);
+        self.lock.state.store(0, Ordering::Release);
     }
 }
 

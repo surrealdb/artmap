@@ -306,10 +306,17 @@ impl<K: AsBytes, V> LeafNode for VersionedLeaf<K, V> {
         self.key.as_bytes()
     }
 
-    /// Versioned leaves are never unlinked before Phase 8, so they carry no
-    /// `removed` flag; tombstones express deletion.
+    /// A versioned leaf is unlinked only after its chain is killed (§13),
+    /// which is its removed state.
     #[inline]
-    fn mark_removed(&self) {}
+    fn mark_removed(&self) {
+        debug_assert!(self.chain_latch.is_dead(), "unlinked with a live chain");
+    }
+
+    #[inline]
+    fn is_removed(&self) -> bool {
+        self.chain_latch.is_dead()
+    }
 }
 
 #[cfg(all(test, not(loom)))]
@@ -335,7 +342,7 @@ mod tests {
         {
             // SAFETY: exclusively owned, never published.
             let l = unsafe { leaf.as_ref() };
-            let w = l.chain_latch.lock();
+            let w = l.chain_latch.lock().unwrap();
             let v20 = l.alloc_version(&w, 20, Some(D(Arc::clone(&n))));
             // SAFETY: freshly allocated.
             assert!(unsafe { (*v20).is_inline() }, "second version takes slot1");
@@ -401,7 +408,7 @@ mod tests {
         let head = l.head();
         assert!(head.is_tombstone() && head.is_inline() && !head.is_superseded());
         assert!(head.next().is_null());
-        let w = l.chain_latch.lock();
+        let w = l.chain_latch.lock().unwrap();
         let v2 = l.alloc_version(&w, 2, Some(7));
         // SAFETY: freshly allocated, unpublished.
         let n = unsafe { &*v2 };

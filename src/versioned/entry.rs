@@ -101,11 +101,12 @@ impl<'a, K, V> VersionedEntryRef<'a, K, V> {
         false
     }
 
-    /// `true` once the captured version node has been unlinked from the chain
-    /// (replaced by a same-version insert, deleted by `remove`, or pruned).
+    /// `true` once the captured version has been unlinked: a same-version
+    /// insert replaced it, `remove` or `remove_version` removed it, a prune
+    /// unlinked it, or its whole key was removed, pruned or cleared.
     #[inline]
     pub fn is_superseded(&self) -> bool {
-        self.node().is_superseded()
+        self.node().is_superseded() || self.leaf().chain_latch.is_dead()
     }
 
     /// A fresh read of the key's newest live version, sharing this handle's

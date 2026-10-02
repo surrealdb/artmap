@@ -25,7 +25,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use artmap::ArtMap;
+use artmap::{ArtMap, VersionedArtMap};
 
 struct Counting;
 
@@ -137,6 +137,28 @@ fn thinned_registry() -> (usize, usize) {
     (thinned, held(base))
 }
 
+/// A versioned queue: each key is written once and deleted a window later,
+/// with the watermark following the queue. Before pruning unlinked deleted
+/// keys, each one kept its leaf and a tombstone for good.
+fn versioned_queue() -> usize {
+    settle();
+    let base = live();
+    let map = VersionedArtMap::<[u8; 8], u64>::new();
+    const WINDOW: u64 = 1_000;
+    for i in 0..300_000u64 {
+        map.insert(i.to_be_bytes(), i, i);
+        if i >= WINDOW {
+            map.delete((i - WINDOW).to_be_bytes(), i);
+        }
+        if i % 10_000 == 0 {
+            map.prune_all(i, |_| false);
+        }
+    }
+    map.prune_all(u64::MAX, |_| false);
+    assert_eq!(map.len(), WINDOW as usize);
+    held(base)
+}
+
 #[test]
 fn delete_churn_does_not_retain_inner_nodes() {
     let queue = sliding_window(b"");
@@ -144,9 +166,10 @@ fn delete_churn_does_not_retain_inner_nodes() {
     let chained = sliding_window(&[b'q'; 40]);
     let registry = registry_to_empty();
     let (thinned, fitted) = thinned_registry();
+    let versioned = versioned_queue();
     eprintln!(
         "held bytes: queue {queue}, chained queue {chained}, emptied registry {registry}, \
-         thinned registry {thinned} then {fitted} after shrink_to_fit"
+         thinned registry {thinned} then {fitted} after shrink_to_fit, versioned queue {versioned}"
     );
     // 1,000 live keys need about 50 KB. The bounds leave room for the
     // destructors still deferred in a thread's epoch bag.
@@ -162,4 +185,8 @@ fn delete_churn_does_not_retain_inner_nodes() {
         "shrink_to_fit kept {fitted} of {thinned} bytes"
     );
     assert!(fitted < 512 << 10, "a fitted registry holds {fitted} bytes");
+    assert!(
+        versioned < 1 << 20,
+        "a versioned queue holds {versioned} bytes"
+    );
 }

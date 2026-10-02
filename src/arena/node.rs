@@ -67,6 +67,11 @@ impl<K: AsBytes, V> LeafNode for Leaf<K, V> {
     fn mark_removed(&self) {
         self.removed.store(true, Ordering::Release);
     }
+
+    #[inline]
+    fn is_removed(&self) -> bool {
+        Leaf::is_removed(self)
+    }
 }
 
 // SAFETY: the link is only used by the retired list, and `drop_in_arena`
@@ -75,8 +80,13 @@ unsafe impl<K, V> ArenaLeaf for Leaf<K, V> {
     const NEEDS_DROP: bool = std::mem::needs_drop::<K>() || std::mem::needs_drop::<V>();
 
     #[inline]
-    fn next_retired(&self) -> Option<&AtomicU32> {
-        Some(&self.next_retired)
+    fn set_next_retired(&self, next: u32) {
+        self.next_retired.store(next, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn next_retired(&self) -> u32 {
+        self.next_retired.load(Ordering::Relaxed)
     }
 
     unsafe fn drop_in_arena(this: NonNull<Self>, _arena: &Arena) {
@@ -243,22 +253,35 @@ impl<K: AsBytes, V> LeafNode for VersionedLeaf<K, V> {
         self.key.as_bytes()
     }
 
-    /// Versioned leaves are never unlinked; tombstones express deletion.
+    /// A versioned leaf is unlinked only after its chain is killed (§13),
+    /// which is its removed state.
     #[inline]
-    fn mark_removed(&self) {}
+    fn mark_removed(&self) {
+        debug_assert!(self.chain_latch.is_dead(), "unlinked with a live chain");
+    }
+
+    #[inline]
+    fn is_removed(&self) -> bool {
+        self.chain_latch.is_dead()
+    }
 }
 
-// SAFETY: versioned leaves are never unlinked (inserts use
-// `Mode::InsertIfAbsent`, and there is no remove, prune or clear), so they need
-// no retired-list link; `drop_in_arena` drops the key and every version of the
-// live chain once. Versions unlinked while the map was alive are on the tree's
-// own retired-versions list instead.
+// SAFETY: a versioned leaf is unlinked only once its chain is dead, and a dead
+// chain lock holds the retired-list link, so the leaf needs no field of its
+// own for it; `drop_in_arena` drops the key and every version of the chain
+// once (an unlinked leaf keeps its whole chain). Versions unlinked from a live
+// chain are on the tree's own retired-versions list instead.
 unsafe impl<K, V> ArenaLeaf for VersionedLeaf<K, V> {
     const NEEDS_DROP: bool = std::mem::needs_drop::<K>() || std::mem::needs_drop::<V>();
 
     #[inline]
-    fn next_retired(&self) -> Option<&AtomicU32> {
-        None
+    fn set_next_retired(&self, next: u32) {
+        self.chain_latch.set_retired_link(next);
+    }
+
+    #[inline]
+    fn next_retired(&self) -> u32 {
+        self.chain_latch.retired_link()
     }
 
     unsafe fn drop_in_arena(this: NonNull<Self>, arena: &Arena) {
@@ -287,7 +310,7 @@ mod tests {
     #[test]
     fn version_nodes_stay_compact() {
         assert_eq!(std::mem::size_of::<VersionNode<u64>>(), 24);
-        // A one-byte chain lock and no retired-list link.
+        // A four-byte chain lock, which doubles as the retired-list link.
         assert_eq!(
             std::mem::size_of::<super::VersionedLeaf<[u8; 8], u64>>(),
             16

@@ -29,7 +29,7 @@ use crate::arena::versioned_iter::{ArenaVersionedEntryRef, ArenaVersionedRange};
 use crate::arena::versioned_tree::{chain, find_le, ArenaVersionedTree};
 use crate::arena::{Arena, ArenaFull};
 use crate::key::AsBytes;
-use crate::raw::cursor::{owned_bound, KeyBuf};
+use crate::raw::cursor::{owned_bound, Cursor, KeyBuf};
 use crate::raw::node::{Node16, Node256, Node4, Node48, MAX_PREFIX_LEN};
 use crate::sync::atomic::AtomicU32;
 
@@ -38,9 +38,12 @@ use crate::sync::atomic::AtomicU32;
 ///
 /// Semantics match [`VersionedArtMap`](crate::VersionedArtMap): `len()` counts
 /// keys whose newest version is live; `delete` records a tombstone; reads at a
-/// snapshot see the newest version at or below it; scans are latest-view. It
-/// has no prune, so versions and deleted keys are kept until the map is
-/// dropped. See the [module docs](crate::arena) for ownership and capacity.
+/// snapshot see the newest version at or below it; scans are latest-view;
+/// `prune_key` and `prune_all` follow the same watermark contract, and
+/// `remove_key` and `remove_version` change history for every snapshot.
+/// Pruned and removed versions and keys stop being visible, but their bytes
+/// stay in the arena, and their values are dropped, when the map is dropped.
+/// See the [module docs](crate::arena) for ownership and capacity.
 pub struct ArenaVersionedArtMap<K, V> {
     tree: ArenaVersionedTree<K, V>,
 }
@@ -280,6 +283,88 @@ impl<K: AsBytes, V> ArenaVersionedArtMap<K, V> {
         unsafe { ArenaVersionedEntryRef::new(leaf, old, self.tree.arena()) }
     }
 
+    /// Unlinks every version of `key` older than its newest version
+    /// `<= min_version`, and the key itself if that version is its newest one
+    /// and a tombstone (a `delete`, or a value that `is_tombstone` accepts).
+    /// Returns the number of versions unlinked. As
+    /// [`VersionedArtMap::prune_key`](crate::VersionedArtMap::prune_key),
+    /// except that nothing is freed before the map is dropped.
+    ///
+    /// `is_tombstone` runs without any latch held.
+    ///
+    /// ```
+    /// let map = artmap::ArenaVersionedArtMap::<String, u32>::with_capacity(1 << 16);
+    /// for v in 1..=4 {
+    ///     map.insert("k".to_string(), v, v as u32);
+    /// }
+    /// assert_eq!(map.prune_key("k", 3, |_| false), 2);
+    /// assert_eq!(map.get_all_versions("k"), vec![(4, Some(4)), (3, Some(3))]);
+    /// map.delete("k".to_string(), 5);
+    /// assert_eq!(map.prune_key("k", 5, |_| false), 3);
+    /// assert_eq!(map.version_count("k"), 0);
+    /// ```
+    pub fn prune_key<Q, F>(&self, key: &Q, min_version: u64, is_tombstone: F) -> usize
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+        F: Fn(&V) -> bool,
+    {
+        match self.tree.raw.get(key.as_bytes()) {
+            Some(leaf) => self.tree.prune_leaf(leaf, min_version, &is_tombstone),
+            None => 0,
+        }
+    }
+
+    /// [`prune_key`](Self::prune_key) for every key, including deleted ones.
+    pub fn prune_all<F>(&self, min_version: u64, is_tombstone: F) -> usize
+    where
+        F: Fn(&V) -> bool,
+    {
+        let mut cursor = Cursor::new(Bound::Unbounded, Bound::Unbounded);
+        let mut total = 0;
+        while let Some(leaf) = cursor.next(&self.tree.raw) {
+            total += self.tree.prune_leaf(leaf, min_version, &is_tombstone);
+        }
+        total
+    }
+
+    /// Removes `key` and every version of it, for every snapshot, unlike
+    /// [`delete`](Self::delete). Returns `true` if the key had any version.
+    pub fn remove_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        self.tree.remove_key(key.as_bytes())
+    }
+
+    /// Removes exactly `version` of `key`, a value or a tombstone, for every
+    /// snapshot. The key goes with its last version. Returns `true` if that
+    /// version existed.
+    ///
+    /// ```
+    /// let map = artmap::ArenaVersionedArtMap::<String, u32>::with_capacity(1 << 16);
+    /// map.insert("k".to_string(), 1, 10);
+    /// map.insert("k".to_string(), 2, 20);
+    /// assert!(map.remove_version("k", 2));
+    /// assert_eq!(map.get("k"), Some(10));
+    /// assert!(map.remove_version("k", 1));
+    /// assert!(!map.contains_key("k"));
+    /// ```
+    pub fn remove_version<Q>(&self, key: &Q, version: u64) -> bool
+    where
+        K: Borrow<Q>,
+        Q: AsBytes + ?Sized,
+    {
+        self.tree.remove_version(key.as_bytes(), version)
+    }
+
+    /// Removes every key and version, linearizably (at the swap of the root).
+    /// Their bytes stay in the arena until the map is dropped.
+    pub fn clear(&self) {
+        self.tree.clear();
+    }
+
     /// An inserter for this map, caching the last insertion point.
     #[inline]
     pub fn inserter(&self) -> ArenaVersionedInserter<'_, K, V> {
@@ -367,9 +452,10 @@ impl<K: AsBytes, V> ArenaVersionedArtMap<K, V> {
         }
     }
 
-    /// Checks the structural invariants; panics on a violation.
+    /// Checks the structural invariants, and that `len()` equals the number
+    /// of reachable keys whose newest version is live. Panics on a violation.
     pub fn validate_invariants(&mut self) {
-        self.tree.raw.validate();
+        self.tree.validate();
     }
 }
 

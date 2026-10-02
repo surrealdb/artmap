@@ -746,3 +746,49 @@ fn concurrent_compaction_keeps_every_sentinel() {
     assert_eq!(map.len(), map.iter().count());
     map.validate_invariants();
 }
+
+#[test]
+fn versioned_removes_prunes_and_clears_drop_everything_once() {
+    // §13: unlinked leaves go on the storage's retired list (linked through
+    // their dead chain lock), unlinked versions on the tree's; the map's drop
+    // drops each key and value exactly once.
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut created = 0usize;
+    {
+        let m = ArenaVersionedArtMap::<Counted, Counted>::with_capacity(4 << 20);
+        for i in 0..n(1500, 60) as u64 {
+            let k = format!("k{:02}", i % 23);
+            m.insert(
+                Counted::new(k.as_bytes(), &drops),
+                i,
+                Counted::new(b"v", &drops),
+            );
+            created += 2;
+            match i % 9 {
+                0 => {
+                    m.delete(Counted::new(k.as_bytes(), &drops), i + 1);
+                    created += 1;
+                }
+                1 => {
+                    m.remove_key(k.as_bytes());
+                }
+                2 => {
+                    m.remove_version(k.as_bytes(), i);
+                }
+                3 => {
+                    m.prune_key(k.as_bytes(), i, |_| false);
+                }
+                4 if i % 4 == 0 => {
+                    m.prune_all(i.saturating_sub(5), |_| i % 8 == 0);
+                }
+                5 if i % 50 == 5 => m.clear(),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        created,
+        "leaked or double-dropped"
+    );
+}

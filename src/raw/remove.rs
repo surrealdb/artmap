@@ -57,6 +57,8 @@ use crate::raw::{LeafNode, Raw, RawTree, Storage};
 enum Unlink {
     /// A failed acquisition. Nothing was written; retry from the root.
     Retry,
+    /// `confirm` refused the leaf. Nothing was written.
+    Refused,
     /// Done. `true` if the commit left the parent empty, so it needs a
     /// follow-up.
     Done(bool),
@@ -85,6 +87,25 @@ impl<S: Storage> RawTree<S> {
         matches: impl Fn(NonNull<S::Leaf>) -> bool,
         guard: &S::Guard,
     ) -> Option<NonNull<S::Leaf>> {
+        self.remove_confirmed(key, matches, |_| Some(1), guard)
+    }
+
+    /// As [`remove`](Self::remove), with a last check under the latches.
+    ///
+    /// `confirm` runs once the latches that the unlink needs are held, just
+    /// before the commit. It returns the `len` the leaf accounts for (1 for a
+    /// plain leaf; for a versioned leaf, whether its newest version is live),
+    /// or `None` to leave the leaf in place, and the remove then returns
+    /// `None`. Once it returns `Some`, the leaf is unlinked. It runs under
+    /// ART latches, so it must not run user code, allocate from an arena, pin,
+    /// or take any latch but a terminal `chain_latch` (Inv 6, Inv 7).
+    pub(crate) fn remove_confirmed(
+        &self,
+        key: &[u8],
+        matches: impl Fn(NonNull<S::Leaf>) -> bool,
+        confirm: impl Fn(NonNull<S::Leaf>) -> Option<isize>,
+        guard: &S::Guard,
+    ) -> Option<NonNull<S::Leaf>> {
         let mut backoff = SpinBackoff::new();
         'retry: loop {
             let root = self.root();
@@ -103,11 +124,12 @@ impl<S: Storage> RawTree<S> {
                     drop(w);
                     continue 'retry;
                 }
+                let count = confirm(leaf)?;
                 let bomb = AbortOnUnwind;
                 self.set_root(&w, Raw::<S>::NULL);
                 // SAFETY: protected leaf read from `root`.
                 unsafe { leaf.as_ref() }.mark_removed();
-                self.len_add(-1);
+                self.len_add(-count);
                 bomb.defuse();
                 drop(w);
                 // SAFETY: unlinked under `root_latch` and marked.
@@ -167,11 +189,12 @@ impl<S: Storage> RawTree<S> {
                     return None;
                 }
                 if empties {
-                    match self.remove_unlinking(parent, node_raw, v, taken, leaf, guard) {
+                    match self.remove_unlinking(parent, node_raw, v, taken, leaf, &confirm, guard) {
                         Unlink::Retry => {
                             backoff.spin();
                             continue 'retry;
                         }
+                        Unlink::Refused => return None,
                         Unlink::Done(follow_up) => {
                             if follow_up {
                                 self.unlink_emptied(key, guard);
@@ -186,11 +209,12 @@ impl<S: Storage> RawTree<S> {
                     backoff.spin();
                     continue 'retry;
                 };
+                let count = confirm(leaf)?;
                 let bomb = AbortOnUnwind;
                 take_out(node, &nw, taken);
                 // SAFETY: protected leaf read from a validated slot.
                 unsafe { leaf.as_ref() }.mark_removed();
-                self.len_add(-1);
+                self.len_add(-count);
                 bomb.defuse();
                 drop(nw);
                 // SAFETY: unlinked under the node latch and marked.
@@ -203,6 +227,7 @@ impl<S: Storage> RawTree<S> {
     /// The latched part of a remove that takes `N`'s (`node_raw`, read at
     /// version `v`) last entry: takes `P`, then `N`, and unlinks `N` with the
     /// leaf, per the module docs.
+    #[allow(clippy::too_many_arguments)]
     fn remove_unlinking(
         &self,
         parent: Parent<Raw<S>>,
@@ -210,6 +235,7 @@ impl<S: Storage> RawTree<S> {
         v: u64,
         taken: Taken,
         leaf: NonNull<S::Leaf>,
+        confirm: &impl Fn(NonNull<S::Leaf>) -> Option<isize>,
         guard: &S::Guard,
     ) -> Unlink {
         // SAFETY: protected inner node read from the tree in this operation.
@@ -225,10 +251,13 @@ impl<S: Storage> RawTree<S> {
             if !node.latch.validate(v) {
                 return Unlink::Retry;
             }
+            let Some(count) = confirm(leaf) else {
+                return Unlink::Refused;
+            };
             self.unlink_in_parent(&pg);
             // SAFETY: protected leaf read from a validated slot.
             unsafe { leaf.as_ref() }.mark_removed();
-            self.len_add(-1);
+            self.len_add(-count);
             return Unlink::Done(false);
         }
         let Some(nw) = node.latch.try_upgrade(v) else {
@@ -237,12 +266,17 @@ impl<S: Storage> RawTree<S> {
         };
         // Read at `v`, which the upgrade just confirmed: exact.
         debug_assert!(node.emptied_by(taken));
+        let Some(count) = confirm(leaf) else {
+            drop(nw);
+            drop(pg);
+            return Unlink::Refused;
+        };
         let bomb = AbortOnUnwind;
         // The store that unlinks `N`, and with it the removed leaf.
         self.unlink_in_parent(&pg);
         // SAFETY: protected leaf read from a validated slot.
         unsafe { leaf.as_ref() }.mark_removed();
-        self.len_add(-1);
+        self.len_add(-count);
         // Inv 7: unlinked, so obsolete, before the parent is released.
         nw.mark_obsolete();
         bomb.defuse();
