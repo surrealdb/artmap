@@ -36,15 +36,15 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 | Data Structure | Read<br><sup>(with&nbsp;standard&nbsp;key)</sup> | Read<br><sup>(with&nbsp;slice&nbsp;key)</sup> | Insert<br><sup>(sequential&nbsp;entries)</sup> | Insert<br><sup>(random&nbsp;entries)</sup> | Range&nbsp;scans<br><sup>(100&nbsp;items)</sup> |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| **`artmap::ArtMap`** | **24.8&nbsp;ns**<br><sup>(40.4M/s)</sup> | **25.1&nbsp;ns**<br><sup>(39.9M/s)</sup> | **32.5&nbsp;ns**<br><sup>(30.7M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**38.7&nbsp;ns**<br><sup>(25.9M/s)</sup> | **718&nbsp;ns**<br><sup>(139M/s)</sup> |
+| **`artmap::ArtMap`** | **24.8&nbsp;ns**<br><sup>(40.4M/s)</sup> | **25.1&nbsp;ns**<br><sup>(39.9M/s)</sup> | **32.5&nbsp;ns**<br><sup>(30.7M/s)</sup> | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/artmap/main/img/rocket.png" alt="🚀">&nbsp;**38.7&nbsp;ns**<br><sup>(25.9M/s)</sup> | **718&nbsp;ns**<br><sup>(139M/s)</sup> |
 | **`artmap::VersionedArtMap`** | **21.9&nbsp;ns**<br><sup>(45.7M/s)</sup> | **21.6&nbsp;ns**<br><sup>(46.2M/s)</sup> | **48.2&nbsp;ns**<br><sup>(20.7M/s)</sup> | **69.4&nbsp;ns**<br><sup>(14.4M/s)</sup> | **807&nbsp;ns**<br><sup>(124M/s)</sup> |
-| **`artmap::ArenaArtMap`** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**13.4&nbsp;ns**<br><sup>(74.5M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**13.4&nbsp;ns**<br><sup>(74.8M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**27.1&nbsp;ns**<br><sup>(36.9M/s)</sup> | **39.8&nbsp;ns**<br><sup>(25.1M/s)</sup> | **574&nbsp;ns**<br><sup>(174M/s)</sup> |
+| **`artmap::ArenaArtMap`** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/artmap/main/img/rocket.png" alt="🚀">&nbsp;**13.4&nbsp;ns**<br><sup>(74.5M/s)</sup> | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/artmap/main/img/rocket.png" alt="🚀">&nbsp;**13.4&nbsp;ns**<br><sup>(74.8M/s)</sup> | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/artmap/main/img/rocket.png" alt="🚀">&nbsp;**27.1&nbsp;ns**<br><sup>(36.9M/s)</sup> | **39.8&nbsp;ns**<br><sup>(25.1M/s)</sup> | **574&nbsp;ns**<br><sup>(174M/s)</sup> |
 | **`artmap::ArenaVersionedArtMap`** | **14.7&nbsp;ns**<br><sup>(68.2M/s)</sup> | **15.7&nbsp;ns**<br><sup>(63.6M/s)</sup> | **41.3&nbsp;ns**<br><sup>(24.2M/s)</sup> | **51.6&nbsp;ns**<br><sup>(19.4M/s)</sup> | **616&nbsp;ns**<br><sup>(162M/s)</sup> |
 | `arenaskiplist::SkipList` | 181&nbsp;ns<br><sup>(5.5M/s)</sup> | 181&nbsp;ns<br><sup>(5.5M/s)</sup> | 39.5&nbsp;ns<br><sup>(25.3M/s)</sup> | 151&nbsp;ns<br><sup>(6.6M/s)</sup> | 809&nbsp;ns<br><sup>(124M/s)</sup> |
 | `concread::bptree::BPTree` | 64.2&nbsp;ns<br><sup>(15.6M/s)</sup> | — | 44.9&nbsp;ns<br><sup>(22.3M/s)</sup> | 128&nbsp;ns<br><sup>(7.8M/s)</sup> | 434&nbsp;ns<br><sup>(231M/s)</sup> |
 | `crossbeam_skiplist::SkipMap` | 160&nbsp;ns<br><sup>(6.2M/s)</sup> | — | 77.8&nbsp;ns<br><sup>(12.9M/s)</sup> | 174&nbsp;ns<br><sup>(5.8M/s)</sup> | 2.39&nbsp;µs<br><sup>(41.9M/s)</sup> |
 | `imbl::OrdMap` | 41.8&nbsp;ns<br><sup>(23.9M/s)</sup> | — | 52.6&nbsp;ns<br><sup>(19.0M/s)</sup> | 74.6&nbsp;ns<br><sup>(13.4M/s)</sup> | 343&nbsp;ns<br><sup>(291M/s)</sup> |
-| `std::collections::BTreeMap` | 62.4&nbsp;ns<br><sup>(16.0M/s)</sup> | — | 31.1&nbsp;ns<br><sup>(32.1M/s)</sup> | 65.7&nbsp;ns<br><sup>(15.2M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**235&nbsp;ns**<br><sup>(426M/s)</sup> |
+| `std::collections::BTreeMap` | 62.4&nbsp;ns<br><sup>(16.0M/s)</sup> | — | 31.1&nbsp;ns<br><sup>(32.1M/s)</sup> | 65.7&nbsp;ns<br><sup>(15.2M/s)</sup> | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/artmap/main/img/rocket.png" alt="🚀">&nbsp;**235&nbsp;ns**<br><sup>(426M/s)</sup> |
 | `vart::Tree` | 22.0&nbsp;ns<br><sup>(45.5M/s)</sup> | 20.6&nbsp;ns<br><sup>(48.6M/s)</sup> | 67.7&nbsp;ns<br><sup>(14.8M/s)</sup> | 69.6&nbsp;ns<br><sup>(14.4M/s)</sup> | 2.68&nbsp;µs<br><sup>(37.3M/s)</sup> |
 | `dashmap::DashMap`* | 17.3&nbsp;ns<br><sup>(58.0M/s)</sup> | — | 23.6&nbsp;ns<br><sup>(42.4M/s)</sup> | 29.1&nbsp;ns<br><sup>(34.4M/s)</sup> | N/A |
 | `papaya::HashMap`* | 21.7&nbsp;ns<br><sup>(46.1M/s)</sup> | — | 52.2&nbsp;ns<br><sup>(19.1M/s)</sup> | 56.9&nbsp;ns<br><sup>(17.6M/s)</sup> | N/A |
@@ -63,7 +63,7 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 | :--- | ---: | ---: | :--- |
 | **`artmap::ArtMap`** | **2.00&nbsp;ms**<br><sup>(50.1M/s)</sup> | **2.07&nbsp;ms**<br><sup>(48.2M/s)</sup> | Non-Blocking Reads + OLC Node Latching |
 | **`artmap::VersionedArtMap`** | **2.34&nbsp;ms**<br><sup>(42.8M/s)</sup> | **2.32&nbsp;ms**<br><sup>(43.1M/s)</sup> | Non-Blocking Reads + OLC + Per-Key Chain Latch |
-| **`artmap::ArenaArtMap`** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.76&nbsp;ms**<br><sup>(56.8M/s)</sup> | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**2.02&nbsp;ms**<br><sup>(49.6M/s)</sup> | OLC Node Latching + 32-Bit Offsets + Atomic Bump Allocation |
+| **`artmap::ArenaArtMap`** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/artmap/main/img/rocket.png" alt="🚀">&nbsp;**1.76&nbsp;ms**<br><sup>(56.8M/s)</sup> | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/artmap/main/img/rocket.png" alt="🚀">&nbsp;**2.02&nbsp;ms**<br><sup>(49.6M/s)</sup> | OLC Node Latching + 32-Bit Offsets + Atomic Bump Allocation |
 | **`artmap::ArenaVersionedArtMap`** | **2.23&nbsp;ms**<br><sup>(44.9M/s)</sup> | **2.23&nbsp;ms**<br><sup>(44.9M/s)</sup> | OLC Node Latching + 32-Bit Offsets + Per-Key Chain Latch |
 | `arenaskiplist::SkipList` | 40.80&nbsp;ms<br><sup>(2.5M/s)</sup> | 28.81&nbsp;ms<br><sup>(3.5M/s)</sup> | Lock-Free Atomic CAS (Contiguous Arena) |
 | `concread::bptree::BPTree` | 8.86&nbsp;ms<br><sup>(11.3M/s)</sup> | 4.59&nbsp;ms<br><sup>(21.8M/s)</sup> | Lock-Free Reads + Single-Writer CoW (MVCC) |
@@ -407,4 +407,4 @@ cargo bench --bench memory_bench
 
 ## License
 
-This project is licensed under the [Apache License, Version 2.0](LICENSE).
+This project is licensed under the [Apache License, Version 2.0](https://github.com/surrealdb/artmap/blob/main/LICENSE).

@@ -298,6 +298,19 @@ fn inserting_existing_keys_frees_the_discarded_leaf_safely() {
     assert_eq!(*e, 2);
 }
 
+#[test]
+fn inserting_existing_set_keys_frees_the_discarded_leaf_safely() {
+    // As above, through `ArtSet::insert`, which looks the key up first and then
+    // installs it with insert-if-absent.
+    let s = artmap::ArtSet::<Vec<u8>>::new();
+    assert!(s.insert(b"vec-key".to_vec()));
+    assert!(!s.insert(b"vec-key".to_vec()));
+    let a = artmap::ArtSet::<[u8; 8]>::new();
+    assert!(a.insert(*b"arraykey"));
+    assert!(!a.insert(*b"arraykey"));
+    assert_eq!(a.len(), 1);
+}
+
 thread_local! {
     static CALLS: Cell<usize> = const { Cell::new(0) };
 }
@@ -328,6 +341,17 @@ fn a_lying_as_bytes_causes_no_ub() {
     CALLS.with(|c| c.set(0));
     let _ = m.get_or_insert_with(Liar(b"k".to_vec()), || 2);
     let _ = m.iter().count();
+}
+
+#[test]
+fn a_lying_as_bytes_causes_no_ub_in_an_artset() {
+    // `ArtSet::insert` calls `as_bytes` for the lookup and again for the
+    // install; the install derives the bytes once, from the leaf (Inv 10).
+    let s = artmap::ArtSet::<Liar>::new();
+    s.insert(Liar(b"k".to_vec()));
+    CALLS.with(|c| c.set(0));
+    let _ = s.insert(Liar(b"k".to_vec()));
+    let _ = s.iter().count();
 }
 
 #[test]

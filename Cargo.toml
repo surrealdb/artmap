@@ -1,11 +1,11 @@
 [package]
 name = "artmap"
 publish = true
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.86"
 license = "Apache-2.0"
-readme = "README.md"
+readme = "CARGO.md"
 description = "A concurrent in-memory Adaptive Radix Tree (ART) featuring optimistic lock coupling."
 repository = "https://github.com/surrealdb/artmap"
 documentation = "https://docs.rs/artmap"

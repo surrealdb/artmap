@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Removes now reclaim the inner nodes they empty, and `ArtMap::shrink_to_fit` fits the rest on demand. In 0.6, a node emptied by removes stayed in the tree until `clear()` or drop, so a map used as a queue or a registry, whose keys keep changing, grew without bound.
+Removes now reclaim the inner nodes they empty, and `ArtMap::shrink_to_fit` fits the rest on demand. Before this release, a node emptied by removes stayed in the tree until `clear()` or drop, so a map used as a queue or a registry, whose keys keep changing, grew without bound.
 
 ### Added
 - `ArtMap::shrink_to_fit`, which fits every node to its entries: a node left with one leaf gives way to it, one left with a single child node is merged into it when their prefixes fit in one node, and every other node is shrunk to the smallest layout that holds its entries. It runs in O(n), under one pin, alongside readers and writers. A registry of 200,000 keys thinned to 2,000 holds 735 KB after its removes, and 94 KB after `shrink_to_fit`.
@@ -30,6 +30,12 @@ Against 0.6.0 on an AMD Threadripper 9970X, two interleaved rounds per tree (`be
 ### Known limitations
 - Without `shrink_to_fit`, a node keeps its layout as it loses children, until it is empty.
 - `VersionedArtMap` never unlinks a deleted key's leaf, even after `prune_key`.
+
+## 0.7.0 (2026-10-01)
+
+### Added
+
+- `ArtSet<K>`: an ordered, concurrent set, a thin wrapper over `ArtMap<K, ()>`. `insert` is insert-if-absent and returns a `bool`, as do `remove` and `contains`. Iterators, `range` and `scan` yield keys.
 
 ## 0.6.0 (2026-09-29)
 

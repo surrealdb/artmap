@@ -25,7 +25,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use artmap::{ArenaArtMap, ArenaVersionedArtMap, ArtMap, AsBytes, VersionedArtMap};
+use artmap::{ArenaArtMap, ArenaVersionedArtMap, ArtMap, ArtSet, AsBytes, VersionedArtMap};
 
 thread_local! {
     /// Panic on the n-th `as_bytes` call on this thread (0 = never).
@@ -163,6 +163,80 @@ fn panicking_as_bytes_in_remove_and_iteration() {
     });
     let mut map = Arc::try_unwrap(map).ok().unwrap();
     map.validate_invariants();
+}
+
+#[test]
+fn panicking_as_bytes_on_every_artset_path() {
+    // `ArtSet::insert` looks the key up before it installs it, so a present
+    // key (the "replace" shapes) panics in the lookup rather than the writer.
+    for (name, keys, probe) in shapes() {
+        for nth in 1..=4 {
+            let set = Arc::new(ArtSet::<PanicKey>::new());
+            for k in &keys {
+                set.insert(key(k));
+            }
+            arm(nth);
+            let r = catch_unwind(AssertUnwindSafe(|| set.insert(key(probe))));
+            disarm();
+            let panicked = r.is_err();
+            let s = Arc::clone(&set);
+            within_timeout(move || {
+                let _ = s.insert(key(&format!("{probe}~")));
+                let _ = s.remove(&b"~never~"[..]);
+            });
+            // `contains` and `remove` walk the same nodes.
+            arm(nth);
+            let _ = catch_unwind(AssertUnwindSafe(|| set.contains(probe.as_bytes())));
+            disarm();
+            let s = Arc::clone(&set);
+            within_timeout(move || {
+                let _ = s.insert(key(&format!("{probe}!")));
+            });
+            let mut set = Arc::try_unwrap(set).ok().unwrap();
+            set.validate_invariants();
+            assert_eq!(set.len(), set.iter().count(), "{name}: len mismatch");
+            if !panicked {
+                assert!(set.contains(probe.as_bytes()), "{name}: insert lost");
+            }
+        }
+    }
+}
+
+#[test]
+fn panicking_as_bytes_in_artset_remove_and_iteration() {
+    let set = Arc::new(ArtSet::<PanicKey>::new());
+    for i in 0..40 {
+        set.insert(key(&format!("r{i:02}")));
+    }
+    for nth in 1..=3 {
+        arm(nth);
+        let _ = catch_unwind(AssertUnwindSafe(|| set.remove(&b"r07"[..])));
+        disarm();
+        arm(nth);
+        let _ = catch_unwind(AssertUnwindSafe(|| set.iter().count()));
+        disarm();
+        arm(nth);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            set.range::<_, [u8]>((
+                std::ops::Bound::Included(&b"r10"[..]),
+                std::ops::Bound::Unbounded,
+            ))
+            .rev()
+            .count()
+        }));
+        disarm();
+        arm(nth);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            set.scan::<_, [u8], _>(.., |_| true);
+        }));
+        disarm();
+    }
+    let s = Arc::clone(&set);
+    within_timeout(move || {
+        s.insert(key("r99"));
+    });
+    let mut set = Arc::try_unwrap(set).ok().unwrap();
+    set.validate_invariants();
 }
 
 #[test]

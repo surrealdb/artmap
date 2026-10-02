@@ -17,10 +17,10 @@
 //! and adversarial byte keys (empty keys, keys that are prefixes of others,
 //! long 0xFF runs, all 256 bytes at one level).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
-use artmap::{ArenaArtMap, ArenaVersionedArtMap, ArtMap, VersionedArtMap};
+use artmap::{ArenaArtMap, ArenaVersionedArtMap, ArtMap, ArtSet, VersionedArtMap};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -219,6 +219,95 @@ fn artmap_all_bytes_at_one_level() {
     let want: Vec<_> = model.keys().rev().cloned().collect();
     assert_eq!(got, want);
     map.validate_invariants();
+}
+
+#[test]
+fn artset_matches_btreeset() {
+    for seed in 0..seeds() {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut set = ArtSet::<Vec<u8>>::new();
+        let mut model = BTreeSet::<Vec<u8>>::new();
+        for _ in 0..ops() {
+            let k = gen_key(&mut rng);
+            match rng.gen_range(0..10) {
+                0..=3 => {
+                    assert_eq!(
+                        set.insert(k.clone()),
+                        model.insert(k),
+                        "insert, seed {seed}"
+                    );
+                }
+                4..=5 => {
+                    assert_eq!(set.remove(&k), model.remove(&k), "remove, seed {seed}");
+                }
+                6 => {
+                    assert_eq!(set.remove_by_slice(&k), model.remove(&k), "remove_by_slice");
+                }
+                7 => {
+                    assert_eq!(
+                        set.contains(&k),
+                        model.contains(&k),
+                        "contains, seed {seed}"
+                    );
+                    assert_eq!(set.contains_slice(&k), model.contains(&k), "contains_slice");
+                }
+                _ => {
+                    let (s, e) = (gen_bound(&mut rng), gen_bound(&mut rng));
+                    if !valid_range(&s, &e) {
+                        continue;
+                    }
+                    let want: Vec<_> = model
+                        .range::<[u8], _>((as_ref_bound(&s), as_ref_bound(&e)))
+                        .map(|k| (k.clone(), 0))
+                        .collect();
+                    let r = || set.range::<_, [u8]>((as_ref_bound(&s), as_ref_bound(&e)));
+                    let fwd: Vec<_> = r().map(|k| (k.clone(), 0)).collect();
+                    assert_eq!(fwd, want, "range fwd {s:?}..{e:?}, seed {seed}");
+                    let mut rev: Vec<_> = r().rev().map(|k| (k.clone(), 0)).collect();
+                    rev.reverse();
+                    assert_eq!(rev, want, "range rev {s:?}..{e:?}, seed {seed}");
+                    let alt = alternate(r(), &mut rng, |k| (k.clone(), 0));
+                    assert_eq!(alt, want, "range alternating, seed {seed}");
+                    let mut scanned = Vec::new();
+                    set.scan::<_, [u8], _>((as_ref_bound(&s), as_ref_bound(&e)), |k| {
+                        scanned.push((k.clone(), 0));
+                        true
+                    });
+                    assert_eq!(scanned, want, "scan {s:?}..{e:?}, seed {seed}");
+                }
+            }
+            assert_eq!(set.len(), model.len());
+        }
+        let all: Vec<_> = set.iter().map(|k| k.clone()).collect();
+        assert!(all.into_iter().eq(model.iter().cloned()));
+        let all_rev: Vec<_> = set.iter().rev().map(|k| k.clone()).collect();
+        assert!(all_rev.into_iter().eq(model.iter().rev().cloned()));
+        set.validate_invariants();
+        set.clear();
+        assert_eq!(set.len(), 0);
+        assert!(set.iter().next().is_none());
+        set.validate_invariants();
+    }
+}
+
+#[test]
+fn artset_all_bytes_at_one_level() {
+    let mut set = ArtSet::<Vec<u8>>::new();
+    let mut model = BTreeSet::new();
+    for round in 0..3u8 {
+        for b in (0..=255u8).rev() {
+            let k = vec![round, b];
+            assert_eq!(set.insert(k.clone()), model.insert(k));
+        }
+    }
+    for b in (0..=255u8).step_by(3) {
+        assert_eq!(set.remove(&vec![1, b]), model.remove(&vec![1, b]));
+    }
+    let got: Vec<_> = set.iter().map(|k| k.clone()).collect();
+    assert!(got.into_iter().eq(model.iter().cloned()));
+    let got: Vec<_> = set.iter().rev().map(|k| k.clone()).collect();
+    assert!(got.into_iter().eq(model.iter().rev().cloned()));
+    set.validate_invariants();
 }
 
 #[test]
