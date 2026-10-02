@@ -36,9 +36,9 @@ pub(crate) const MAX_PREFIX_LEN: usize = 16;
 /// treated as absent (R2).
 pub(crate) const NODE48_EMPTY: u8 = 48;
 
-/// Discriminated node type; immutable after construction.
+/// Discriminated node type; immutable after construction. Ordered by size.
 #[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum NodeType {
     Node4 = 0,
     Node16 = 1,
@@ -54,6 +54,17 @@ impl NodeType {
             NodeType::Node16 => 16,
             NodeType::Node48 => 48,
             NodeType::Node256 => 256,
+        }
+    }
+
+    /// The smallest layout that holds `children` children.
+    #[inline]
+    pub(crate) fn fitting(children: usize) -> NodeType {
+        match children {
+            0..=4 => NodeType::Node4,
+            5..=16 => NodeType::Node16,
+            17..=48 => NodeType::Node48,
+            _ => NodeType::Node256,
         }
     }
 
@@ -81,6 +92,30 @@ pub(crate) struct NodeHeader<A> {
     /// `MAX_PREFIX_LEN` bytes packed little-endian into two words (W5).
     prefix: [AtomicU64; 2],
     exact_leaf: A,
+}
+
+/// The entry of a node that a remove takes out, for [`NodeHeader::rest`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Taken {
+    /// The exact leaf.
+    Exact,
+    /// The child at this byte.
+    Child(u8),
+    /// Nothing: count every entry.
+    Nothing,
+}
+
+/// What a node holds besides the [`Taken`] entry (§13).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Rest<R> {
+    /// Nothing: the node can be unlinked.
+    Empty,
+    /// One leaf (a child or the exact leaf), which can take the node's place.
+    Leaf(R),
+    /// One inner child, at this byte, which the node can be merged into.
+    Inner(u8, R),
+    /// Two or more entries: the node stays.
+    Many,
 }
 
 /// A reader's snapshot of a node prefix (R2).
@@ -166,6 +201,19 @@ impl<A: AtomicSlot> NodeHeader<A> {
             self.prefix[1].load(Ordering::Relaxed),
         ]);
         PrefixSnapshot { len, bytes }
+    }
+
+    /// Snapshot of the prefix length, clamped (R2). A hint when read without
+    /// this node's latch or version.
+    #[inline]
+    pub(crate) fn prefix_len(&self) -> usize {
+        (self.prefix_len.load(Ordering::Relaxed) as usize).min(MAX_PREFIX_LEN)
+    }
+
+    /// The stored prefix length, unclamped, for `validate`.
+    #[inline]
+    pub(crate) fn raw_prefix_len(&self) -> usize {
+        self.prefix_len.load(Ordering::Relaxed) as usize
     }
 
     /// Snapshot of `num_children`, clamped to the node's capacity (R2).
@@ -582,6 +630,53 @@ impl<A: AtomicSlot> NodeHeader<A> {
         }
     }
 
+    /// `true` if taking out `taken` leaves this node with no entry (§13). Two
+    /// loads and no scan: without the latch the caller validates the node's
+    /// version before acting on it (R3); under the latch it is exact.
+    #[inline]
+    pub(crate) fn emptied_by(&self, taken: Taken) -> bool {
+        let has_exact = !self.exact_leaf().is_null() && taken != Taken::Exact;
+        let taken_child = usize::from(matches!(taken, Taken::Child(_)));
+        (self.num_children() + usize::from(has_exact)).saturating_sub(taken_child) == 0
+    }
+
+    /// What this node holds besides `taken` (§13).
+    ///
+    /// Without the latch the answer is optimistic, and the caller validates
+    /// the node's version before acting on it (R3); under the latch it is
+    /// exact. `num_children` settles the common case, two or more entries
+    /// left, without scanning.
+    pub(crate) fn rest(&self, taken: Taken) -> Rest<A::Raw> {
+        let exact = self.exact_leaf();
+        let has_exact = !exact.is_null() && taken != Taken::Exact;
+        let taken_child = usize::from(matches!(taken, Taken::Child(_)));
+        let left = (self.num_children() + usize::from(has_exact)).saturating_sub(taken_child);
+        if left >= 2 {
+            return Rest::Many;
+        }
+        let mut rest = if has_exact {
+            Rest::Leaf(exact)
+        } else {
+            Rest::Empty
+        };
+        let mut from = 0u16;
+        while let Some((b, c)) = self.next_child(from) {
+            from = b as u16 + 1;
+            if taken == Taken::Child(b) {
+                continue;
+            }
+            if rest != Rest::Empty {
+                return Rest::Many;
+            }
+            rest = if c.is_leaf() {
+                Rest::Leaf(c)
+            } else {
+                Rest::Inner(b, c)
+            };
+        }
+        rest
+    }
+
     /// W2/W3: inserts a child for an absent `byte` into a non-full node.
     /// Caller holds this node's latch.
     pub(crate) fn insert_child(&self, w: &WriteGuard<'_>, byte: u8, child: A::Raw) {
@@ -742,7 +837,8 @@ impl<A: AtomicSlot> NodeHeader<A> {
     }
 
     /// Copies this node's prefix, exact leaf and children into `dst`, an
-    /// unpublished node of a larger type. Caller holds this node's latch, so
+    /// unpublished node of a type that holds them (a larger one for growth, a
+    /// smaller one for `shrink_to_fit`). Caller holds this node's latch, so
     /// the copy is exact.
     pub(crate) fn copy_into(&self, dst: &mut NodeHeader<A>) {
         dst.init_prefix(self.load_prefix().as_slice());

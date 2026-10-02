@@ -90,6 +90,8 @@ unsafe impl<L> Layout for HeapStorage<L> {
     }
 
     fn alloc_node(&self, ty: NodeType) -> Result<NonNull<NodeHeader<A>>, Infallible> {
+        #[cfg(test)]
+        NODE_COUNTS.with(|c| c.allocated.set(c.allocated.get() + 1));
         Ok(match ty {
             NodeType::Node4 => boxed(Node4::<A>::new()),
             NodeType::Node16 => boxed(Node16::<A>::new()),
@@ -99,6 +101,8 @@ unsafe impl<L> Layout for HeapStorage<L> {
     }
 
     unsafe fn free_node(&self, n: NonNull<NodeHeader<A>>) {
+        #[cfg(test)]
+        NODE_COUNTS.with(|c| c.freed.set(c.freed.get() + 1));
         // SAFETY: `n` is a Box allocation of its `node_type`, owned by the caller.
         unsafe {
             match n.as_ref().node_type {
@@ -124,6 +128,8 @@ unsafe impl<L: LeafNode + Send + 'static> Storage for HeapStorage<L> {
     unsafe fn retire_node(&self, n: NonNull<NodeHeader<A>>, guard: &crossbeam_epoch::Guard) {
         #[cfg(test)]
         RETIRED_NODES.with(|c| c.set(c.get() + 1));
+        #[cfg(test)]
+        NODE_COUNTS.with(|c| c.retired.set(c.retired.get() + 1));
         // SAFETY: the caller guarantees `n` is unlinked, obsolete and retired
         // once; it is a Box allocation of its `node_type`. Inner nodes have no
         // destructor that follows child pointers.
@@ -144,8 +150,20 @@ unsafe impl<L: LeafNode + Send + 'static> Storage for HeapStorage<L> {
     }
 }
 
+/// Inner-node lifecycle counts on one thread, for the accounting tests: every
+/// node allocated is either freed unpublished (or at tree drop) or retired,
+/// exactly once.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct NodeCounts {
+    pub(crate) allocated: std::cell::Cell<usize>,
+    pub(crate) freed: std::cell::Cell<usize>,
+    pub(crate) retired: std::cell::Cell<usize>,
+}
+
 #[cfg(test)]
 std::thread_local! {
     /// Inner nodes retired on this thread, for the retirement-count test.
     pub(crate) static RETIRED_NODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static NODE_COUNTS: NodeCounts = NodeCounts::default();
 }

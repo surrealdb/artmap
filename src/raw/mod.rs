@@ -32,6 +32,8 @@ pub(crate) mod cursor;
 pub(crate) mod heap;
 pub(crate) mod node;
 pub(crate) mod read;
+pub(crate) mod remove;
+pub(crate) mod shrink;
 pub(crate) mod slot;
 pub(crate) mod walk;
 pub(crate) mod write;

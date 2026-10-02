@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+Removes now reclaim the inner nodes they empty, and `ArtMap::shrink_to_fit` fits the rest on demand. Before this release, a node emptied by removes stayed in the tree until `clear()` or drop, so a map used as a queue or a registry, whose keys keep changing, grew without bound.
+
+### Added
+- `ArtMap::shrink_to_fit`, which fits every node to its entries: a node left with one leaf gives way to it, one left with a single child node is merged into it when their prefixes fit in one node, and every other node is shrunk to the smallest layout that holds its entries. It runs in O(n), under one pin, alongside readers and writers. A registry of 200,000 keys thinned to 2,000 holds 735 KB after its removes, and 94 KB after `shrink_to_fit`.
+
+### Changed behaviour
+- A remove that takes the last entry of a node unlinks the node (`docs/SAFETY.md` §13). If that leaves the parent empty, the parent goes too, and so on up, so a chain of `Node4`s under a long shared prefix goes with the last key below it. A node that keeps an entry is left as it is, until `shrink_to_fit`.
+- `ArtMap` frees unlinked nodes through EBR. A queue with 1,000 live keys holds 49 KB after 2M inserts and removes, down from 16.7 MB.
+- `ArenaArtMap` unlinks emptied nodes too, so scans do not walk dead nodes. Arena memory is still freed only on drop, and the arena maps have no `shrink_to_fit`: its copies would only add to the arena.
+- `validate_invariants` also checks that no inner node is empty.
+- The versioned maps are unchanged. They never unlink a key, so their nodes are never emptied.
+
+### Performance
+Against 0.6.0 on an AMD Threadripper 9970X, two interleaved rounds per tree (`benches/safety_bench.rs`, `benches/comparison_bench.rs`):
+- A remove that keeps an entry in its node locks only that node, as before. Removing and re-inserting keys costs the same as before, in a dense map and in the worst case for unlinking, keys in pairs under their own `Node4` (78 ns per remove and re-insert either way).
+- Scanning the 1,000 live keys of a queue that has seen 1M pushes is 7× faster (24 µs → 3.6 µs), because the scan no longer walks empty nodes. Queue push and pop is unchanged.
+- Point reads, inserts, overwrites, range scans, versioned updates and the README's concurrent benchmarks are unchanged within noise.
+- `shrink_to_fit` takes 81 µs on a map of 100,000 random keys thinned to 1,000.
+
+### Verification
+- loom models of removes that empty a node against lookups, inserts into that node, the arena inserter's cached-node insert, a second remove, prefix-chain follow-ups and `clear`; and of `shrink_to_fit` shrinking, collapsing and merging against lookups, inserts into the replaced node or child, and removes. Three new mutants must fail: a node unlinked without its own latch, a node fitted without its own latch, and a merge without the child's latch.
+- Unit tests of unlinking and of every `shrink_to_fit` shape, including a cascade in one pass and fitted-tree checks; node accounting: every node is freed or retired exactly once under random churn with `shrink_to_fit` mixed in.
+- Concurrent tests that churn keys around sentinels in every shape while a thread runs `shrink_to_fit`, for `ArtMap`, and with an arena inserter for `ArenaArtMap`; run under Miri and the sanitizers with the rest of those suites. The `ArtMap` model test runs `shrink_to_fit` among its operations.
+- `tests/retention.rs` measures live memory under queue, prefix-chain, registry and thinned-registry churn with a counting allocator. It fails on 0.6.
+
+### Known limitations
+- Without `shrink_to_fit`, a node keeps its layout as it loses children, until it is empty.
+- `VersionedArtMap` never unlinks a deleted key's leaf, even after `prune_key`.
+
 ## 0.7.0 (2026-10-01)
 
 ### Added

@@ -221,6 +221,27 @@ impl<K: AsBytes + Send + 'static> ArtSet<K> {
         self.map.clear();
     }
 
+    /// Fits the tree to its keys, releasing the memory that removes leave in
+    /// nodes too large for what they still hold. See
+    /// [`ArtMap::shrink_to_fit`].
+    ///
+    /// ```
+    /// let set = artmap::ArtSet::<[u8; 2]>::new();
+    /// for i in 0..=255u8 {
+    ///     set.insert([0, i]);
+    /// }
+    /// for i in 1..=255u8 {
+    ///     set.remove(&[0, i]);
+    /// }
+    /// set.shrink_to_fit();
+    /// assert!(set.contains(&[0, 0]));
+    /// assert_eq!(set.len(), 1);
+    /// ```
+    #[inline]
+    pub fn shrink_to_fit(&self) {
+        self.map.shrink_to_fit();
+    }
+
     /// Checks the tree's structural invariants and that `len()` equals the
     /// number of reachable keys. Panics on a violation. Requires exclusive
     /// access, so it never races with writers.

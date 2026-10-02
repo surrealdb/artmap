@@ -252,14 +252,39 @@ jobs:
 
   miri-tb:
     # EBR suites under Tree Borrows; the default collector never frees its
-    # Locals, hence -Zmiri-ignore-leaks (§16.1).
-    name: Miri (Tree Borrows, ${{ matrix.target }})
+    # Locals, hence -Zmiri-ignore-leaks (§16.1). Sharded so the suites run
+    # side by side; the two slowest split their seeds over two jobs.
+    name: Miri (Tree Borrows, ${{ matrix.shard.name }}, ${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         # aarch64 covers the NEON Node16 path.
         target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+        shard:
+          - name: units
+            tests: --lib
+            seeds: 0..4
+            doctests: true
+          - name: stress
+            tests: >-
+              --test concurrent_correctness --test unwind --test regressions
+              --test drop_accounting --test panicking_drop --test linearizability
+              --test byteslice_keys --test sim --test versioned_simulation_tests
+              --test versioned_artmap_tests
+            seeds: 0..4
+          - name: model 0..2
+            tests: --test model
+            seeds: 0..2
+          - name: model 2..4
+            tests: --test model
+            seeds: 2..4
+          - name: proptest 0..2
+            tests: --test proptest_keys
+            seeds: 0..2
+          - name: proptest 2..4
+            tests: --test proptest_keys
+            seeds: 2..4
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -275,24 +300,26 @@ jobs:
 
       - name: Run Miri on the EBR suites
         env:
-          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-ignore-leaks -Zmiri-many-seeds=0..4
-        run: >
-          cargo miri test --target ${{ matrix.target }} --lib
-          --test concurrent_correctness --test model --test unwind
-          --test regressions --test drop_accounting --test panicking_drop
-          --test linearizability --test proptest_keys --test byteslice_keys
-          --test sim --test versioned_simulation_tests --test versioned_artmap_tests
+          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-ignore-leaks -Zmiri-many-seeds=${{ matrix.shard.seeds }}
+        run: cargo miri test --target ${{ matrix.target }} ${{ matrix.shard.tests }}
 
       - name: Run Miri on the doctests
+        if: matrix.shard.doctests
         env:
           MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-ignore-leaks
         run: cargo miri test --target ${{ matrix.target }} --doc
 
   miri-arena:
     # The arena suites never pin, so they run leak-checked, with strict
-    # provenance and symbolic alignment, over several seeds (§16.1).
-    name: Miri (arena, leak-checked)
+    # provenance and symbolic alignment, over several seeds (§16.1). Each
+    # suite splits its eight seeds over two jobs.
+    name: Miri (arena, leak-checked, ${{ matrix.test }} ${{ matrix.seeds }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [arena_artmap_tests, arena_regressions]
+        seeds: [0..4, 4..8]
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -308,8 +335,8 @@ jobs:
 
       - name: Run Miri on the arena suites
         env:
-          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-many-seeds=0..8
-        run: cargo miri test --test arena_artmap_tests --test arena_regressions
+          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-many-seeds=${{ matrix.seeds }}
+        run: cargo miri test --test ${{ matrix.test }}
 
   miri-strict:
     # Strict provenance for the units that do not touch crossbeam (§16.1).
