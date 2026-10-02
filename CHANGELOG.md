@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 (2026-10-02)
 
 Removes now reclaim the inner nodes they empty, `shrink_to_fit` fits the rest on demand, and the versioned maps can remove, prune and clear keys. Before this release, a node emptied by removes stayed in the tree until `clear()` or drop, and a deleted versioned key kept its leaf and a tombstone for good, so a map used as a queue or a registry, whose keys keep changing, grew without bound.
 
